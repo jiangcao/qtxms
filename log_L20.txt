@@ -1,0 +1,20 @@
+grid: 80 slabs x 320 = 25600 points, t = 2.345 eV
+lead subband bottoms (meV above e1): [  0.  156.  345.5 412.  501.5 757.5]
+RGF: 1.62 s/energy; [(np.float64(0.0001), 1), (np.float64(0.478), 1), (np.float64(0.7755), 1), (np.float64(0.5582), 1), (np.float64(0.9902), 1), (np.float64(0.8985), 2)]
+CMS M=2        N=  160 (2.0/slab) deg= 8 | MS err 8.47e-01 -> MG err 3.81e-08 | GMRES its mean 15.8 max 19 | matvec/rhs 175 | 0.35 s/E | idem 6.1e-14
+CMS M=2        N=  160 (2.0/slab) deg=16 | MS err 8.47e-01 -> MG err 1.07e-08 | GMRES its mean 9.3 max 11 | matvec/rhs 178 | 0.32 s/E | idem 6.1e-14
+CMS M=4        N=  320 (4.0/slab) deg= 8 | MS err 1.09e+00 -> MG err 3.55e-09 | GMRES its mean 15.7 max 18 | matvec/rhs 173 | 0.38 s/E | idem 4.7e-14
+CMS M=4        N=  320 (4.0/slab) deg=16 | MS err 1.09e+00 -> MG err 1.25e-09 | GMRES its mean 8.7 max 10 | matvec/rhs 166 | 0.28 s/E | idem 4.7e-14
+CMS M=8        N=  640 (8.0/slab) deg= 8 | MS err 6.19e-01 -> MG err 8.49e-11 | GMRES its mean 15.0 max 18 | matvec/rhs 166 | 0.36 s/E | idem 4.8e-14
+CMS M=8        N=  640 (8.0/slab) deg=16 | MS err 6.19e-01 -> MG err 6.66e-09 | GMRES its mean 8.0 max 9 | matvec/rhs 153 | 0.27 s/E | idem 4.8e-14
+CMS M=16       N= 1280 (16.0/slab) deg= 8 | MS err 3.19e-01 -> MG err 1.18e-10 | GMRES its mean 14.8 max 18 | matvec/rhs 164 | 0.53 s/E | idem 3.5e-14
+CMS M=16       N= 1280 (16.0/slab) deg=16 | MS err 3.19e-01 -> MG err 9.51e-10 | GMRES its mean 7.7 max 9 | matvec/rhs 147 | 0.30 s/E | idem 3.5e-14
+  idem = np.linalg.norm(p2 - p1) / np.linalg.norm(p1)
+none           N=    0 (0.0/slab) deg= 8 | MS err 1.00e+00 -> MG err 7.19e-08 | GMRES its mean 41.7 max 52 | matvec/rhs 459 | 1.23 s/E | idem nan
+none           N=    0 (0.0/slab) deg=16 | MS err 1.00e+00 -> MG err 8.49e-08 | GMRES its mean 24.0 max 30 | matvec/rhs 457 | 0.81 s/E | idem nan
+LDM Eb=0.3     N=  156 (1.9/slab) deg= 8 | MS err 3.51e-01 -> MG err 2.37e-09 | GMRES its mean 14.8 max 21 | matvec/rhs 163 | 0.34 s/E | idem 2.0e-14
+LDM Eb=0.3     N=  156 (1.9/slab) deg=16 | MS err 3.51e-01 -> MG err 2.23e-09 | GMRES its mean 8.0 max 11 | matvec/rhs 153 | 0.25 s/E | idem 2.0e-14
+LDM Eb=0.6     N=  424 (5.3/slab) deg= 8 | MS err 3.29e-02 -> MG err 1.32e-10 | GMRES its mean 8.9 max 10 | matvec/rhs 99 | 0.21 s/E | idem 1.1e-14
+LDM Eb=0.6     N=  424 (5.3/slab) deg=16 | MS err 3.29e-02 -> MG err 2.37e-10 | GMRES its mean 4.8 max 5 | matvec/rhs 93 | 0.15 s/E | idem 1.1e-14
+LDM Eb=1       N=  799 (10.0/slab) deg= 8 | MS err 1.20e-02 -> MG err 1.58e-11 | GMRES its mean 6.8 max 7 | matvec/rhs 76 | 0.17 s/E | idem 2.5e-14
+LDM Eb=1       N=  799 (10.0/slab) deg=16 | MS err 1.20e-02 -> MG err 2.62e-11 | GMRES its mean 3.8 max 4 | matvec/rhs 74 | 0.15 s/E | idem 2.5e-14
