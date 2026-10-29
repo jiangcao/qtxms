@@ -1,9 +1,9 @@
 """Tight-binding model switch for the whole pipeline.
 
-    QT_MODEL=sp3s     (default) Vogl sp3s* Si, 5 orbitals per channel Si   (qtmode.hamiltonian)
-    QT_MODEL=sp3d5s   Boykin sp3d5s* Si, 10 orbitals per channel Si        (qtmode.hamiltonian5)
+    QT_MODEL=sp3s     (default) Vogl sp3s* Si, 5 orbitals per channel Si   (mgms.prep.hamiltonian)
+    QT_MODEL=sp3d5s   Boykin sp3d5s* Si, 10 orbitals per channel Si        (mgms.prep.hamiltonian5)
 
-select() sets the orbital-count table in qtmode.structure in place, so Structure.norb / .offsets,
+select() sets the orbital-count table in mgms.prep.structure in place, so Structure.norb / .offsets,
 partition() and every block index follow the chosen model. Results go to separate folders
 (results_transport + suffix()) so the two models never share caches.
 
@@ -44,10 +44,10 @@ def suffix():
     return ("" if MODEL == "sp3s" else f"_{MODEL}") + ("" if XSEC == "3x5" else f"_{XSEC}")
 
 
-def device_cfg():
-    """build_open_device arguments of the selected cross-section (same recipe, seeds and roughness)."""
+def device_cfg(xsec=None):
+    """build_open_device arguments of a cross-section (default: env XSEC; same recipe, seeds and roughness)."""
     return dict(n_dev_blocks=4, n_lead_blocks=3, rough_rms=1.5, rough_corr=8.0, seed=7, lead_seed=1000,
-                **_CFG[XSEC])
+                **_CFG[xsec or XSEC])
 
 
 def reference_edge():

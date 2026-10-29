@@ -46,6 +46,12 @@ Per energy E:
   half a plane spacing before the first plane; user can override with --slab-width (= lead cell length).
 - Injection channels: eigenvalues of Γ_L above 1e-4 eV (absolute); relative tolerances picked up
   η-broadened evanescent modes. Count is cross-checked against lead band crossings.
+- Level 1 of the user's two-level basis (qtmode): local tiles + bulk-Bloch cores for the Si sheet. For general
+  ab initio TB there is NO tile / core separation: level 1 is built from local tiles over all atoms (cores need
+  a bulk unit cell, which ab initio devices do not provide). Level 2 = transport slabs (contour slab ρ).
+- All models go through one generic input set (mgms/prep/inputs.py: xyz, norb, blocks, H, S, lead cell,
+  meta.json), so solvers and bases never call a TB builder directly; model-specific extras (Si structure.npz)
+  are optional side files.
 - Per-slab "slab" (CMS-like) basis in TB is selected by count (M lowest above mid-gap), not by window,
   because isolated-slab energies sit above the device band edge.
 
@@ -82,10 +88,22 @@ What works (verified)
 - TB synthetic (5928 orbitals): LDM (N = 221) 8–9 its, final error ~5e-10; slab M=4 10–12 its; no coarse 56–90.
 - Reader: .npz / .mtx / text, per-species / per-atom orbitals, shuffled atoms all give identical T.
 
+Input preparation (`mgms/prep/`, see README)
+- `inputs.py`  — `write_inputs` / `read_inputs` of the generic input set.
+- `si_sheet.py`— CLI `python -m mgms.prep.si_sheet --model sp3s|sp3d5s --xsec 3x5|3x15|5x10 --out DIR`;
+  also writes `structure.npz` + TB params; `load_structure(dir, meta)` → (Structure, P).
+- `structure.py`, `hamiltonian.py` (sp3s*), `hamiltonian5.py` + `sp3d5s.py` (sp3d5s*), `model.py` — moved
+  unchanged from qtmode (only `model.device_cfg(xsec=None)` gained an argument). `model.select()` still mutates
+  `structure.NORB` globally. Verified: H, lead H00/H01 bit-identical to ../qtmode_cms (3×5, both models).
+
+User's two-level mode-space code (`qtmode/`, from ../qtmode_cms; pipeline scripts live there, not here)
+- `cms.py` level 1 (partition into cores/tiles, tile spectral modes, union core basis), `enrich.py` residual
+  enrichment, `lsq.py` slab blocks / transmission, `lead_ms.py` reduced leads, `transport.py`, `negf.py`,
+  `reduced.py`, `clean.py`. Imports structure/TB from `mgms.prep`. Not yet wired to the generic inputs.
+
 Untested / known limitations
 - No real ab initio files yet (CP2K/Wannier/OMEN; sp3d5s*, d orbitals, spin, complex H).
-- The user's actual two-level basis (level 1 + residual enrichment + level 2) is NOT implemented; current
-  LDM is a single-step per-slab basis.
+- The user's two-level basis (qtmode) is not yet coupled to mgms: the mgms LDM is a single-step per-slab basis.
 - Only two grids; no three-level V-cycle.
 - LDM build uses dense (generalized) eigh of (2w+1)-slab clusters: fine here (1.5 s TB, 76 s EM) but will not
   scale to sp3d5s* slabs with thousands of orbitals.
@@ -99,8 +117,7 @@ Untested / known limitations
 
 ## Open problems
 1. Implement the nested two-level basis U = U⁽¹⁾U⁽²⁾ and a three-level V-cycle (smoother on level 1 with A₁)
-   to cut fine-grid matvecs — needs the user's level-1 construction (local region, eigenproblem, residual
-   enrichment rule). Ask the user for their code rather than reconstructing it.
+   to cut fine-grid matvecs — the user's level-1 construction is in `qtmode/` (cms.py tiles/cores, enrich.py).
 2. Cheap basis construction for TB (sparse/shift-invert or randomized range finder for ρ in the window;
    reuse across energies and bias points).
 3. Smoother for indefinite TB complement: compare GMRES(k) vs two-interval Chebyshev / least-squares
@@ -111,12 +128,14 @@ Untested / known limitations
 6. Cost model vs RGF as a function of n_slab, S, number of channels, energies.
 
 ## Next steps
-1. Get the user's two-level basis code → wrap its U⁽¹⁾, U⁽²⁾ in a 3-level version of `twolevel.TwoLevel`;
-   test on the effective-mass rough sheet (their 39k-point setup) vs the current 2-grid numbers.
-2. Run `run_tb.py` on a real ab initio device (start small); set `--slab-width` to the lead cell length.
-3. Cache U†HU and U†SU; rebuild only A_c(E) = E·U†SU − U†HU − U†ΣU per energy.
-4. Replace dense cluster eigh in `basis_ldm` with a sparse/randomized construction.
-5. Write up the formulation + results for Mathieu.
+1. Make qtmode level 1 run from the generic inputs (read_inputs) with tiles only (no cores) for ab initio;
+   keep cores as a Si-sheet option via structure.npz.
+2. Wrap qtmode's U⁽¹⁾, U⁽²⁾ in a 3-level version of `twolevel.TwoLevel`;
+   test on the prepared Si sheet inputs vs the current 2-grid numbers.
+3. Run `run_tb.py` on a real ab initio device (start small); set `--slab-width` to the lead cell length.
+4. Cache U†HU and U†SU; rebuild only A_c(E) = E·U†SU − U†HU − U†ΣU per energy.
+5. Replace dense cluster eigh in `basis_ldm` with a sparse/randomized construction.
+6. Write up the formulation + results for Mathieu.
 
 ## How to run
 ```
@@ -124,4 +143,5 @@ python -m mgms.run 20     # EM sweep (~5 min)
 python -m mgms.scaling    # EM length scaling (~5 min)
 python -m mgms.make_test_tb # writes test.xyz, test_H.txt, test_S.txt
 python -m mgms.run_tb --xyz test.xyz --H test_H.txt --S test_S.txt --norb "Si:2,H:1" --dE 0.02,0.08,0.15,0.25 --Eb 0.6
+python -m mgms.prep.si_sheet --model sp3d5s --xsec 3x5 --out inputs/si3x5_sp3d5s   # ~2 min, writes generic inputs
 ```

@@ -97,3 +97,32 @@ Tested on a synthetic non-orthogonal model (`python -m mgms.make_test_tb`: rough
 
 (At +0.02 and +0.08 eV T ≈ 0, tunnelling through constrictions.) `.npz`/`.mtx`/per-atom-file inputs give identical results.
 Not yet tested on real ab initio files (e.g. Wannier/CP2K sp3d5s*-size orbital sets, d-orbitals, spin).
+
+---
+
+# Input preparation (`mgms/prep/`)
+
+Every TB model, empirical or ab initio, is turned into one generic input set (`mgms/prep/inputs.py`):
+
+| file | content |
+|---|---|
+| `device.xyz` | atoms in orbital order, `label x y z` [Å] |
+| `norb.txt` | orbitals per atom (orbitals of an atom consecutive) |
+| `blocks.txt` | transport block (slab) index per atom |
+| `H.npz`, `S.npz` | device H [eV], overlap (`S = I` for orthogonal TB) |
+| `lead_{H,S}{00,01}.npz` | periodic lead cell and its coupling to the next cell (+x) |
+| `meta.json` | units, axis, block length, device / lead blocks, band edges, model info |
+
+`read_inputs(dir)` returns them as a dict; `mgms.abtb` reads the same files (`read_xyz`, `parse_norb norb.txt`,
+`read_sparse *.npz`). An ab initio model enters by writing its matrices with `write_inputs`.
+
+Rough Si nanosheet with oxide shell (structure and sp3s* / sp3d5s* TB from qtmode, unchanged):
+```
+python -m mgms.prep.si_sheet --model sp3d5s --xsec 3x5 --out inputs/si3x5_sp3d5s
+```
+Options: `--xsec 3x5|3x15|5x10` (or `--nt 12,8 --half-width 25,15`), `--n-dev`, `--rms`, `--corr`, `--seed`,
+`--no-lead-edge`. Device = blocks 2 … nb−nl (L2 + D + R0), lead cells L1 / R1, as in the qtmode pipeline.
+Si-specific extras for the level-1 core basis: `structure.npz` (species codes, bonds, union sites, roughness
+profiles) and the TB parameters in `meta.json`; `si_sheet.load_structure(dir, meta)` rebuilds `Structure` + params.
+Checked: H and the lead cell are bit-identical to the original qtmode build (3 × 5 nm, both models);
+lead E_c = 1.2051 eV (sp3s*).

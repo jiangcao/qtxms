@@ -5,6 +5,8 @@ Library modules
   em        - effective-mass bases (CMS, LDM) and two-level solver
   abtb      - ab initio / TB readers, TBDevice, Sancho-Rubio leads, RGF, bases
   twolevel  - generic two-level preconditioner + flexible GMRES
+  prep      - input preparation: generic input set (xyz, norb, H, S, lead cell, meta),
+              Si nanosheet structure + sp3s* / sp3d5s* TB  (python -m mgms.prep.si_sheet)
 
 Drivers (run from the repo root with `python -m mgms.<name>`)
   run, scaling, make_test_tb, run_tb
