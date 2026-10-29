@@ -138,6 +138,8 @@ Untested / known limitations
 6. Write up the formulation + results for Mathieu.
 
 ## How to run
+Environment: `uv sync` (Python 3.12, numpy, scipy, pypardiso/MKL on x86-64; `mgms` and `qtmode` installed
+editable). Prefix commands with `uv run`, or activate `.venv`.
 ```
 python -m mgms.run 20     # EM sweep (~5 min)
 python -m mgms.scaling    # EM length scaling (~5 min)

@@ -1,5 +1,12 @@
 # Mode space as the coarse level of a two-grid transport solver
 
+## Setup
+
+```
+uv sync                                  # creates .venv (Python 3.12, numpy, scipy, pypardiso)
+uv run python -m mgms.run_tb --help      # or: source .venv/bin/activate
+```
+
 Prototype on an effective-mass rough Si nanosheet (5 × 3 nm, a = 0.25 nm, m* = 0.26, 3 eV oxide barrier,
 top/bottom roughness rms 0.3 nm, Λ = 1.5 nm, uniform ideal leads). Reference: exact RGF.
 
