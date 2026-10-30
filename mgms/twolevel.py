@@ -14,12 +14,19 @@ import scipy.sparse.linalg as spla
 
 
 class TwoLevel:
-    def __init__(self, A, U, smoother="gmres", k=10, alpha=None, beta=None, coarse=None):
-        """coarse: optional object with solve(B) for A_c = U^H A U (e.g. msbasis.BlockTridiag built from
-        slab blocks); default: sparse LU of U^H A U."""
+    def __init__(self, A, U, smoother="gmres", k=10, alpha=None, beta=None, coarse=None, restrict="U"):
+        """coarse: optional object with solve(B) for the coarse matrix (e.g. msbasis.BlockTridiag built from
+        slab blocks); default: sparse LU of U^H A U.
+        restrict: 'U'  -> Galerkin, Pc r = U A_c^-1 U^H r;
+                  'AU' -> minimal residual, Pc r = U (W^H W)^-1 W^H r with W = A U (coarse = msbasis.MRCoarse):
+                          A Pc is then the orthogonal projector on range(AU), so the coarse correction never
+                          increases the residual; Pc A is still a projector (W^H A U = W^H W)."""
         self.A, self.U = A.tocsr(), U.tocsr()
         self.N = U.shape[1]
-        self.coarse = coarse
+        self.coarse, self.restrict = coarse, restrict
+        if restrict == "AU":
+            assert coarse is not None, "restrict='AU' needs a coarse solver for W^H W (msbasis.MRCoarse)"
+            self.AH = self.A.conj().T.tocsr()
         if coarse is not None:
             self.Ac = None
         elif self.N:
@@ -49,6 +56,8 @@ class TwoLevel:
         if not self.N:
             return np.zeros_like(r)
         solve = self.coarse.solve if self.coarse is not None else self.lu.solve
+        if self.restrict == "AU":
+            return self.U @ solve(self.U.conj().T @ (self.AH @ r))
         return self.U @ solve(self.U.conj().T @ r)
 
     # ---------------- smoothers

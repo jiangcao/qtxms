@@ -229,3 +229,45 @@ def test_two_level_pipeline(gauge):
             T += float(np.real(x[dev.bR].conj() @ GR @ x[dev.bR]))
         Te = exact_T(inp, E)[0]
         assert abs(T - Te) < 1e-7 * Te
+
+
+def test_gmres_right_with_inexact_preconditioner():
+    """The CSolver fallback: GMRES right-preconditioned by an inexact inverse reaches tol."""
+    rng = np.random.default_rng(3)
+    n = 200
+    A = sp.random(n, n, 0.03, random_state=3) + 1j * sp.random(n, n, 0.03, random_state=4) + 3 * sp.identity(n)
+    A = A.tocsr()
+    b = rng.normal(size=n) + 1j * rng.normal(size=n)
+    d = A.diagonal()
+    x, its = mb.gmres_right(lambda v: A @ v, lambda v: v / d, b, np.zeros(n, complex), 1e-12, 200)
+    assert np.linalg.norm(A @ x - b) < 1e-11 * np.linalg.norm(b) and its < 200
+
+
+@pytest.mark.parametrize("gauge", [False, True])
+def test_mr_coarse(gauge):
+    """Minimal-residual coarse correction: W^H W solve, A Pc orthogonal projector (residual never grows),
+    Pc A projector, and the two-level FGMRES with it converges."""
+    inp = strip(nd=4, nonorth=True, complex_gauge=gauge)
+    dev = mb.Device(inp)
+    blocks, _, _ = mb.partition(dev, cores=False, tile_orbs=40)
+    geo = mb.Geometry(inp["xyz"])
+    tree = geo.tree()
+    bases = [mb.tile_modes(inp, geo, tree, b["atoms"], E_TEST, tile_thr=1e-3)[0] for b in blocks]
+    Us, _ = mb.slab_U(dev, blocks, bases)
+    U = sp.block_diag(Us, format="csr")
+    E = E_TEST[0]
+    SL, SR = dev.sigma(E + 1e-6j)
+    A = dev.A(E, SL, SR)
+    mr = mb.MRCoarse(dev, A, Us)
+    W = (A @ U).toarray()
+    v = np.random.default_rng(5).normal(size=U.shape[1]) + 0j
+    assert rel(mr.solve(W.conj().T @ W @ v), v) < 1e-9
+    tl = TwoLevel(A, U, smoother="gmres", k=5, coarse=mr, restrict="AU")
+    r = np.random.default_rng(6).normal(size=dev.n) + 1j * np.random.default_rng(7).normal(size=dev.n)
+    r2 = r - A @ tl.Pc(r)
+    assert np.linalg.norm(r2) <= np.linalg.norm(r) and np.linalg.norm(r2 - (r2 - A @ tl.Pc(r2))) < 1e-9 * np.linalg.norm(r)
+    p1 = tl.Pc(A @ r); assert rel(tl.Pc(A @ p1), p1) < 1e-9
+    B, _, _ = mb.injection(SL, 1e-10)
+    b = np.zeros(dev.n, complex); b[dev.bL] = B[:, -1]
+    x, hist, _ = tl.solve(b, tol=1e-11)
+    assert hist[-1] < 1e-11 and rel(x, mb.CSolver(A).solve(b)) < 1e-8

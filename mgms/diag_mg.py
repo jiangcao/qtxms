@@ -4,12 +4,15 @@ injection channel. Uses the bases cached by run_ms (same --inputs / --no-cores /
     python -m mgms.diag_mg --inputs inputs/si3x5_sp3s --E 1.21 [--neig 30] [-- <extra run_ms options>]
 
 Per energy:
-  [exact]    PARDISO residual vs number of iterative-refinement steps
-  [coarse]   consistency of the block-tridiagonal A_c with U^H A U, U orthonormality, projector pi^2 = pi
-  [MS1]      residual and error of the mode-space solution; error left in range(U)
-  [smoother] GMRES(k) alone on the MS1 residual (residual and error reduction, then + coarse correction)
-  [conv]     FGMRES with the two-level preconditioner (k = 10, 30), plain GMRES on A, deflated GMRES
+  [exact]    PARDISO: perturbed pivots, residual vs refinement steps, CSolver with GMRES fallback
+  [coarse]   consistency of the block-tridiagonal A_c with U^H A U, U orthonormality
+  [galerkin] / [mr]  coarse correction Pc = U A_c^-1 U^H  /  U (W^H W)^-1 W^H, W = A U:
+             projector pi^2 = pi; MS solution x0 = Pc b (T of the channel, residual, error);
+             GMRES(k) smoother alone on the MS residual, then + coarse correction;
+             FGMRES with the two-level preconditioner (k = 10, 30); deflated GMRES (--its)
   [eig]      eigenvalues of A nearest 0 (shift-invert) and how much of each eigenvector U1 misses
+(The version that produced the first logs, with plain refinement only and the Galerkin coarse level, is
+commit f10d477.)
 """
 import argparse, sys, time
 import numpy as np
@@ -19,7 +22,8 @@ p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDes
 p.add_argument("--inputs", required=True)
 p.add_argument("--E", required=True, help="absolute energies [eV], comma separated")
 p.add_argument("--neig", type=int, default=30, help="eigenvalues of A nearest 0 (0: skip)")
-p.add_argument("--its", type=int, default=400, help="plain / deflated GMRES iterations")
+p.add_argument("--its", type=int, default=0, help="deflated GMRES iterations (0: skip)")
+p.add_argument("--mg-its", type=int, default=60, help="FGMRES iterations")
 d, rest = p.parse_known_args()
 
 # basis setup and caches: the part of run_ms before the transmission loop
@@ -66,50 +70,61 @@ for E in [float(x) for x in d.E.split(",")]:
     rel = lambda x: np.linalg.norm(A @ x - b) / nb
     log(f"\n=== E = {E:.4f} (Ec {E - Ec:+.3f}), {B.shape[1]} channels, strongest channel")
 
-    cs = mb.CSolver(A, n_ref=0)
-    x = cs.solve(b)
-    log(f"[exact] PARDISO residual, refinement 0: {rel(x):.1e}")
-    for i in range(1, 11):
-        x = x + cs.solve(b - A @ x)
-        if i in (1, 2, 5, 10):
+    t = time.time()
+    cs = mb.CSolver(A, n_ref=0, maxit=0)
+    x = cs.factor_solve(b[:, None])[:, 0]
+    log(f"[exact] factorization {time.time() - t:.0f} s, {cs.npert} perturbed pivots; residual, refinement 0: {rel(x):.1e}")
+    for i in range(1, 6):
+        x = x + cs.factor_solve((b - A @ x)[:, None])[:, 0]
+        if i in (1, 2, 5):
             log(f"[exact]   refinement {i}: {rel(x):.1e}")
-    xex = x
+    cs.n_ref, cs.maxit = 2, 60
+    xex = cs.solve(b)
+    log(f"[exact] CSolver (2 refinements + GMRES): residual {rel(xex):.1e}, {cs.its} GMRES its")
+    GR = 1j * (SR - SR.conj().T)
+    Tch = lambda x: float(np.real(x[dev.bR].conj() @ GR @ x[dev.bR]))
+    log(f"[exact] T of the strongest channel {Tch(xex):.6f}")
 
     Ac = mb.BlockTridiag(blk1, E, PL.conj().T @ SL @ PL, PR.conj().T @ SR @ PR)
     v = np.random.default_rng(1).standard_normal(U1.shape[1]) + 0j
     w = Ac.solve(U1.conj().T @ (A @ (U1 @ v)))
     log(f"[coarse] |Ac^-1 U^H A U v - v| / |v| = {np.linalg.norm(w - v) / np.linalg.norm(v):.1e}; "
         f"|U^H U - I|_max = {np.abs(G - np.eye(len(G))).max():.1e}")
-    tl = TwoLevel(A, U1, smoother="gmres", k=10, coarse=Ac)
+    t = time.time()
+    mr = mb.MRCoarse(dev, A, Us)
+    log(f"[coarse] minimal-residual W^H W: Cholesky {time.time() - t:.0f} s")
     y = np.random.default_rng(2).standard_normal(dev.n) + 0j
-    p1 = tl.Pc(A @ y); p2 = tl.Pc(A @ p1)
-    log(f"[coarse] projector |pi^2 y - pi y| / |pi y| = {np.linalg.norm(p2 - p1) / np.linalg.norm(p1):.1e}")
-    x0 = tl.Pc(b)
-    e0 = xex - x0
-    log(f"[MS1] residual {rel(x0):.2e}; error |x - x_MS| / |x| = {np.linalg.norm(e0) / np.linalg.norm(xex):.2e}; "
-        f"part of the error in range(U): {np.linalg.norm(tl.Pc(A @ e0)) / np.linalg.norm(e0):.2e}")
-
-    r1 = b - A @ x0
-    for k in (10, 30, 100):
-        z = gmres_fixed(lambda v: A @ v, r1, k)
-        r2 = r1 - A @ z
-        r3 = r2 - A @ tl.Pc(r2)
-        log(f"[smoother] GMRES({k}) on MS1 residual: |r| {np.linalg.norm(r1) / nb:.2e} -> {np.linalg.norm(r2) / nb:.2e}"
-            f" -> + coarse {np.linalg.norm(r3) / nb:.2e}; error |e - z| / |e| = "
-            f"{np.linalg.norm(e0 - z) / np.linalg.norm(e0):.3f}")
-
-    for k in (10, 30):
-        t = time.time()
-        s = TwoLevel(A, U1, smoother="gmres", k=k, coarse=Ac)
-        _, h, _ = s.solve(b, tol=1e-10, maxit=40)
-        log(f"[conv] FGMRES two-level k={k:<3d}: " + " ".join(f"{h[i]:.1e}" for i in range(0, len(h), 5)) +
-            f" (every 5 its) | final {h[-1]:.1e}, {s.nmv} mv, {time.time() - t:.0f} s")
-    marks = [i for i in (0, 25, 50, 100, 200, 300, 400, 600, 800) if i <= d.its]
-    for tag, op, r0 in (("plain GMRES on A", lambda v: A @ v, b),
-                        ("deflated (I - A Pc) A", lambda v: (lambda u: u - A @ tl.Pc(u))(A @ v), r1)):
-        t = time.time()
-        h = gmres_hist(op, r0, nb, d.its)
-        log(f"[conv] {tag:24s}: " + " ".join(f"{h[i]:.1e}" for i in marks) + f" (its {marks}), {time.time() - t:.0f} s")
+    for kind, kw in (("galerkin", dict(coarse=Ac)), ("mr", dict(coarse=mr, restrict="AU"))):
+        tl = TwoLevel(A, U1, smoother="gmres", k=10, **kw)
+        p1 = tl.Pc(A @ y); p2 = tl.Pc(A @ p1)
+        x0 = tl.Pc(b)
+        e0 = xex - x0
+        r1 = b - A @ x0
+        log(f"[{kind}] projector |pi^2 y - pi y| / |pi y| = {np.linalg.norm(p2 - p1) / np.linalg.norm(p1):.1e}")
+        log(f"[{kind}] MS: T {Tch(x0):.6f} (rel err {abs(Tch(x0) - Tch(xex)) / Tch(xex):.1e}); residual "
+            f"{rel(x0):.2e}; error |x - x_MS| / |x| = {np.linalg.norm(e0) / np.linalg.norm(xex):.2e}")
+        for k in (10, 30, 100):
+            z = gmres_fixed(lambda v: A @ v, r1, k)
+            r2 = r1 - A @ z
+            r3 = r2 - A @ tl.Pc(r2)
+            log(f"[{kind}] smoother GMRES({k}) on MS residual: {np.linalg.norm(r1) / nb:.2e} -> "
+                f"{np.linalg.norm(r2) / nb:.2e} -> + coarse {np.linalg.norm(r3) / nb:.2e}; error |e - z| / |e| = "
+                f"{np.linalg.norm(e0 - z) / np.linalg.norm(e0):.3f}")
+        for k in (10, 30):
+            t = time.time()
+            s = TwoLevel(A, U1, smoother="gmres", k=k, **kw)
+            xs, h, _ = s.solve(b, tol=1e-10, maxit=d.mg_its)
+            log(f"[{kind}] FGMRES two-level k={k:<3d}: " + " ".join(f"{h[i]:.1e}" for i in range(0, len(h), 10)) +
+                f" (every 10 its) | final {h[-1]:.1e} at {len(h) - 1} its, {s.nmv} mv, T err "
+                f"{abs(Tch(xs) - Tch(xex)) / Tch(xex):.1e}, {time.time() - t:.0f} s")
+        if d.its:
+            t = time.time()
+            h = gmres_hist(lambda v: (lambda u: u - A @ tl.Pc(u))(A @ v), r1, nb, d.its)
+            marks = [i for i in (0, 25, 50, 100, 200, 300, 400, 600, 800) if i <= d.its]
+            log(f"[{kind}] deflated GMRES (I - A Pc) A: " + " ".join(f"{h[i]:.1e}" for i in marks) +
+                f" (its {marks}), {time.time() - t:.0f} s")
+    tl = TwoLevel(A, U1, smoother="gmres", k=10, coarse=Ac)
+    e0 = xex - tl.Pc(b)
 
     if d.neig:
         t = time.time()

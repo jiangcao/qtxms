@@ -39,36 +39,75 @@ def log(*a):
 # ------------------------------------------------------------------ sparse complex solves
 class CSolver:
     """Factorization of a complex sparse matrix A. PARDISO on the real-equivalent
-    [[Ar, -Ai], [Ai, Ar]] with iterative refinement when pypardiso is available, else SuperLU."""
+    [[Ar, -Ai], [Ai, Ar]] when pypardiso is available, else SuperLU. Each solve does n_ref steps of
+    iterative refinement, then GMRES preconditioned by the factorization on the columns whose residual
+    is still above tol (PARDISO perturbs small pivots; plain refinement can then stall or diverge)."""
 
-    def __init__(self, A, n_ref=2):
+    def __init__(self, A, n_ref=2, tol=1e-12, maxit=60):
         A = sp.csr_matrix(A)
-        self.n, self.n_ref = A.shape[0], n_ref
+        self.A, self.n, self.n_ref, self.tol, self.maxit = A, A.shape[0], n_ref, tol, maxit
+        self.res, self.its = 0.0, 0                       # max relative residual, max GMRES its (last solve)
         if pypardiso is None:
             self.lu = spla.splu(A.astype(complex).tocsc())
+            self.npert = 0
             return
         Ar, Ai = sp.csr_matrix(A.real), sp.csr_matrix(A.imag)
         self.M = sp.bmat([[Ar, -Ai], [Ai, Ar]], format="csr")
         self.ps = pypardiso.PyPardisoSolver(mtype=11)
         self.ps.factorize(self.M)
+        self.npert = int(self.ps.get_iparm(14))           # number of perturbed pivots
+
+    def factor_solve(self, B):
+        if pypardiso is None:
+            return self.lu.solve(B.astype(complex))
+        Z = self.ps.solve(self.M, np.vstack([B.real, B.imag]))
+        Z = Z.reshape(2 * self.n, -1)
+        return Z[:self.n] + 1j * Z[self.n:]
 
     def solve(self, B):
         B = np.asarray(B)
         one = B.ndim == 1
-        B = B.reshape(len(B), -1)
-        if pypardiso is None:
-            X = self.lu.solve(B.astype(complex))
-        else:
-            R = np.vstack([B.real, B.imag])
-            Z = self.ps.solve(self.M, R)
-            for _ in range(self.n_ref):
-                Z += self.ps.solve(self.M, R - self.M @ Z)
-            X = Z[:self.n] + 1j * Z[self.n:]
+        B = B.reshape(len(B), -1).astype(complex)
+        X = self.factor_solve(B)
+        for _ in range(self.n_ref):
+            X += self.factor_solve(B - self.A @ X)
+        bn = np.maximum(np.linalg.norm(B, axis=0), 1e-300)
+        res = np.linalg.norm(B - self.A @ X, axis=0) / bn
+        self.its = 0
+        for c in np.where(res > self.tol)[0]:
+            X[:, c], its = gmres_right(lambda v: self.A @ v, lambda v: self.factor_solve(v[:, None])[:, 0],
+                                       B[:, c], X[:, c], self.tol, self.maxit)
+            res[c] = np.linalg.norm(B[:, c] - self.A @ X[:, c]) / bn[c]
+            self.its = max(self.its, its)
+        self.res = float(res.max()) if len(res) else 0.0
         return X[:, 0] if one else X
 
     def free(self):
         if pypardiso is not None:
             self.ps.free_memory(everything=True)
+
+
+def gmres_right(mv, prec, b, x0, tol, maxit):
+    """GMRES on A x = b from x0, right preconditioner prec ~ A^-1; stops at |b - A x| <= tol |b|."""
+    r0 = b - mv(x0)
+    bn, be = np.linalg.norm(b), np.linalg.norm(r0)
+    if be <= tol * bn:
+        return x0, 0
+    V = np.zeros((len(b), maxit + 1), complex); Z = np.zeros((len(b), maxit), complex)
+    H = np.zeros((maxit + 1, maxit), complex)
+    V[:, 0] = r0 / be
+    for j in range(maxit):
+        Z[:, j] = prec(V[:, j])
+        w = mv(Z[:, j])
+        for _ in range(2):
+            h = V[:, :j + 1].conj().T @ w; H[:j + 1, j] += h; w -= V[:, :j + 1] @ h
+        H[j + 1, j] = np.linalg.norm(w)
+        e1 = np.zeros(j + 2, complex); e1[0] = be
+        y = np.linalg.lstsq(H[:j + 2, :j + 1], e1, rcond=None)[0]
+        if np.linalg.norm(H[:j + 2, :j + 1] @ y - e1) <= tol * bn or H[j + 1, j] == 0:
+            break
+        V[:, j + 1] = w / H[j + 1, j]
+    return x0 + Z[:, :j + 1] @ y, j + 1
 
 
 # ------------------------------------------------------------------ device and leads
@@ -505,6 +544,36 @@ class BlockTridiag:
         for s in range(n - 2, -1, -1):
             X[s] = sla.lu_solve(self.lu[s], Y[s] - self.Up[s] @ X[s + 1], check_finite=False)
         return np.concatenate(X)
+
+
+class MRCoarse:
+    """Cholesky of W^H W, W = A U with U = diag(U_s) over slabs (minimal-residual coarse correction, used with
+    twolevel.TwoLevel(restrict='AU')). W_s = A[:, slab s] U_s lives on slabs s-1..s+1, so W^H W is block
+    pentadiagonal; it is assembled densely from the dense W_s."""
+
+    def __init__(self, dev, A, Us):
+        b, nsl = dev.sb, len(Us)
+        A = sp.csc_matrix(A)
+        W, rng = [], []
+        for s in range(nsl):
+            lo, hi = b[max(s - 1, 0)], b[min(s + 2, nsl)]
+            W.append(np.asarray((A[lo:hi, b[s]:b[s + 1]] @ Us[s]).todense()))
+            rng.append((lo, hi))
+        off = np.concatenate([[0], np.cumsum([u.shape[1] for u in Us])])
+        G = np.zeros((off[-1], off[-1]), complex)
+        for s in range(nsl):
+            for t in range(s, min(s + 3, nsl)):
+                lo, hi = max(rng[s][0], rng[t][0]), min(rng[s][1], rng[t][1])
+                if lo >= hi:
+                    continue
+                X = W[s][lo - rng[s][0]:hi - rng[s][0]].conj().T @ W[t][lo - rng[t][0]:hi - rng[t][0]]
+                G[off[s]:off[s + 1], off[t]:off[t + 1]] = X
+                G[off[t]:off[t + 1], off[s]:off[s + 1]] = X.conj().T
+        del W
+        self.cho = sla.cho_factor(G, check_finite=False)
+
+    def solve(self, B):
+        return sla.cho_solve(self.cho, B, check_finite=False)
 
 
 # ------------------------------------------------------------------ level 2: contour slab density matrix
