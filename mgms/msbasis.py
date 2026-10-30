@@ -140,8 +140,11 @@ class Device:
         assert np.abs(so[r] - so[c]).max() <= 1, "device blocks are not block tridiagonal"
         self.lead = FoldedLead(inp["lead"]["H00"], inp["lead"]["H01"], inp["lead"]["S00"], inp["lead"]["S01"],
                                fast=fast_lead)
+        lr = inp.get("lead_right")                                  # different right lead (e.g. under bias)
+        self.leadR = self.lead if lr is None else FoldedLead(lr["H00"], lr["H01"], lr["S00"], lr["S01"],
+                                                             fast=fast_lead)
         oL = O[tr["lead_left_block"]][self.lead.oL]                # lead-cell orbitals carrying g_L, g_R
-        oR = O[tr["lead_right_block"]][self.lead.oR]
+        oR = O[tr["lead_right_block"]][self.leadR.oR]
         P = (abs(H) + abs(S)).tocsr()
         self.bL = np.unique(P[O[tr["lead_left_block"]]][:, dev].nonzero()[1])
         self.bR = np.unique(P[O[tr["lead_right_block"]]][:, dev].nonzero()[1])
@@ -172,6 +175,8 @@ class Device:
 
     def _sigma(self, z):
         gL, gR = self.lead.surface_gfs(z)
+        if self.leadR is not self.lead:
+            gR = self.leadR.surface_gfs(z)[1]
         out = []
         for g, (Hld, Sld, Hdl, Sdl) in ((gL, self.cL), (gR, self.cR)):
             out.append((z * Sdl - Hdl) @ g @ (z * Sld - Hld))

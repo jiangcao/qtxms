@@ -5,6 +5,8 @@
 <dir>/blocks.txt        transport block (slab) index per atom
 <dir>/H.npz, S.npz      device H [eV] and overlap S (scipy.sparse.save_npz); S = I for orthogonal TB
 <dir>/lead_H00.npz ...  lead_{H,S}{00,01}: periodic lead cell and its coupling to the next cell along +x
+<dir>/leadR_H00.npz ... optional right lead (same orbital order as the right lead block), e.g. under bias;
+                        without it both leads are lead_*
 <dir>/meta.json         units, transport axis, block length, device / lead blocks, band edges, model info
 
 Model-specific extras may sit next to these (e.g. structure.npz of the Si sheet with bonds and species
@@ -19,8 +21,9 @@ from pathlib import Path
 LEAD_KEYS = ("H00", "H01", "S00", "S01")
 
 
-def write_inputs(out, labels, xyz, norb, blocks, H, S=None, lead=None, meta=None):
-    """lead: dict with H00, H01 (and S00, S01; default I, 0). meta: JSON-serialisable dict."""
+def write_inputs(out, labels, xyz, norb, blocks, H, S=None, lead=None, meta=None, lead_right=None):
+    """lead: dict with H00, H01 (and S00, S01; default I, 0); lead_right: same for a different right lead.
+    meta: JSON-serialisable dict."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     n = int(np.sum(norb))
@@ -33,16 +36,17 @@ def write_inputs(out, labels, xyz, norb, blocks, H, S=None, lead=None, meta=None
     np.savetxt(out / "blocks.txt", np.asarray(blocks, int), fmt="%d")
     sp.save_npz(out / "H.npz", sp.csr_matrix(H))
     sp.save_npz(out / "S.npz", sp.csr_matrix(S) if S is not None else sp.identity(n, format="csr"))
-    if lead is not None:
-        m = lead["H00"].shape[0]
-        lead = dict(dict(S00=sp.identity(m, format="csr"), S01=sp.csr_matrix((m, m))), **lead)
-        for k in LEAD_KEYS:
-            sp.save_npz(out / f"lead_{k}.npz", sp.csr_matrix(lead[k]))
+    for pre, ld in (("lead", lead), ("leadR", lead_right)):
+        if ld is not None:
+            m = ld["H00"].shape[0]
+            ld = dict(dict(S00=sp.identity(m, format="csr"), S01=sp.csr_matrix((m, m))), **ld)
+            for k in LEAD_KEYS:
+                sp.save_npz(out / f"{pre}_{k}.npz", sp.csr_matrix(ld[k]))
     json.dump(meta or {}, open(out / "meta.json", "w"), indent=1)
 
 
 def read_inputs(d):
-    """dict(labels, xyz, norb, blocks, H, S, lead (dict or None), meta)."""
+    """dict(labels, xyz, norb, blocks, H, S, lead (dict or None), lead_right (dict or None), meta)."""
     d = Path(d)
     with open(d / "device.xyz") as f:
         lines = f.read().splitlines()
@@ -52,7 +56,9 @@ def read_inputs(d):
     xyz = np.array([[float(v) for v in x[1:4]] for x in w])
     lead = ({k: sp.load_npz(d / f"lead_{k}.npz").tocsr() for k in LEAD_KEYS}
             if (d / "lead_H00.npz").exists() else None)
+    lead_right = ({k: sp.load_npz(d / f"leadR_{k}.npz").tocsr() for k in LEAD_KEYS}
+                  if (d / "leadR_H00.npz").exists() else None)
     return dict(labels=labels, xyz=xyz, norb=np.loadtxt(d / "norb.txt", dtype=int).ravel(),
                 blocks=np.loadtxt(d / "blocks.txt", dtype=int).ravel(),
-                H=sp.load_npz(d / "H.npz").tocsr(), S=sp.load_npz(d / "S.npz").tocsr(), lead=lead,
+                H=sp.load_npz(d / "H.npz").tocsr(), S=sp.load_npz(d / "S.npz").tocsr(), lead=lead, lead_right=lead_right,
                 meta=json.load(open(d / "meta.json")))

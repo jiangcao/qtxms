@@ -271,3 +271,21 @@ def test_mr_coarse(gauge):
     b = np.zeros(dev.n, complex); b[dev.bL] = B[:, -1]
     x, hist, _ = tl.solve(b, tol=1e-11)
     assert hist[-1] < 1e-11 and rel(x, mb.CSolver(A).solve(b)) < 1e-8
+
+
+def test_right_lead_shift(tmp_path, real_strip):
+    """A right lead written as leadR_* (left lead + dV S) round-trips, leaves Sigma_L unchanged, and its
+    surface GF at z equals the unshifted one at z - dV."""
+    inp = real_strip
+    dV = -0.15
+    lr = {k: inp["lead"][k] + (dV * inp["lead"]["S" + k[1:]] if k[0] == "H" else 0) for k in ("H00", "H01", "S00", "S01")}
+    write_inputs(tmp_path, inp["labels"], inp["xyz"], inp["norb"], inp["blocks"], inp["H"], inp["S"],
+                 lead=inp["lead"], meta=inp["meta"], lead_right=lr)
+    r = read_inputs(tmp_path)
+    assert r["lead_right"] is not None and abs(r["lead_right"]["H00"] - lr["H00"]).max() == 0
+    z = 0.7 + 0.05j
+    dev_b, dev_0 = mb.Device(r), mb.Device(inp)
+    assert rel(dev_b.sigma(z)[0], dev_0.sigma(z)[0]) < 1e-10
+    gR_shift = mb.FoldedLead(lr["H00"], lr["H01"], lr["S00"], lr["S01"]).surface_gfs(z)[1]
+    gR_ref = dev_0.lead.surface_gfs(z - dV)[1]
+    assert rel(gR_shift, gR_ref) < 1e-9
