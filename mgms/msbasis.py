@@ -608,10 +608,19 @@ def rho_contour(dev, blk, PL, PR, mu1, mu2, npts, log=log):
     return [-((a - a.conj().T) / 2j) / np.pi for a in acc]
 
 
-def level2_basis(rho, thr=1e-5):
-    """Per slab: eigenvectors of rho_ss with lambda > thr * lambda_max (largest first)."""
+def level2_basis(rho, thr=1e-5, S=None):
+    """Per slab: eigenvectors of rho_ss with lambda > thr * lambda_max (largest first).
+    S (list of slab overlaps S_ss): eigenproblem of L^H rho L (S = L L^H, eigenvalues = occupations in the
+    S metric), vectors mapped back by L^-H and orthonormalized."""
     V = []
-    for R in rho:
-        lam, X = np.linalg.eigh(0.5 * (R + R.conj().T))
-        V.append(X[:, lam > thr * lam[-1]][:, ::-1])
+    for s, R in enumerate(rho):
+        R = 0.5 * (R + R.conj().T)
+        if S is None:
+            lam, X = np.linalg.eigh(R)
+            V.append(X[:, lam > thr * lam[-1]][:, ::-1])
+            continue
+        Lc = np.linalg.cholesky(0.5 * (S[s] + S[s].conj().T))
+        lam, Y = np.linalg.eigh(Lc.conj().T @ R @ Lc)
+        X = sla.solve_triangular(Lc.conj().T, Y[:, lam > thr * lam[-1]][:, ::-1], lower=False)
+        V.append(np.linalg.qr(X)[0])
     return V
