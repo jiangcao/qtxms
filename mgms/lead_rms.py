@@ -52,10 +52,13 @@ class LeadCell:
         return E
 
 
-def slab_cell_map(inp, dev, s, tol=0.6):
-    """Slab-local orbital index for each lead-cell orbital (-1: atom missing in slab s)."""
+def slab_cell_map(inp, dev, s, tol=0.6, return_info=False):
+    """Slab-local orbital index for each lead-cell orbital (-1: no atom of that species within tol in slab s).
+    Lead-cell atoms are shifted by the block distance and matched one-to-one to slab atoms of the same label
+    (closest pairs first); slab atoms left unmatched (e.g. oxide) get no basis coefficient.
+    return_info: also dict(missing = unmatched cell atoms, extra = unmatched slab atoms per label, max_dist)."""
     tr, meta = inp["meta"]["transport"], inp["meta"]
-    xyz, blocks, norb = inp["xyz"], inp["blocks"], inp["norb"]
+    xyz, blocks, norb, lab = inp["xyz"], inp["blocks"], inp["norb"], inp["labels"]
     off = np.concatenate([[0], np.cumsum(norb)])
     ax, L = meta["axis"], meta["block_length"]
     per = meta.get("periodic")
@@ -66,19 +69,43 @@ def slab_cell_map(inp, dev, s, tol=0.6):
     if per:
         d[..., per["axis"]] -= per["length"] * np.round(d[..., per["axis"]] / per["length"])
     dist = np.linalg.norm(d, axis=2)
-    j = dist.argmin(1)
-    ok = dist[np.arange(len(ca)), j] < tol
-    loc = dev.loc
+    dist[lab[ca][:, None] != lab[sa][None]] = np.inf
+    pi, pj = np.unravel_index(np.argsort(dist, axis=None), dist.shape)
+    keep = dist[pi, pj] < tol
+    pi, pj = pi[keep], pj[keep]
+    match, used, dmax = -np.ones(len(ca), int), np.zeros(len(sa), bool), 0.0
+    for i, j in zip(pi, pj):                                 # greedy one-to-one, closest first
+        if match[i] < 0 and not used[j]:
+            match[i], used[j] = j, True
+            dmax = max(dmax, dist[i, j])
     m = []
     for i, a in enumerate(ca):
-        oc = np.arange(off[a], off[a + 1])
-        if ok[i]:
-            b = sa[j[i]]
+        if match[i] >= 0:
+            b = sa[match[i]]
             assert norb[b] == norb[a]
-            m.append(loc[np.arange(off[b], off[b + 1])])
+            m.append(dev.loc[np.arange(off[b], off[b + 1])])
         else:
-            m.append(-np.ones(len(oc), int))
-    return np.concatenate(m)
+            m.append(-np.ones(norb[a], int))
+    cmap = np.concatenate(m)
+    if not return_info:
+        return cmap
+    ex = lab[sa][~used]
+    info = dict(missing=int((match < 0).sum()), extra={k: int(v) for k, v in zip(*np.unique(ex, return_counts=True))},
+                max_dist=float(dmax))
+    return cmap, info
+
+
+def lead_rho_basis(cell, mu1, mu2, thr=1e-5, nk=64):
+    """Lead-cell basis: k integral of the Bloch projectors with E_n(k) in [mu1, mu2], eigenvectors with
+    occupation (S00 metric) above thr * max (mb.level2_basis with S)."""
+    from mgms import msbasis as mb
+    R = np.zeros((cell.n, cell.n), complex)
+    kk = np.linspace(-np.pi, np.pi, nk, endpoint=False)
+    for k in kk:
+        e, Z = sla.eigh(*cell.hk(k))
+        sel = (e > mu1) & (e < mu2)
+        R += Z[:, sel] @ Z[:, sel].conj().T / nk
+    return mb.level2_basis([R], thr, S=[cell.S00])[0]
 
 
 def to_cell(V, cmap):
@@ -331,13 +358,7 @@ if __name__ == "__main__":
     if a.rho or a.lead_rho:
         if a.lead_rho:
             m1, m2 = (Ec + float(x) for x in a.mu.split(","))
-            Rl = np.zeros((cell.n, cell.n), complex)
-            kk = np.linspace(-np.pi, np.pi, 64, endpoint=False)
-            for k in kk:
-                e, Z = sla.eigh(*cell.hk(k))
-                sel = (e > m1) & (e < m2)
-                Rl += Z[:, sel] @ Z[:, sel].conj().T / len(kk)
-            Phi = mb.level2_basis([Rl], a.l2_thr, S=[cell.S00])[0]
+            Phi = lead_rho_basis(cell, m1, m2, a.l2_thr)
             cmap = np.arange(cell.n)
             a.slab = "lead"
         else:
