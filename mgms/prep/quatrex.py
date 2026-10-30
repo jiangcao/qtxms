@@ -78,6 +78,11 @@ def main():
     p.add_argument("--potential", action="store_true",
                    help="add inputs/potential.npy to H as (V S + S V) / 2 (default: H as stored, no potential)")
     p.add_argument("--cut", type=float, default=0.0, help="drop |H|, |S| entries below cut (default keep all)")
+    p.add_argument("--cut-S", type=float, help="separate cut for S (default --cut); a large S cut can make the "
+                   "lead S(k) indefinite")
+    p.add_argument("--trim", action="store_true",
+                   help="drop the H, S entries coupling non-neighbouring blocks (minimal truncation for --cells); "
+                        "the largest dropped |H|, |S| are reported")
     p.add_argument("--nk", type=int, default=41, help="k points for the lead band edges")
     a = p.parse_args()
     t0 = time.time()
@@ -102,8 +107,9 @@ def main():
     n = int(off[-1])
     assert H.shape == (n, n) and S.shape == (n, n), f"H {H.shape}, S {S.shape}, sum(norb) {n}"
     H, S = symmetrize(H, "H"), symmetrize(S, "S")
-    if a.cut > 0:
-        H.data[np.abs(H.data) < a.cut] = 0; S.data[np.abs(S.data) < a.cut] = 0
+    cutS = a.cut if a.cut_S is None else a.cut_S
+    if a.cut > 0 or cutS > 0:
+        H.data[np.abs(H.data) < a.cut] = 0; S.data[np.abs(S.data) < cutS] = 0
         H.eliminate_zeros(); S.eliminate_zeros()
     print(f"{root.name}: {len(labels)} atoms {dict(zip(*np.unique(labels, return_counts=True)))}, {n} orbitals; "
           f"H nnz {H.nnz}, S nnz {S.nnz}; {time.time() - t0:.0f} s")
@@ -160,6 +166,19 @@ def main():
     print(f"  transport axis {'xyz'[ax]}, cell {acell:.4f} A, {ncell} cells; coupling range {rng:.3f} A -> "
           f"{m} cells per block, {nb} blocks, orbitals per block {[len(o) for o in O]}")
 
+    trimmed = None
+    if a.trim:
+        trimmed = {}
+        for nm in ("H", "S"):
+            M = sp.coo_matrix(H if nm == "H" else S)
+            far = np.abs(ob[M.row] - ob[M.col]) > 1
+            trimmed[nm] = dict(n=int(far.sum()), max=float(np.abs(M.data[far]).max()) if far.any() else 0.0)
+            M = sp.csr_matrix((M.data[~far], (M.row[~far], M.col[~far])), shape=M.shape)
+            if nm == "H":
+                H = M
+            else:
+                S = M
+        print(f"  trim to block-tridiagonal: dropped {trimmed}")
     P = (abs(H) + abs(S)).tocsr()
     r, c = P.nonzero()
     assert np.abs(ob[r] - ob[c]).max() <= 1, "H, S not block tridiagonal with these blocks (use a larger --cells)"
@@ -206,7 +225,7 @@ def main():
                                lead_cell=f"first block ({m} contact cells) and its coupling to the second"),
                 edges=dict(Ev_lead=Ev, Ec_lead=Ec, Eref=mid, right_lead_shift=dV),
                 source=dict(folder=str(root.resolve()), cells=int(ncell), cell_length=acell, cells_per_block=int(m),
-                            coupling_range=rng, potential=None if V is None else
+                            coupling_range=rng, cut=dict(H=a.cut, S=cutS), trimmed=trimmed, potential=None if V is None else
                             dict(min=float(V.min()), max=float(V.max()), convention="H += (V S + S V) / 2"),
                             lead_checks=checks, contacts=dict(left=cL, right=cR)))
     write_inputs(a.out, labels, xyz, norb, blocks, H, S, lead=lead, meta=meta, lead_right=lead_right)

@@ -10,11 +10,13 @@ from mgms import msbasis as mb
 p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 p.add_argument("--inputs", required=True)
 p.add_argument("--dE", default="0.05,0.15", help="energies - Ec_lead [eV]")
+p.add_argument("--Ec", type=float, help="reference edge for --dE (default Ec_lead of the inputs; set it to compare "
+               "input sets at the same absolute energies)")
 a = p.parse_args()
 inp = read_inputs(a.inputs)
 dev = mb.Device(inp)
 dev.sigma_cache = os.path.join("results_ms", "sigma", os.path.basename(os.path.normpath(a.inputs)))
-Ec = inp["meta"]["edges"]["Ec_lead"]
+Ec = inp["meta"]["edges"]["Ec_lead"] if a.Ec is None else a.Ec
 print(f"device {dev.n} orbitals, slabs {dev.ns}, |bL| {len(dev.bL)}, |bR| {len(dev.bR)}, "
       f"separate right lead {dev.leadR is not dev.lead}", flush=True)
 for dE in (float(x) for x in a.dE.split(",")):
