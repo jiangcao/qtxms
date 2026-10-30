@@ -4,3 +4,6 @@ __pycache__/
 inputs/
 .venv/
 gmon.out
+results_ms/
+results_cms/
+envs/gpaw/.pixi/

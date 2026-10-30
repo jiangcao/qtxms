@@ -147,8 +147,9 @@ def _bridging_O(pA, pB, phi, dO):
 
 
 def build_si_region(n_cells, nt, half_width, disorder, rough_rng=None, rough_rms=0.0,
-                    rough_corr=10.0, periodic_x=False, rough_2d=True, rough_window=None):
-    """Si channel + oxide shell occupying an n_cells x ny x nz box of the Si lattice."""
+                    rough_corr=10.0, periodic_x=False, rough_2d=True, rough_window=None, channel=None):
+    """Si channel + oxide shell occupying an n_cells x ny x nz box of the Si lattice.
+    channel: optional function of the lattice coordinates (n, 3) [a/4] -> bool, replacing the rough faces."""
     ny, nz = _nyz(nt)
     hy, hz = _hyz(half_width)
     n4y, n4z, nx4 = 4 * ny, 4 * nz, 4 * n_cells
@@ -165,6 +166,8 @@ def build_si_region(n_cells, nt, half_width, disorder, rough_rng=None, rough_rms
     X, Y, Z = coords.T
     ch = ((xyz[:, 1] >= yc - hy + prof[0][X, Z]) & (xyz[:, 1] <= yc + hy + prof[1][X, Z]) &
           (xyz[:, 2] >= zc - hz + prof[2][X, Y]) & (xyz[:, 2] <= zc + hz + prof[3][X, Y]))
+    if channel is not None:
+        ch = np.asarray(channel(coords), bool)
 
     nb = -np.ones((len(coords), 4), int)
     wrap = np.zeros((len(coords), 4))           # x shift (A) of the bonded periodic image
@@ -197,7 +200,7 @@ def build_si_region(n_cells, nt, half_width, disorder, rough_rng=None, rough_rms
 
     def nonbridging(i, direction, c_partner, k, c_key):
         d = direction.astype(float)
-        if c_partner[0] < 0 or c_partner[0] >= nx4:   # x-end face: keep O lateral (away from Au)
+        if not periodic_x and (c_partner[0] < 0 or c_partner[0] >= nx4):   # x-end face: keep O lateral
             d[0] = 0.0
         d /= np.linalg.norm(d)
         o = add_O(pos_si[i] + D_SIO_GEOM * d + disorder.do[disorder.key(c_key)][k])

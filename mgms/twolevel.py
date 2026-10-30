@@ -14,10 +14,15 @@ import scipy.sparse.linalg as spla
 
 
 class TwoLevel:
-    def __init__(self, A, U, smoother="gmres", k=10, alpha=None, beta=None):
+    def __init__(self, A, U, smoother="gmres", k=10, alpha=None, beta=None, coarse=None):
+        """coarse: optional object with solve(B) for A_c = U^H A U (e.g. msbasis.BlockTridiag built from
+        slab blocks); default: sparse LU of U^H A U."""
         self.A, self.U = A.tocsr(), U.tocsr()
         self.N = U.shape[1]
-        if self.N:
+        self.coarse = coarse
+        if coarse is not None:
+            self.Ac = None
+        elif self.N:
             Ac = (self.U.conj().T @ self.A @ self.U).tocsc()
             self.lu = spla.splu(Ac)
             # smallest singular value of A_c: near zero = spurious coarse band at this energy
@@ -26,7 +31,7 @@ class TwoLevel:
         self.nmv = 0
 
     def sigma_min_coarse(self):
-        if not self.N:
+        if not self.N or self.Ac is None:
             return np.nan
         if self.N < 2000:
             return np.linalg.svd(self.Ac.toarray(), compute_uv=False).min()
@@ -43,7 +48,8 @@ class TwoLevel:
     def Pc(self, r):
         if not self.N:
             return np.zeros_like(r)
-        return self.U @ self.lu.solve(self.U.conj().T @ r)
+        solve = self.coarse.solve if self.coarse is not None else self.lu.solve
+        return self.U @ solve(self.U.conj().T @ r)
 
     # ---------------- smoothers
     def smooth(self, r):

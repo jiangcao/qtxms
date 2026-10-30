@@ -1,0 +1,21 @@
+# DFT environment for input preparation only (GPAW LCAO -> generic input set read by the uv environment).
+#   export PIXI_CACHE_DIR=/usr/scratch/mont-fort15/jiacao/.cache/pixi   (home quota is full)
+#   pixi install --manifest-path envs/gpaw/pixi.toml
+#   pixi run --manifest-path envs/gpaw/pixi.toml python -m mgms.prep.mos2 ...   (from the repo root)
+[workspace]
+name = "mgms-gpaw"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+gpaw = ">=26.7"
+gpaw-data = "*"
+ase = "*"
+numpy = "*"
+scipy = "*"
+
+[activation.env]
+PYTHONPATH = "$PIXI_PROJECT_ROOT/../.."
+OMP_NUM_THREADS = "1"
+PYTHONNOUSERSITE = "1"     # ~/.local site-packages (old numpy / ase) must not leak in
