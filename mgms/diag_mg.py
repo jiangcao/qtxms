@@ -34,13 +34,7 @@ from mgms.twolevel import TwoLevel, gmres_fixed
 
 
 def sigma(E):
-    f = os.path.join(out, "sigma", f"sig_{E:.4f}.npz")
-    if os.path.exists(f):
-        z = np.load(f)
-        return z["SL"], z["SR"]
-    SL, SR = dev.sigma(E + 1e-6j)
-    np.savez(f, SL=SL, SR=SR)
-    return SL, SR
+    return dev.sigma(E + 1e-6j)
 
 
 def gmres_hist(op, r0, nb, it):

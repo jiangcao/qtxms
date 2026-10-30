@@ -18,7 +18,7 @@ Level 2 (block modes -> slab modes): contour-integrated slab density matrix of t
 Leads: exact Sigma(z) at complex z, lead interior folded onto its faces, then decimation of the folded chain
 (general: complex Hermitian H, any S; fast path for real H, S = I: qtmode face decimation on the smaller face).
 """
-import time
+import os, time
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
@@ -154,8 +154,23 @@ class Device:
         self.cL = [cut(M, oL, dev[self.bL]) for M in (H, S)] + [cut(M, dev[self.bL], oL) for M in (H, S)]
         self.cR = [cut(M, oR, dev[self.bR]) for M in (H, S)] + [cut(M, dev[self.bR], oR) for M in (H, S)]
 
+    sigma_cache = None              # directory: Sigma(z) is read from / written to sig_<Re z>_<Im z>.npz there
+
     def sigma(self, z):
         """Sigma_L on bL, Sigma_R on bR (device indices) at complex z: A_dl g_L A_ld, A_dr g_R A_rd."""
+        z = complex(z)
+        if self.sigma_cache:
+            f = os.path.join(self.sigma_cache, f"sig_{z.real:+.8f}_{z.imag:.8e}.npz")
+            if os.path.exists(f):
+                c = np.load(f)
+                return c["SL"], c["SR"]
+        out = self._sigma(z)
+        if self.sigma_cache:
+            os.makedirs(self.sigma_cache, exist_ok=True)
+            np.savez(f, SL=out[0], SR=out[1])
+        return out
+
+    def _sigma(self, z):
         gL, gR = self.lead.surface_gfs(z)
         out = []
         for g, (Hld, Sld, Hdl, Sdl) in ((gL, self.cL), (gR, self.cR)):

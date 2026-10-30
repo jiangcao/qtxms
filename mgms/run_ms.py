@@ -20,6 +20,8 @@ from mgms.twolevel import TwoLevel
 log = mb.log
 p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 p.add_argument("--inputs", required=True)
+p.add_argument("--sigma-cache", help="lead self-energy cache, shared by all runs on these inputs "
+               "(default results_ms/sigma/<inputs name>)")
 p.add_argument("--out", help="cache / results folder (default results_ms/<inputs name>[_nocore])")
 p.add_argument("--no-cores", action="store_true", help="tiles only (ab initio mode)")
 p.add_argument("--direct-l2", action="store_true",
@@ -47,12 +49,12 @@ a = p.parse_args()
 name = os.path.basename(os.path.normpath(a.inputs)) + ("_l2direct" if a.direct_l2 else "_nocore" if a.no_cores else "")
 out = a.out or os.path.join("results_ms", name)
 os.makedirs(os.path.join(out, "tiles"), exist_ok=True)
-os.makedirs(os.path.join(out, "sigma"), exist_ok=True)
 t0 = time.time()
 inp = read_inputs(a.inputs)
 meta = inp["meta"]
 Ec = meta["edges"]["Ec_lead"]
 dev = mb.Device(inp)
+dev.sigma_cache = a.sigma_cache or os.path.join("results_ms", "sigma", os.path.basename(os.path.normpath(a.inputs)))
 log(f"{name}: device {dev.n} orbitals, slabs {dev.ns}, |bL| {len(dev.bL)}, |bR| {len(dev.bR)}, "
     f"lead faces {len(dev.lead.Lf)}/{len(dev.lead.Rf)}, interior {len(dev.lead.I)}")
 
@@ -140,13 +142,7 @@ log(f"level 2 (thr {a.l2_thr:g}, {a.l2_metric} metric): N2 = {sum(N2)} {N2}; set
 
 # ------------------------------------------------------------------ transmission
 def sigma(E):
-    f = os.path.join(out, "sigma", f"sig_{E:.4f}.npz")
-    if os.path.exists(f):
-        z = np.load(f)
-        return z["SL"], z["SR"]
-    SL, SR = dev.sigma(E + 1e-6j)
-    np.savez(f, SL=SL, SR=SR)
-    return SL, SR
+    return dev.sigma(E + 1e-6j)
 
 
 def T_of(psi, GR):
@@ -155,7 +151,8 @@ def T_of(psi, GR):
 
 
 fres = os.path.join(out, "results" + ("" if a.l2_metric == "euclid" else f"_{a.l2_metric}") +
-                    ("" if a.l2_thr == 1e-5 else f"_thr{a.l2_thr:g}") + ".json")
+                    ("" if a.l2_thr == 1e-5 else f"_thr{a.l2_thr:g}") +
+                    ("" if a.mu == "0,0.395" else f"_mu{a.mu.replace(',', '_')}") + ".json")
 res = json.load(open(fres)) if os.path.exists(fres) else {}
 res.update(N1=N1, N2=N2, n=dev.n, slabs=dev.ns, cores=not a.no_cores)
 res.setdefault("E", {})

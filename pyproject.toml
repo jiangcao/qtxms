@@ -7,6 +7,7 @@ dependencies = [
     "numpy>=2.0",
     "scipy>=1.18.1",
     "pypardiso>=0.4.7; platform_machine == 'x86_64' or platform_machine == 'AMD64'",   # MKL wheels: x86-64 only; elsewhere qtmode/_pardiso_compat.py
+    "matplotlib>=3.11.2",
 ]
 
 [build-system]
