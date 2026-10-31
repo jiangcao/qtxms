@@ -85,8 +85,18 @@ through `--modes` (use the device options listed).
 |---|---|---|---|---|
 | `mos2_hfo2_n400` | default (5 cells per block) | 4 | 400 per slab, no cleanup = 1600 | 1.4e-5 at Ec + 0.02 / 0.05 / 0.15 / 0.30 eV |
 | `mos2_hfo2_trim_c3_n200` | `--cells 3 --trim` | 8 | 213 / 200 x 6 / 214 (end-slab cleanup) = 1627 | 6e-6 at Ec + 0.05 / 0.15 / 0.30 / 0.45 eV |
+| `mos2_hfo2_trim_c3_2win` | `--cells 3 --trim` | 8 | 438-479 per slab = 3661 (two windows, below) | QuaTrEx: 5e-5 without, 4e-5 with `--potential` |
 
 The per-energy values are in each `basis.json`.
+
+`mos2_hfo2_trim_c3_2win` is for biased devices. It is still built at zero potential, from two windows
+(`--mu=-0.15,0.6;0.5,0.9 --npts 24,16 --nmodes 200,400 --merge-thr 1e-12`): the second window covers the states that a
+potential lowering the bands (here inputs/potential.npy, 0 -> -0.2 V across the device) brings into the transport
+window. Each window's modes are weighted by sqrt(occupation / largest) and the two sets are merged by one SVD per
+slab (as in qtmode). QuaTrEx QTBM, mode space vs full orbitals at Ec + 0.05 / 0.15 / 0.30 / 0.45 eV with the
+potential: single-window basis (N 1627) up to 0.45% (at Ec + 0.45), this basis <= 0.0042%. The second window needs
+its occupations down to rounding level (400 modes); with 200 (occupation 1e-5) the error moves between energies
+(up to 0.05%).
 
 ## Tested: MoS2 on HfO2 (2808 atoms, 29 088 orbitals)
 
@@ -98,7 +108,7 @@ Transmission error of the mode space against the exact T of the same device:
 | device | basis | N total | max error, Ec + 0 … 0.5 eV |
 |---|---|---|---|
 | full (5 cells) | 400 per slab + end-slab cleanup | 1636 | 0.0043% (fine scan, 10 meV steps) |
-| full (5 cells) | 400 per slab + end-slab cleanup (this code, cleanup not converged) | 1900 | 0.0035% (4 energies) |
+| full (5 cells) | 400 per slab, this code (defaults, `--neig 800`) | 1600 | 0.0002% (Ec + 0.05, 0.15, 0.30, 0.45) |
 | full (5 cells) | 400 per slab | 1600 | 0.001% (Ec + 0.02, 0.05, 0.15, 0.30) |
 | full (5 cells) | 200 per slab | 800 | 0.010% (Ec + 0.02, 0.05, 0.15, 0.30) |
 | full (5 cells) | 100 per slab | 400 | 40% |

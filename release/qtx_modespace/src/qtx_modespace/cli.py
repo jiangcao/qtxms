@@ -5,7 +5,10 @@
   2. level 2 (direct): slab density matrices of the open device, contour integral over [Ec + mu1, Ec + mu2] with the
      exact lead self-energies; per slab the --nmodes eigenvectors with the largest occupation, from an eigensolve of
      the --neig largest (default 2 nmodes; the smallest occupations are near rounding level, and which vectors come
-     out there depends on the solve size), optionally only those with occupation > --floor * largest
+     out there depends on the solve size), optionally only those with occupation > --floor * largest.
+     Several windows (--mu 'a1,b1;a2,b2'): each set is taken as above, weighted X sqrt(lambda / lambda_max), stacked
+     and merged by one SVD per slab (kept: s^2 > --merge-thr s0^2), so that a higher window (e.g. for a bias that
+     lowers the bands) is not swamped by the occupations of the first
   3. optional cleanup (off by default; not needed for T): the level-2 bases of the slabs listed in --clean-slabs
      (e.g. 0,-1 = next to the leads) are put on the lead cell, and spurious lead bands in [Ec + win1, Ec + win2] are
      removed by appending optimized vectors (clean.RMS). Its convergence is sensitive to rounding-level changes of
@@ -61,27 +64,24 @@ def plot(fpng, res, title):
     fig.tight_layout(); fig.savefig(fpng, dpi=130); plt.close(fig)
 
 
-def build_basis(a, inp, dev, Ec, t0):
-    nsl, meta = len(dev.ns), inp["meta"]
-    neig = a.neig or 2 * a.nmodes
-    assert neig >= a.nmodes, "--neig < --nmodes"
-    # ------------------------------------------------------------------ level 2
-    mu = [Ec + float(x) for x in a.mu.split(",")]
-    feig = os.path.join(a.out, f"eig_mu{mu[0]:.4f}_{mu[1]:.4f}_n{a.npts}_top{neig}.npz")
+def slab_modes(a, dev, mu, npts, neig, nmodes):
+    """Top --nmodes (lambda, X) per slab of the contour slab density matrices over [mu1, mu2] (cached eigenpairs)."""
+    nsl = len(dev.ns)
+    feig = os.path.join(a.out, f"eig_mu{mu[0]:.4f}_{mu[1]:.4f}_n{npts}_top{neig}.npz")
     if os.path.exists(feig):
         z = np.load(feig)
         eig = [(z[f"l{s}"], z[f"X{s}"]) for s in range(nsl)]
         log(f"slab modes from {feig}")
     else:
-        frho = os.path.join(a.out, f"rho_mu{mu[0]:.4f}_{mu[1]:.4f}_n{a.npts}.npz")
+        frho = os.path.join(a.out, f"rho_mu{mu[0]:.4f}_{mu[1]:.4f}_n{npts}.npz")
         if os.path.exists(frho):
             z = np.load(frho)
             rho = [z[f"r{s}"] for s in range(nsl)]
             log(f"slab density matrices from {frho}")
         else:
             t = time.time()
-            rho = rho_contour(dev, mu[0], mu[1], a.npts, log=log)
-            log(f"contour rho [{mu[0]:.4f}, {mu[1]:.4f}] eV, {a.npts} points: {time.time() - t:.0f} s")
+            rho = rho_contour(dev, mu[0], mu[1], npts, log=log)
+            log(f"contour rho [{mu[0]:.4f}, {mu[1]:.4f}] eV, {npts} points: {time.time() - t:.0f} s")
             if a.save_rho:
                 np.savez(frho, **{f"r{s}": r for s, r in enumerate(rho)})
         t = time.time()
@@ -91,16 +91,43 @@ def build_basis(a, inp, dev, Ec, t0):
             rho[s] = None
         np.savez(feig, **{f"l{s}": e[0] for s, e in enumerate(eig)}, **{f"X{s}": e[1] for s, e in enumerate(eig)})
         log(f"slab eigenpairs (top {neig}): {time.time() - t:.0f} s")
-    eig = [(lam[:a.nmodes], X[:, :a.nmodes]) for lam, X in eig]
+    eig = [(lam[:nmodes], X[:, :nmodes]) for lam, X in eig]
     if a.floor > 0:
         eig = [(lam[lam > a.floor * lam[0]], X[:, lam > a.floor * lam[0]]) for lam, X in eig]
+    log(f"window [{mu[0]:.4f}, {mu[1]:.4f}] eV: N {[X.shape[1] for _, X in eig]}; smallest kept occupation / "
+        f"largest {[f'{lam[-1] / lam[0]:.1e}' for lam, _ in eig]}")
+    return eig
+
+
+def build_basis(a, inp, dev, Ec, t0):
+    nsl, meta = len(dev.ns), inp["meta"]
+    nmodes = [int(x) for x in str(a.nmodes).split(",")]
+    neig = a.neig or 2 * max(nmodes)
+    assert neig >= max(nmodes), "--neig < --nmodes"
+    # ------------------------------------------------------------------ level 2
+    wins = [[Ec + float(x) for x in w.split(",")] for w in a.mu.split(";")]
+    npts = [int(x) for x in str(a.npts).split(",")]
+    npts += [npts[-1]] * (len(wins) - len(npts))
+    nmodes += [nmodes[-1]] * (len(wins) - len(nmodes))
+    sets = [slab_modes(a, dev, mu, n, neig, m) for mu, n, m in zip(wins, npts, nmodes)]
+    if len(sets) == 1:
+        eig = sets[0]
+    else:   # merge the windows: per slab X sqrt(lambda / lambda_max) of every set, one SVD
+        eig = []
+        for s in range(nsl):
+            Y = np.hstack([X * np.sqrt(np.maximum(lam, 0) / lam[0]) for lam, X in (e[s] for e in sets)])
+            Q, sv, _ = np.linalg.svd(Y, full_matrices=False)
+            m = sv ** 2 > a.merge_thr * sv[0] ** 2
+            eig.append((sv[m] ** 2, Q[:, m]))
+        log(f"merged {len(sets)} windows: {[sum(e[s][1].shape[1] for e in sets) for s in range(nsl)]} vectors -> "
+            f"N {[X.shape[1] for _, X in eig]} (s^2 > {a.merge_thr:g} s0^2)")
     V = [X for _, X in eig]
     log(f"level 2: N {[v.shape[1] for v in V]}; smallest kept occupation / largest "
         f"{[f'{lam[-1] / lam[0]:.1e}' for lam, _ in eig]}")
 
     # ------------------------------------------------------------------ cleanup of the slabs next to the leads
-    info = dict(device=dict(meta, n=dev.n, slabs=dev.ns), mu=mu, npts=a.npts, nmodes=a.nmodes,
-                neig=neig, floor=a.floor,
+    info = dict(device=dict(meta, n=dev.n, slabs=dev.ns), mu=wins, npts=npts, nmodes=nmodes,
+                neig=neig, floor=a.floor, merge_thr=a.merge_thr if len(wins) > 1 else None,
                 occupations={s: dict(first=float(lam[0]), last=float(lam[-1])) for s, (lam, _) in enumerate(eig)},
                 clean={}, args=vars(a))
     slabs = sorted({int(x) % nsl for x in a.clean_slabs.split(",") if x.strip()})
@@ -137,10 +164,14 @@ def main(argv=None):
     g.add_argument("--trim", action="store_true", help="drop H, S entries coupling non-neighbouring blocks")
     g.add_argument("--potential", action="store_true", help="add inputs/potential.npy as (V S + S V) / 2")
     g = p.add_argument_group("basis")
-    g.add_argument("--mu", default="-0.15,0.6", help="contour window - Ec_lead [eV]")
-    g.add_argument("--npts", type=int, default=24, help="contour points")
-    g.add_argument("--nmodes", type=int, default=400, help="modes per slab (largest occupations)")
-    g.add_argument("--neig", type=int, help="eigenpairs computed per slab (default 2 * nmodes)")
+    g.add_argument("--mu", default="-0.15,0.6",
+                   help="contour window - Ec_lead [eV]; several windows separated by ';' are merged, e.g. "
+                        "'-0.15,0.6;0.5,0.9'")
+    g.add_argument("--npts", default="24", help="contour points (per window: comma list, last value repeats)")
+    g.add_argument("--merge-thr", type=float, default=1e-8,
+                   help="several windows: keep merged vectors with s^2 > merge_thr * s0^2")
+    g.add_argument("--nmodes", default="400", help="modes per slab (largest occupations); per window: comma list")
+    g.add_argument("--neig", type=int, help="eigenpairs computed per slab (default 2 * largest nmodes)")
     g.add_argument("--floor", type=float, default=0.0, help="drop modes with occupation < floor * largest")
     g.add_argument("--save-rho", action="store_true", help="keep the slab density matrices (<out>/rho_*.npz, large)")
     g.add_argument("--modes", help="saved basis directory (slab<s>.npy, slab<s>_orbitals.npy): skip the basis build")
