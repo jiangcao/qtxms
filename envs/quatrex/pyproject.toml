@@ -1,0 +1,13 @@
+[project]
+name = "mgms-quatrex-env"
+version = "0.1.0"
+description = "QuaTrEx production code (github.com/quatrex/quatrex) for running mode-space input sets (mgms.quatrex_ms)"
+requires-python = ">=3.13"
+dependencies = [
+    "quatrex @ git+https://github.com/quatrex/quatrex@95abf986",
+    "mpich",          # MPI runtime for the mpi4py wheels
+    "pydiso>=0.3.1",
+]
+
+[tool.uv]
+package = false

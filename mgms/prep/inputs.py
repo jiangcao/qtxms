@@ -8,6 +8,8 @@
 <dir>/leadR_H00.npz ... optional right lead (same orbital order as the right lead block), e.g. under bias;
                         without it both leads are lead_*
 <dir>/meta.json         units, transport axis, block length, device / lead blocks, band edges, model info
+<dir>/perm.npy          optional: for each orbital of H, its index in the source model's files (e.g. QuaTrEx
+                        hamiltonian.h5), when the preparation reordered orbitals
 
 Model-specific extras may sit next to these (e.g. structure.npz of the Si sheet with bonds and species
 codes); solvers that only need the generic part must not depend on them. The files are readable by
@@ -21,9 +23,9 @@ from pathlib import Path
 LEAD_KEYS = ("H00", "H01", "S00", "S01")
 
 
-def write_inputs(out, labels, xyz, norb, blocks, H, S=None, lead=None, meta=None, lead_right=None):
+def write_inputs(out, labels, xyz, norb, blocks, H, S=None, lead=None, meta=None, lead_right=None, perm=None):
     """lead: dict with H00, H01 (and S00, S01; default I, 0); lead_right: same for a different right lead.
-    meta: JSON-serialisable dict."""
+    meta: JSON-serialisable dict. perm: source orbital index of every orbital (saved as perm.npy)."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     n = int(np.sum(norb))
@@ -42,11 +44,14 @@ def write_inputs(out, labels, xyz, norb, blocks, H, S=None, lead=None, meta=None
             ld = dict(dict(S00=sp.identity(m, format="csr"), S01=sp.csr_matrix((m, m))), **ld)
             for k in LEAD_KEYS:
                 sp.save_npz(out / f"{pre}_{k}.npz", sp.csr_matrix(ld[k]))
+    if perm is not None:
+        assert len(perm) == n, f"perm has {len(perm)} entries, {n} orbitals"
+        np.save(out / "perm.npy", np.asarray(perm, np.int64))
     json.dump(meta or {}, open(out / "meta.json", "w"), indent=1)
 
 
 def read_inputs(d):
-    """dict(labels, xyz, norb, blocks, H, S, lead (dict or None), lead_right (dict or None), meta)."""
+    """dict(labels, xyz, norb, blocks, H, S, lead (dict or None), lead_right (dict or None), perm (or None), meta)."""
     d = Path(d)
     with open(d / "device.xyz") as f:
         lines = f.read().splitlines()
@@ -61,4 +66,4 @@ def read_inputs(d):
     return dict(labels=labels, xyz=xyz, norb=np.loadtxt(d / "norb.txt", dtype=int).ravel(),
                 blocks=np.loadtxt(d / "blocks.txt", dtype=int).ravel(),
                 H=sp.load_npz(d / "H.npz").tocsr(), S=sp.load_npz(d / "S.npz").tocsr(), lead=lead, lead_right=lead_right,
-                meta=json.load(open(d / "meta.json")))
+                perm=np.load(d / "perm.npy") if (d / "perm.npy").exists() else None, meta=json.load(open(d / "meta.json")))

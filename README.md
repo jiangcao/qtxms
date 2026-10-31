@@ -133,3 +133,51 @@ Si-specific extras for the level-1 core basis: `structure.npz` (species codes, b
 profiles) and the TB parameters in `meta.json`; `si_sheet.load_structure(dir, meta)` rebuilds `Structure` + params.
 Checked: H and the lead cell are bit-identical to the original qtmode build (3 × 5 nm, both models);
 lead E_c = 1.2051 eV (sp3s*).
+
+---
+
+# QuaTrEx devices: MoS2 on HfO2 (`mgms/prep/quatrex.py`, `run_l2_clean.py`, `exact_T.py`, `ms_scan.py`)
+
+Device `examples/device_MoS2HfO2_2808a_29088o` (deviceBuilder; 2808 atoms, 29 088 orbitals, non-orthogonal; Mo 26,
+S 13, Hf 10, O 4 orbitals per atom; lead cell 3120 orbitals, Ec_lead = 0.504 eV). `examples/` is not in git.
+```
+python -m mgms.prep.quatrex examples/device_MoS2HfO2_2808a_29088o --out inputs/mos2_hfo2          # 5 cells per block
+python -m mgms.prep.quatrex ... --out inputs/mos2_hfo2_trim_c3 --cells 3 --trim                     # block-tridiagonal truncation
+python -m mgms.exact_T --inputs inputs/mos2_hfo2 --dE 0.02,0.05 --Ec 0.50435      # -> results_ms/exact/<name>.json
+python -m mgms.run_l2_clean --inputs inputs/mos2_hfo2 --nmodes 200,400 --no-res --dE 0.05,0.15,0.3,0.45 \
+       --exact-from results_ms/exact/mos2_hfo2.json --Ec 0.50435
+python -m mgms.ms_scan --inputs inputs/mos2_hfo2 --modes results_ms/mos2_hfo2_l2direct/modes/mu-0.15_0.6_n400_lead \
+       --dE 0:0.5:0.01
+```
+`--Ec` fixes the energy reference (E = Ec + dE) so that exact T values in `results_ms/exact/*.json` are reused; a json
+with a different Ec is refused. Lead self-energies are cached under `results_ms/sigma/<name>/`.
+
+Truncation of H, S (exact T of the truncated device vs the full one, 0.02–0.50 eV above Ec):
+
+| set | blocks | max |ΔT/T| |
+|---|---|---|
+| `--trim --cells 4` | 4 cells | 0.18% |
+| `--trim --cells 3` | 3 cells | 0.86% (at 0.20 eV, otherwise ≤ 0.14%) |
+| `--cut 1e-4` (4 cells) | | 1.35% |
+| `--cut 1e-3` (4 cells) | | 6.7% |
+| `--cut 1e-2 --cut-S 1e-3` (3 cells) | | 40% |
+
+Direct level-2 basis (slab density-matrix eigenvectors of the open device, window [Ec − 0.15, Ec + 0.6] eV,
+24 contour points; end slabs cleaned of spurious lead bands with `lead_rms.RMS`), T_MS vs exact:
+
+| device | modes per slab | N | max error |
+|---|---|---|---|
+| full, 5 cells | 100 | 400 | 15–40% |
+| full, 5 cells | 200 | 800 | ≤ 1e-4 |
+| full, 5 cells | 400 + cleanup | 1636 | 4.3e-5 (`ms_scan`, 10 meV grid) |
+| trim, 3 cells | 200 (± cleanup) | ~800 / 1627 | ≤ 3e-5 |
+
+- A lead-CMS basis (`run_lead_cms.py`: lead Bloch projectors on the lead-like atoms of every slab, oxide rows zero)
+  fails here: −17 to −39% on all slabs; as end-slab basis it breaks an accurate level-2 basis (−0.003% → −23%).
+- Two-level GMRES (`--mg`, GMRES(k) smoother) does not reach 1e-8 in 100 iterations with any basis; the residual
+  stalls at ~2e-4 independent of k = 1…60 (`results_ms/mg_diag/`): the smoother, not the coarse space, is the
+  problem. A slab block-Jacobi / Schwarz smoother is the next thing to try.
+- Cost (4 threads): lead Σ per energy 170–300 s, exact solve 250–650 s, MS solve ~1 s; basis ~1.5–2 h
+  (contour ~80 min, dominated by Σ).
+
+Self-contained release of this pipeline (QuaTrEx folder → basis `.npy` → optional T): `release/qtx_modespace/`.

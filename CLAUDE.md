@@ -54,6 +54,13 @@ Per energy E:
   are optional side files.
 - Per-slab "slab" (CMS-like) basis in TB is selected by count (M lowest above mid-gap), not by window,
   because isolated-slab energies sit above the device band edge.
+- QuaTrEx devices with oxide (MoS2/HfO2): basis = direct level 2 (top-K eigenvectors of the contour slab ρ of
+  the open device, U⁽¹⁾ = I), not lead CMS — the lead-CMS basis cannot represent oxide / displaced atoms (−17…−39%).
+  Count K per slab (not an occupation threshold); end-slab spurious lead bands removed with RMS (generalized S).
+- H/S truncation only as block-tridiagonal trim (drop couplings beyond the next block), never a magnitude cut:
+  trim c4 0.18%, c3 0.86% vs cut 1e-4 1.35%, 1e-3 6.7% in exact T.
+- Exact T cached per input set in results_ms/exact/<name>.json keyed by dE with a fixed reference "Ec"
+  (--Ec 0.50435 for mos2_hfo2); runs refuse a json with another Ec.
 
 ## Code state (package `mgms/`; Python 3, numpy, scipy only)
 All modules live in `mgms/`; drivers are run from the repo root as `python -m mgms.<name>`
@@ -81,12 +88,27 @@ Ab initio TB track
   1st+2nd-neighbour H, NN overlap, gap ~3 eV, shuffled atoms, upper-triangle 1-based text files).
 - `README.md`  — usage and result tables.
 
+QuaTrEx / MoS2-HfO2 track (see README section "QuaTrEx devices")
+- `prep/quatrex.py` — deviceBuilder folder → generic inputs (`--cells`, `--trim`, `--cut`, `--cut-S`, `--potential`).
+- `exact_T.py` — exact QTBM T by sparse direct solve; `--json` merges into results_ms/exact/<name>.json, `--Ec`.
+- `run_l2_clean.py` — direct level-2 basis (`--nmodes` sweep), end-slab RMS cleanup, optional block residual
+  enrichment, MS T vs exact, `--mg` two-level GMRES; `--exact-from`, `--Ec`; saves modes/<tag>_slab<s>.npy.
+- `run_lead_cms.py` — lead-CMS basis on lead-like atoms of every slab (+ `--mg`). Negative result.
+- `lead_rms.py` — lead bands in a slab basis, spurious-band removal (Huang et al. 2018, non-orthogonal S).
+- `ms_scan.py` — saved basis on a fine energy grid vs exact (coarse-first order, exact json reuse).
+- `release/qtx_modespace/` — self-contained package (numpy/scipy/h5py, optional pypardiso): QuaTrEx folder →
+  contour ρ → basis npy (+ QuaTrEx orbital indices) → optional T_MS / T_exact. Checked bit-equivalent to mgms
+  (results_ms/release_check/).
+
 What works (verified)
 - Effective mass, 20 nm (25.6k points): LDM E_b = 1 eV (N = 799) → 7 GMRES its / ~76 matvecs per RHS,
   final T error ~1e-11 (MS alone 1.2%); no coarse: 42 its / 459 matvecs.
 - Length independence: 7.0 its at 10/20/40 nm with LDM; no coarse 33 → 46 → 76 its.
 - TB synthetic (5928 orbitals): LDM (N = 221) 8–9 its, final error ~5e-10; slab M=4 10–12 its; no coarse 56–90.
 - Reader: .npz / .mtx / text, per-species / per-atom orbitals, shuffled atoms all give identical T.
+- MoS2/HfO2 (29 088 orbitals, slabs 3483/8383/7862/3120): level 2 n200 (N 800) T error ≤ 1e-4; n400 + end-slab
+  cleanup (N 1636) ≤ 4.3e-5 on a 10 meV grid 0–0.5 eV; n100 15–40%. 3-cell trim n200 ≤ 3e-5.
+  MS solve ~1 s vs exact 250–650 s per energy; lead Σ 170–300 s per energy; basis ~1.5–2 h (contour Σ-dominated).
 
 Input preparation (`mgms/prep/`, see README)
 - `inputs.py`  — `write_inputs` / `read_inputs` of the generic input set.
@@ -114,6 +136,9 @@ Untested / known limitations
 - `run_tb.py` Chebyshev β is a crude estimate; use the GMRES smoother for TB.
 - No bias / Poisson / SCBA loop, no energy-adaptive basis, no carrier density (needs diag(G) or many RHS).
 - Spurious coarse bands only monitored (σ_min(A_c)); no mitigation implemented.
+- Two-level GMRES on MoS2/HfO2 stalls (residual 3e-3 → 2e-4 in 60 its, independent of smoother k = 1…60): the
+  GMRES(k) smoother is ineffective there; the release ships stand-alone MS T only.
+- Lead Σ (folding + Sancho–Rubio in Python) dominates every MoS2 run.
 
 ## Open problems
 1. Implement the nested two-level basis U = U⁽¹⁾U⁽²⁾ and a three-level V-cycle (smoother on level 1 with A₁)
@@ -121,7 +146,8 @@ Untested / known limitations
 2. Cheap basis construction for TB (sparse/shift-invert or randomized range finder for ρ in the window;
    reuse across energies and bias points).
 3. Smoother for indefinite TB complement: compare GMRES(k) vs two-interval Chebyshev / least-squares
-   polynomial on the gap-separated spectrum; cost per iteration.
+   polynomial on the gap-separated spectrum; cost per iteration. On MoS2/HfO2 GMRES(k) fails outright:
+   try slab block-Jacobi / additive Schwarz (exact slab solves) as smoother.
 4. Spurious bands: detect via σ_min(A_c(E)) and mitigate (complex shift E + iη_c in the coarse solve only,
    or basis filtering).
 5. Adaptive enrichment: append smoothed residuals to U (bootstrap AMG) energy by energy.
@@ -136,6 +162,7 @@ Untested / known limitations
 4. Cache U†HU and U†SU; rebuild only A_c(E) = E·U†SU − U†HU − U†ΣU per energy.
 5. Replace dense cluster eigh in `basis_ldm` with a sparse/randomized construction.
 6. Write up the formulation + results for Mathieu.
+7. Faster lead Σ (cache across runs exists; need a faster decimation / eigenvalue-based Σ for 3120-orbital cells).
 
 ## How to run
 Environment: `uv sync` (Python 3.12, numpy, scipy, pypardiso/MKL on x86-64; `mgms` and `qtmode` installed

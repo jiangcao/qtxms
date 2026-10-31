@@ -15,9 +15,10 @@ contact origin. A transport block is m cells with m * a >= the coupling range of
 the transport axis between coupled orbitals), so H, S are block tridiagonal. The first and last blocks are the
 leads (the QuaTrEx contacts are the device's own end cells). The lead cell is the first block and its coupling
 to its periodic image in the second block (matched atoms only; other atoms there, e.g. oxide, are device atoms).
-The right lead block is reordered into the lead-cell atom order. If the potential differs between the contacts
-(bias), the right lead is the left one shifted by dV S (written as leadR_*). Deviations of the end blocks from
-these lead cells are reported. Band edges from the left-lead bands around mid_gap_energy.
+The right lead block is reordered into the lead-cell atom order; perm.npy gives the QuaTrEx orbital of every
+orbital. If the potential differs between the contacts (bias), the right lead is the left one shifted by dV S
+(written as leadR_*). Deviations of the end blocks from these lead cells are reported.
+Band edges from the left-lead bands around mid_gap_energy.
 
     python -m mgms.prep.quatrex examples/device_MoS2HfO2_2808a_29088o --out inputs/mos2_hfo2
 """
@@ -228,7 +229,7 @@ def main():
                             coupling_range=rng, cut=dict(H=a.cut, S=cutS), trimmed=trimmed, potential=None if V is None else
                             dict(min=float(V.min()), max=float(V.max()), convention="H += (V S + S V) / 2"),
                             lead_checks=checks, contacts=dict(left=cL, right=cR)))
-    write_inputs(a.out, labels, xyz, norb, blocks, H, S, lead=lead, meta=meta, lead_right=lead_right)
+    write_inputs(a.out, labels, xyz, norb, blocks, H, S, lead=lead, meta=meta, lead_right=lead_right, perm=oo)
     np.savez(Path(a.out) / "lead_bands.npz", k=ks, E=E)
     print(f"-> {a.out}, {time.time() - t0:.0f} s")
 
