@@ -75,17 +75,66 @@ ranges for the device below), so `slab<s>_orbitals.npy` is simply a range there.
 `--modes DIR` reads `slab<s>.npy` back, checks `slab<s>_orbitals.npy` against the device (same `--cells`, `--trim`),
 and skips steps 3-4.
 
-## Included bases
+## Included bases (`data/`)
 
-Not in git; shipped as `qtx_modespace-0.1.0-data-<name>.tar.gz`. Both are direct level-2 bases of the device below,
-window Ec - 0.15 … Ec + 0.6 eV, 24 points, from an 800-vector eigensolve, and both are checked to give the same T
-through `--modes` (use the device options listed).
+Not in git; shipped as `qtx_modespace-0.1.0-data-<name>.tar.gz` (unpack into `data/`). Each `data/<name>/` is the
+output of one basis build of the device below, in the `--out` layout above (only `modes/` and `basis.json`):
+```
+data/<name>/basis.json                   how it was built and checked (see below)
+data/<name>/modes/slab<s>.npy            U_s: complex128, (n_s slab orbitals) x (N_s modes)
+data/<name>/modes/slab<s>_orbitals.npy   int64, length n_s: row i of U_s is orbital orbitals[i] of hamiltonian.h5
+data/<name>/modes/slab<s>_occupations.npy  float64, length N_s: weight of each column (largest first)
+```
+s = 0 … S-1 runs over the device slabs from the left lead to the right lead; the lead blocks (first and last
+block) are not in any slab and stay in full orbitals.
+
+How to read the files:
+- **Orbital indices.** `slab<s>_orbitals.npy` holds 0-based row / column indices of the QuaTrEx `hamiltonian.h5` /
+  `overlap.h5` (orbital order = atom order of `structure.xyz`, `num_orbitals_per_atom` orbitals per atom). They
+  depend only on the device options (`--cells`, `--trim`), not on the basis; for the included devices each slab is
+  a contiguous range (e.g. `mos2_hfo2_trim_c3_*` slab 0 = orbitals 1872 … 3743, after the 1872-orbital lead block).
+- **Basis vectors.** Columns of `slab<s>.npy` are orthonormal in the plain inner product (U_s^H U_s = I, not
+  S-orthonormal); the mode-space overlap U^H S U is formed with the projection. The full basis is block diagonal,
+  U = diag(U_0, …, U_{S-1}), i.e. U[orbitals_s, columns of slab s] = slab<s>.npy, zero elsewhere. The reduced
+  device matrices are
+      H_red[s, t] = U_s^H H[orbitals_s][:, orbitals_t] U_t,   S_red likewise,
+  nonzero for |s - t| <= 1 (block tridiagonal; with `--trim` the dropped couplings are dropped here too). The
+  lead blocks couple to slab 0 / S-1 through H[lead, orbitals_0] U_0. Any potential is added to H (and S-weighted)
+  before the projection: a basis is a fixed set of vectors, reused for every potential and energy.
+- **Occupations.** For a single window: eigenvalues of the contour slab density matrix rho_ss of each kept column
+  (electrons per mode over the window; columns sorted by it). For several windows (`*_2win`): the
+  squared singular values s^2 of the merged, weighted stack (relative weights; the smallest kept s^2 / s0^2 is the
+  merge threshold 1e-12). Only the ratio to the first value is meaningful: it shows how far down the basis reaches
+  (about 1e-7 or below is converged for T here).
+- **basis.json.** `device` (blocks, slab sizes `slabs`, lead edges `edges`, trim info), `mu` (window(s) in eV,
+  absolute), `npts`, `nmodes`, `neig`, `merge_thr`, `N` (columns per slab), `clean` (end-slab cleanup, if any),
+  `args` (command line), and the transmission checks (`transmission`: own solver; `quatrex_check_*`: QuaTrEx QTBM
+  through `to_quatrex`, mode space vs full orbitals).
+
+Use a basis with `--modes data/<name>/modes` and the device options of the table (the orbital check refuses a
+mismatch), or apply it to QuaTrEx with `python -m qtx_modespace.to_quatrex FOLDER --modes data/<name>/modes ...`.
+In Python:
+```python
+import numpy as np, h5py, scipy.sparse as sp
+d = "data/mos2_hfo2_n400/modes"
+with h5py.File("DEVICE/inputs/hamiltonian.h5") as f:          # one triangle stored: complete it
+    g = f["[0, 0, 0]"]; H = sp.coo_matrix((g["data"][()], (g["row"][()], g["col"][()])), g.attrs["shape"]).tocsr()
+H = H + sp.triu(H, 1).conj().T if (sp.tril(H, -1).nnz == 0) else H
+U = [np.load(f"{d}/slab{s}.npy") for s in range(4)]
+o = [np.load(f"{d}/slab{s}_orbitals.npy") for s in range(4)]
+H01 = U[0].conj().T @ (H[o[0]][:, o[1]] @ U[1])                # reduced coupling slab 0 - slab 1
+```
+
+All included bases are direct level-2 bases of the device below, built at zero potential; single-window ones over
+Ec - 0.15 … Ec + 0.6 eV with 24 points from an 800-vector eigensolve. Every check reads the
+saved files back through `--modes` (own solver) or `to_quatrex --modes` (QuaTrEx).
 
 | `data/<name>` | device options | slabs | N | T_MS vs exact (same device) |
 |---|---|---|---|---|
 | `mos2_hfo2_n400` | default (5 cells per block) | 4 | 400 per slab, no cleanup = 1600 | 1.4e-5 at Ec + 0.02 / 0.05 / 0.15 / 0.30 eV |
 | `mos2_hfo2_trim_c3_n200` | `--cells 3 --trim` | 8 | 213 / 200 x 6 / 214 (end-slab cleanup) = 1627 | 6e-6 at Ec + 0.05 / 0.15 / 0.30 / 0.45 eV |
 | `mos2_hfo2_trim_c3_2win` | `--cells 3 --trim` | 8 | 438-479 per slab = 3661 (two windows, below) | QuaTrEx: 5e-5 without, 4e-5 with `--potential` |
+| `mos2_hfo2_2win` | default (5 cells per block) | 4 | 537 / 542 / 536 / 512 = 2127 (two windows, below) | QuaTrEx: 4e-6 without, 2.2e-4 with `--potential` |
 
 The per-energy values are in each `basis.json`.
 
@@ -97,6 +146,19 @@ slab (as in qtmode). QuaTrEx QTBM, mode space vs full orbitals at Ec + 0.05 / 0.
 potential: single-window basis (N 1627) up to 0.45% (at Ec + 0.45), this basis <= 0.0042%. The second window needs
 its occupations down to rounding level (400 modes); with 200 (occupation 1e-5) the error moves between energies
 (up to 0.05%).
+
+`mos2_hfo2_2win` is the same construction on the default 5-cell device (`--mu=-0.15,0.6;0.5,0.9 --npts 24,16
+--nmodes 400,800 --neig 800 --merge-thr 1e-12`). The two windows overlap strongly here, so the merge keeps only
+about 530 columns per slab. QuaTrEx QTBM, mode space vs full orbitals at Ec + 0.05 / 0.15 / 0.30 / 0.45 eV:
+
+| basis | N | no potential | with `--potential` (0 -> -0.2 V) |
+|---|---|---|---|
+| `mos2_hfo2_n400` (one window) | 1600 | 0.0002% | +0.008 / +0.045 / +0.024 / +0.009% |
+| `mos2_hfo2_2win` | 2127 | 0.0004% | +0.003 / +0.022 / +0.001 / -0.014% |
+
+On this device the single-window basis already holds up under the potential (its 400 modes per slab reach
+occupation ~1e-14, unlike the 200 of the 3-cell basis); the second window halves the largest error for 33% more
+columns. Neither reaches 0.01% at every energy with the potential.
 
 ## Tested: MoS2 on HfO2 (2808 atoms, 29 088 orbitals)
 
