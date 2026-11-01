@@ -133,6 +133,7 @@ saved files back through `--modes` (own solver) or `to_quatrex --modes` (QuaTrEx
 |---|---|---|---|---|
 | `mos2_hfo2_n400` | default (5 cells per block) | 4 | 400 per slab, no cleanup = 1600 | 1.4e-5 at Ec + 0.02 / 0.05 / 0.15 / 0.30 eV |
 | `mos2_hfo2_trim_c3_n200` | `--cells 3 --trim` | 8 | 213 / 200 x 6 / 214 (end-slab cleanup) = 1627 | 6e-6 at Ec + 0.05 / 0.15 / 0.30 / 0.45 eV |
+| `mos2_hfo2_2win` | default (5 cells per block) | 4 | 512-542 per slab = 2127 (two windows, below) | QuaTrEx: 4e-6 without, 2.2e-4 with `--potential` |
 | `mos2_hfo2_trim_c3_2win` | `--cells 3 --trim` | 8 | 438-479 per slab = 3661 (two windows, below) | QuaTrEx: 5e-5 without, 4e-5 with `--potential` |
 | `mos2_hfo2_2win` | default (5 cells per block) | 4 | 537 / 542 / 536 / 512 = 2127 (two windows, below) | QuaTrEx: 4e-6 without, 2.2e-4 with `--potential` |
 
@@ -146,6 +147,12 @@ slab (as in qtmode). QuaTrEx QTBM, mode space vs full orbitals at Ec + 0.05 / 0.
 potential: single-window basis (N 1627) up to 0.45% (at Ec + 0.45), this basis <= 0.0042%. The second window needs
 its occupations down to rounding level (400 modes); with 200 (occupation 1e-5) the error moves between energies
 (up to 0.05%).
+
+`mos2_hfo2_2win` is the same construction on the default 5-cell device (`--nmodes 400,800 --neig 800`, other
+options as above; second-window contour 2.2 h). QuaTrEx, mode space vs full orbitals at Ec + 0.05 / 0.15 / 0.30 /
+0.45 eV with the potential: +0.0026 / +0.022 / +0.0010 / -0.014% (the one-window `mos2_hfo2_n400`: +0.008 / +0.045 /
++0.024 / +0.009%); without the potential <= 0.0004%. On this device the one-window basis (occupations down to
+rounding level at 400 modes) already holds under this bias; the second window halves the largest error.
 
 `mos2_hfo2_2win` is the same construction on the default 5-cell device (`--mu=-0.15,0.6;0.5,0.9 --npts 24,16
 --nmodes 400,800 --neig 800 --merge-thr 1e-12`). The two windows overlap strongly here, so the merge keeps only
