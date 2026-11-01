@@ -204,3 +204,11 @@ solve 4–9 min.
 - The coarse system is meant as a stand-alone mode-space solver. Used as the coarse level of a two-level GMRES with a
   GMRES smoother it converges slowly on this device (residual 3e-3 -> 2e-4 in 60 iterations, independent of the
   number of smoother steps), so no iterative refinement is included.
+
+## Release 0.1.0
+
+Tag `qtx_modespace-v0.1.0`. Release files (archived with a `SHA256SUMS` file, which is not in git so that the
+package can carry this README): `qtx_modespace-0.1.0-py3-none-any.whl`, `qtx_modespace-0.1.0.tar.gz` (`uv build`),
+and one data tarball per included basis, `qtx_modespace-0.1.0-data-<name>.tar.gz` with `<name>/modes/` and
+`<name>/basis.json`. Unpack one and pass `--modes <name>/modes` with the device options of the table above.
+The QuaTrEx production runs (`to_quatrex`, `compare_quatrex`) used github.com/quatrex/quatrex at commit 95abf986.
