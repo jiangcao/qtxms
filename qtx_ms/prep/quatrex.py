@@ -1,4 +1,4 @@
-"""Read a QuaTrEx / deviceBuilder device folder into the generic input set (mgms.prep.inputs).
+"""Read a QuaTrEx / deviceBuilder device folder into the generic input set (qtx_ms.prep.inputs).
 
 Folder layout (as written by deviceBuilder, e.g. examples/device_MoS2HfO2_2808a_29088o):
     quatrex_config.toml        [device] transport_direction, num_orbitals_per_atom, contacts (origin, lattice
@@ -7,7 +7,9 @@ Folder layout (as written by deviceBuilder, e.g. examples/device_MoS2HfO2_2808a_
     inputs/hamiltonian.h5      group "[0, 0, 0]": coo row / col / data, attrs shape    (eV)
     inputs/overlap.h5          same for S
     inputs/potential.npy       optional, per orbital or per atom (eV); used only with --potential
-Only the R = [0, 0, 0] block is used (kpoint_grid 1 1 1: no transverse periodicity).
+Only the R = [0, 0, 0] block is used (kpoint_grid 1 1 1). deviceBuilder folds the transverse images of the
+supercell into it (Gamma point), so H, S couple atoms across the y / z faces: every transverse axis of the
+Lattice along which a coupling spans more than half a period goes into meta["periodic"] (minimum image).
 With --potential, as in QuaTrEx (electron/solver.py _apply_potential): H += (V S + S V) / 2.
 
 Blocks: the contact lattice vector a (along the transport axis) defines primitive cells, counted from the left
@@ -20,7 +22,7 @@ orbital. If the potential differs between the contacts (bias), the right lead is
 (written as leadR_*). Deviations of the end blocks from these lead cells are reported.
 Band edges from the left-lead bands around mid_gap_energy.
 
-    python -m mgms.prep.quatrex examples/device_MoS2HfO2_2808a_29088o --out inputs/mos2_hfo2
+    python -m qtx_ms.prep.quatrex examples/device_MoS2HfO2_2808a_29088o --out inputs/mos2_hfo2
 """
 import argparse, json, time, tomllib
 from pathlib import Path
@@ -65,6 +67,32 @@ def symmetrize(M, name):
     raise ValueError(f"{name} is not Hermitian (max |M - M^H| = {d:.2e})")
 
 
+def detect_periodic(xyz, norb, H, S, lat, ax, tol=1e-3):
+    """[{"axis": k, "length": L}] for the transverse axes k of the (orthorhombic) supercell Lattice along which
+    |H| + |S| > tol couples two atoms more than L / 2 apart, i.e. through the periodic image; and the largest
+    minimum-image |d_k| of those couplings (must stay below L / 2)."""
+    if lat is None:
+        return [], {}
+    assert np.abs(lat - np.diag(np.diag(lat))).max() < 1e-8, "periodic detection needs an orthorhombic Lattice"
+    atom = np.repeat(np.arange(len(norb)), norb)
+    P = (abs(H) + abs(S)).tocoo()
+    k = P.data > tol
+    ia, ja = atom[P.row[k]], atom[P.col[k]]
+    keep = ia < ja
+    D = xyz[ja[keep]] - xyz[ia[keep]]
+    per, info = [], {}
+    for t in range(3):
+        if t == ax:
+            continue
+        L = float(lat[t, t])
+        if np.abs(D[:, t]).max() > 0.5 * L:
+            per.append(dict(axis=t, length=L))
+            Dm = D[:, t] - L * np.round(D[:, t] / L)
+            info[t] = dict(raw_max=float(np.abs(D[:, t]).max()), image_max=float(np.abs(Dm).max()),
+                           wrapped=int((np.abs(D[:, t]) > 0.5 * L).sum()), pairs=int(len(D)))
+    return per, info
+
+
 def coupling_range(M, x, off):
     """Max |x_i - x_j| over the nonzeros of M (orbital coordinates x)."""
     r, c = M.nonzero()
@@ -90,7 +118,7 @@ def main():
     root = Path(a.folder)
     cfg = tomllib.loads((root / "quatrex_config.toml").read_text())
     dc = cfg["device"]
-    ax = "abc".index(dc["transport_direction"])
+    ax = {"a": 0, "b": 1, "c": 2, "x": 0, "y": 1, "z": 2}[dc["transport_direction"]]   # deviceBuilder writes a|b|c or x|y|z
     norb_sp = dc["num_orbitals_per_atom"]
     cL = next(c for c in dc["contacts"] if c["name"] == "left")
     cR = next(c for c in dc["contacts"] if c["name"] == "right")
@@ -101,6 +129,18 @@ def main():
         print(f"  kpoint_grid {dc['kpoint_grid']}: transverse k not supported, using Gamma ([0, 0, 0] block)")
 
     labels, xyz, lat = read_xyz(root / "inputs" / "structure.xyz")
+    def end_cells(a_):                      # atoms in the first and the last primitive cell
+        c_ = np.floor((xyz[:, ax] - x0) / a_ + 1e-9).astype(int)
+        return (c_ == 0).sum(), (c_ == c_.max()).sum()
+    if lat is not None and len(set(end_cells(acell))) > 1:
+        # contact vectors are rounded (3.168 for 3.16758): over ~100 cells the cell edges drift onto atom planes and
+        # the last cell is cut. Then take the period from the supercell length (only then: keeps older devices' blocks).
+        Lx = float(np.linalg.norm(lat[ax]))
+        nc = round(Lx / acell)
+        if nc and abs(Lx / acell - nc) < 0.05 and len(set(end_cells(Lx / nc))) == 1:
+            print(f"  end cells {end_cells(acell)} atoms: contact cell {acell:.6f} A -> {Lx / nc:.6f} A "
+                  f"(structure Lattice {Lx:.4f} A / {nc} cells)")
+            acell = Lx / nc
     norb = np.array([norb_sp[s] for s in labels])
     off = np.concatenate([[0], np.cumsum(norb)])
     H = read_h5(root / "inputs" / "hamiltonian.h5")
@@ -108,6 +148,8 @@ def main():
     n = int(off[-1])
     assert H.shape == (n, n) and S.shape == (n, n), f"H {H.shape}, S {S.shape}, sum(norb) {n}"
     H, S = symmetrize(H, "H"), symmetrize(S, "S")
+    periodic, pinfo = detect_periodic(xyz, norb, H, S, lat, ax)
+    print(f"  periodic transverse axes: {periodic} {pinfo}")
     cutS = a.cut if a.cut_S is None else a.cut_S
     if a.cut > 0 or cutS > 0:
         H.data[np.abs(H.data) < a.cut] = 0; S.data[np.abs(S.data) < cutS] = 0
@@ -221,7 +263,7 @@ def main():
 
     meta = dict(name=f"{root.name} (QuaTrEx / deviceBuilder)", model="QuaTrEx input, non-orthogonal",
                 units=dict(energy="eV", length="Angstrom"), orthogonal=False, axis=ax,
-                block_length=float(m * acell), lead_cell_length=float(m * acell), nblocks=int(nb), periodic=None,
+                block_length=float(m * acell), lead_cell_length=float(m * acell), nblocks=int(nb), periodic=periodic or None,
                 transport=dict(device_blocks=list(range(1, nb - 1)), lead_left_block=0, lead_right_block=int(nb - 1),
                                lead_cell=f"first block ({m} contact cells) and its coupling to the second"),
                 edges=dict(Ev_lead=Ev, Ec_lead=Ec, Eref=mid, right_lead_shift=dV),
