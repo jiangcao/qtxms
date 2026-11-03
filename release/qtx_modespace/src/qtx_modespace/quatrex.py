@@ -31,6 +31,13 @@ def read_xyz(f):
     return np.array([x[0] for x in w]), np.array([[float(v) for v in x[1:4]] for x in w])
 
 
+def read_lattice(f):
+    """Lattice="..." of an extended xyz comment line as a 3 x 3 array (rows = vectors), or None."""
+    with open(f) as fh:
+        fh.readline(); c = fh.readline()
+    return np.array(c.split('Lattice="')[1].split('"')[0].split(), float).reshape(3, 3) if 'Lattice="' in c else None
+
+
 def read_h5(f, key="[0, 0, 0]", log=print):
     import h5py
     with h5py.File(f) as h:
@@ -71,7 +78,7 @@ def read_quatrex(folder, cells=None, trim=False, potential=False, nk=41, log=pri
     t0 = time.time()
     root = Path(folder)
     dc = tomllib.loads((root / "quatrex_config.toml").read_text())["device"]
-    ax = "abc".index(dc["transport_direction"])
+    ax = {"a": 0, "b": 1, "c": 2, "x": 0, "y": 1, "z": 2}[dc["transport_direction"]]   # deviceBuilder writes a|b|c or x|y|z
     norb_sp = dc["num_orbitals_per_atom"]
     cL = next(c for c in dc["contacts"] if c["name"] == "left")
     acell = float(np.linalg.norm(cL["lattice_vectors"][ax]))
@@ -81,6 +88,19 @@ def read_quatrex(folder, cells=None, trim=False, potential=False, nk=41, log=pri
         log(f"  kpoint_grid {dc['kpoint_grid']}: transverse k not supported, using the [0, 0, 0] block")
 
     labels, xyz = read_xyz(root / "inputs" / "structure.xyz")
+    lat = read_lattice(root / "inputs" / "structure.xyz")
+    def end_cells(a_):                      # atoms in the first and the last primitive cell
+        c_ = np.floor((xyz[:, ax] - x0) / a_ + 1e-9).astype(int)
+        return (c_ == 0).sum(), (c_ == c_.max()).sum()
+    if lat is not None and len(set(end_cells(acell))) > 1:
+        # contact vectors are rounded (3.168 for 3.16758): over ~100 cells the cell edges drift onto atom planes and
+        # the last cell is cut. Then take the period from the supercell length (only then: keeps older devices' blocks).
+        Lx = float(np.linalg.norm(lat[ax]))
+        nc = round(Lx / acell)
+        if nc and abs(Lx / acell - nc) < 0.05 and len(set(end_cells(Lx / nc))) == 1:
+            log(f"  end cells {end_cells(acell)} atoms: contact cell {acell:.6f} A -> {Lx / nc:.6f} A "
+                  f"(structure Lattice {Lx:.4f} A / {nc} cells)")
+            acell = Lx / nc
     norb = np.array([norb_sp[s] for s in labels])
     off = np.concatenate([[0], np.cumsum(norb)])
     n = int(off[-1])
