@@ -55,7 +55,7 @@ for v in a.variants.split(","):
     lam, X = lam[::-1], X[:, ::-1]
     r = dict(t=info["t"], n_emb=info["n_emb"], drho=float(np.linalg.norm(rho - rho_ref, 2)),
              docc=float(np.abs(lam[:200] - sr[:200]).max()))
-    for cut in (1e-5, 1e-6, 1e-7):
+    for cut in (1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10):
         k, kr = int((lam > cut).sum()), int((sr > cut).sum())
         U, Uref = X[:, :k], Ur[:, :kr]
         r[f"{cut:g}"] = dict(k=k, k_ref=kr, dist=float(np.linalg.norm(U - Uref @ (Uref.T @ U), 2)) if k else 0.0)
