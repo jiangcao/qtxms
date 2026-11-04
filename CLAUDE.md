@@ -306,7 +306,10 @@ QuaTrEx / MoS2-HfO2 track (see README section "QuaTrEx devices")
 - `exact_T.py` — exact QTBM T by sparse direct solve; `--json` merges into results_ms/exact/<name>.json, `--Ec`.
 - `run_l2_clean.py` — direct level-2 basis (`--nmodes` sweep), end-slab RMS cleanup, optional block residual
   enrichment, MS T vs exact, `--mg` two-level GMRES; `--exact-from`, `--Ec`; saves modes/<tag>_slab<s>.npy.
-- `run_lead_cms.py` — lead-CMS basis on lead-like atoms of every slab (+ `--mg`). Negative result.
+- `run_lead_cms.py` — lead-CMS basis on lead-like atoms of every slab (+ `--mg`). Negative result. Revisited 2026-11-04 with lower cuts
+  (results_ms/run_leadcms_sweep.sh, window Ec −0.15…+0.6, 64 k): the lead-cell ρ (trace 56) decays fast, N per cell
+  only 204 / 245 / 291 at 1e-7 / 1e-9 / 1e-11 (+8–10 RMS); T err median 0.21–0.27 on the 51-pt grid, flat in the cut
+  (old N 84: 0.33). Representability-limited (no coefficients on ~880 unmatched oxide atoms, no slab-face vectors).
 - `lead_rms.py` — lead bands in a slab basis, spurious-band removal (Huang et al. 2018, non-orthogonal S).
 - `ms_scan.py` — saved basis on a fine energy grid vs exact (coarse-first order, exact json reuse), MS residual.
 - `prep/compare_qtbm.py` — QuaTrEx QTBM (generate_inputs style) vs qtx_ms: injection, psi fit, T (two stages / envs).
