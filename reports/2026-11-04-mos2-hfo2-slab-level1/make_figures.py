@@ -1,5 +1,6 @@
 """Slab level 1 (local rho per slab, CAP+OBC embedding, 24-pt contour, window Ec - 0.15 ... + 0.6 eV) on the
-2808-atom MoS2/HfO2 device: T and |T_MS1 - T| / T vs E for the local-rho cuts 1e-5 ... 1e-10 (N1 in the legend).
+2808-atom MoS2/HfO2 device: T and |T_MS1 - T| / T vs E for the local-rho cuts 1e-5 ... 1e-10 (N1 in the legend). MS1 only: the level-2
+cut is not tuned yet.
     uv run python reports/2026-11-04-mos2-hfo2-slab-level1/make_figures.py
 """
 import json, os
@@ -36,7 +37,7 @@ def style(ax):
     ax.tick_params(colors=MUTED, labelcolor=INK, labelsize=9)
 
 
-for level in (1, 2):
+for level in (1,):
     fig, (a1, a2) = plt.subplots(2, 1, figsize=(7.6, 8.0), sharex=True, height_ratios=[1, 1.15])
     fig.patch.set_facecolor(SURF)
     for a in (a1, a2):
@@ -68,11 +69,11 @@ for level in (1, 2):
     print("->", f)
 
 
-# error summary vs basis size: median and max over the 51 energies, MS1 and MS2
+# error summary vs basis size: median and max over the 51 energies (MS1 only; level 2 not tuned yet)
 fig, ax = plt.subplots(figsize=(6.4, 4.4))
 fig.patch.set_facecolor(SURF)
 style(ax)
-for level, c, m in ((1, "#2a78d6", "o"), (2, "#eb6834", "s")):
+for level, c, m in ((1, "#2a78d6", "o"),):
     rows = [load(t, level) for t in CUTS]
     N = np.array([r[3] if level == 1 else r[4] for r in rows])
     med = np.array([np.median(np.abs(r[1] - r[2]) / r[2]) for r in rows])
