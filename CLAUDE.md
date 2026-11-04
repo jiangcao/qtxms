@@ -203,6 +203,10 @@ Per energy E:
   1e-6 N1 1305 1.5e-4 / 2.5e-2 (1), MS2 4.4e-4 / 4.8e-2; 1e-7 N1 1831 3.3e-5 / 5.5e-3 (0), MS2 3.2e-4 / 2.0e-2.
   Tile partition (8 tiles): 1e-5 N1 1563 9.9e-4 / 4.0e-2, 1e-6 N1 2264 1.9e-4 / 2.9e-2: slabs reach the same MS1
   accuracy with ~40% fewer columns (no transverse tile cuts), N2 ≈ the same (823–904).
+  Lower cuts (slabs rebuilt with the fast path, 4 × 6 threads: 116 / 708 / 612 / 67 s, i.e. slab 1 708 s vs 1961 s
+  at 12 threads serial; run_slabl1_low_mos2_hfo2.sh): MS1 median / max 1e-8 N1 2373 5.2e-6 / 3.4e-4; 1e-9 N1 2982
+  6.9e-7 / 1.9e-5; 1e-10 N1 3658 2.7e-7 / 8.1e-6 (below the 1.2e-4 quadrature error of ρ, still converging).
+  MS2 (l2-thr 1e-5, N2 889–913) stays at median 1.6–3.7e-4, max 1.7–2.6e-2: level 2 sets the floor now.
 - Accelerated local ρ (`msbasis.tile_rho_contour`, `tile_modes(fast=)`, run_ms `--tile-fast schur --tile-env-prec
   --tile-refine --tile-emb-far imz:d,... --tile-pts-workers --tile-pts-threads`; bench `qtx_ms/tile_fast_bench.py` →
   results_ms/tile_fast/): G_PP = (A_PP − A_PE A_EE⁻¹ A_EP)⁻¹ with A_EE LU in complex64 + refinement (sparse residual),
