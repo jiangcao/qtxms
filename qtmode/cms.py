@@ -23,9 +23,9 @@ try:
 except ImportError:          # pragma: no cover
     from . import _pardiso_compat as pypardiso   # SciPy SuperLU fallback
 
-from mgms.prep.structure import A_SI, SI_C, VB
-from mgms.prep import structure as _structure
-from mgms.prep.hamiltonian import TBParams, sk_block
+from qtx_ms.prep.structure import A_SI, SI_C, VB
+from qtx_ms.prep import structure as _structure
+from qtx_ms.prep.hamiltonian import TBParams, sk_block
 
 
 def _nsi():
@@ -126,7 +126,7 @@ def _bulk_hk_batch(P, ks):
     sp3s* (TBParams) or sp3d5s* (TB5Params, no spin-orbit, shifted so the bulk VBM is 0)."""
     v = VB * A_SI / 4
     if hasattr(P, "si"):                                  # sp3d5s*
-        from mgms.prep import sp3d5s as T5
+        from qtx_ms.prep import sp3d5s as T5
         ns = T5.NORB
         on = np.kron(np.eye(2), T5.onsite(P.si)) + P.shift * np.eye(2 * ns)
         Ms = [T5.sk_block(d, P.si) for d in v]
@@ -432,7 +432,7 @@ def union_core_region(nt, half_width, d_core=6.0, margin=4.5):
     all diamond sites with |y - yc| <= hy - d_core + margin and |z - zc| <= hz - d_core + margin.
     margin covers outward excursions of the rough interface (default 3 x rms 1.5 A).
     Returns block-local integer coordinates (units a/4) and positions."""
-    from mgms.prep.structure import diamond_sites, NX4_BLOCK, _nyz, _hyz
+    from qtx_ms.prep.structure import diamond_sites, NX4_BLOCK, _nyz, _hyz
     ny, nz = _nyz(nt)
     hy, hz = _hyz(half_width)
     a4 = A_SI / 4
@@ -466,7 +466,7 @@ def restrict_union_basis(st, atoms, slab, ucoords, QU, SU, thr=1e-2, s_min=1e-2)
     """Basis of one core block from the shared union basis: keep union vectors above `thr`,
     take the rows of the block's sites, re-orthonormalize (SVD), drop directions whose
     restriction has singular value < s_min (they live almost entirely outside the block)."""
-    from mgms.prep.structure import NX4_BLOCK
+    from qtx_ms.prep.structure import NX4_BLOCK
     a4 = A_SI / 4
     lut = {tuple(c): i for i, c in enumerate(ucoords)}
     c = np.rint(st.pos[atoms] / a4).astype(int)

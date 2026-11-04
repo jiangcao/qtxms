@@ -7,9 +7,9 @@ Folder layout (as written by deviceBuilder, e.g. examples/device_MoS2HfO2_2808a_
     inputs/hamiltonian.h5      group "[0, 0, 0]": coo row / col / data, attrs shape    (eV)
     inputs/overlap.h5          same for S
     inputs/potential.npy       optional, per orbital or per atom (eV); used only with --potential
-Only the R = [0, 0, 0] block is used (kpoint_grid 1 1 1). deviceBuilder folds the transverse images of the
-supercell into it (Gamma point), so H, S couple atoms across the y / z faces: every transverse axis of the
-Lattice along which a coupling spans more than half a period goes into meta["periodic"] (minimum image).
+All R blocks are summed (Gamma point, kpoint_grid 1 1 1): older deviceBuilder folders fold the transverse images
+into [0, 0, 0], newer ones store them as [0, +-1, 0]. Either way H, S couple atoms across the y / z faces: every
+transverse axis of the Lattice along which a coupling spans more than half a period goes into meta["periodic"] (minimum image).
 With --potential, as in QuaTrEx (electron/solver.py _apply_potential): H += (V S + S V) / 2.
 
 Blocks: the contact lattice vector a (along the transport axis) defines primitive cells, counted from the left
@@ -44,14 +44,27 @@ def read_xyz(f):
 
 
 def read_h5(f, key="[0, 0, 0]"):
+    """Gamma-point matrix sum_R M_R of all R blocks in the file (QuaTrEx wf: M(k) = sum_R M_R exp(2 pi i k.R),
+    k = 0 for kpoint_grid 1 1 1). Newer deviceBuilder folders store the transverse images as [0, +-1, 0] blocks
+    instead of folding them into [0, 0, 0]."""
     import h5py
     with h5py.File(f) as h:
         keys = list(h.keys())
-        g = h[key]
-        shape = tuple(int(s) for s in g.attrs["shape"])
-        M = sp.coo_matrix((g["data"][()], (g["row"][()], g["col"][()])), shape=shape).tocsr()
-    if keys != [key]:
-        print(f"  {Path(f).name}: blocks {keys}; only {key} used")
+        assert key in keys, f"{f}: no {key} block ({keys})"
+        Ms = {}
+        for k in keys:
+            g = h[k]
+            shape = tuple(int(s) for s in g.attrs["shape"])
+            Ms[k] = sp.coo_matrix((g["data"][()], (g["row"][()], g["col"][()])), shape=shape).tocsr()
+    M = Ms.pop(key)
+    if Ms:
+        pat = M.copy(); pat.data[:] = 1
+        for k, Mk in Ms.items():
+            q = Mk.copy(); q.data[:] = 1
+            print(f"  {Path(f).name}: block {k} nnz {Mk.nnz}, max {abs(Mk).max():.3e}, "
+                  f"{pat.multiply(q).nnz} entries shared with {key}; summed (Gamma point)")
+            M = M + Mk
+        M = M.tocsr()
     return M
 
 

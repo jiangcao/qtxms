@@ -97,13 +97,54 @@ class CapSchwarz:
     the coarse level); "ends": interfaces + the two windows on the lead faces.
     split = pieces per periodic transverse axis (meta["periodic"] order): every x-window is cut into boxes of
     period / n (core, disjoint) + tov Å on each side (minimum image), with the same absorbing ramp towards the
-    transverse cuts."""
+    transverse cuts.
+    centres "tile": one window per tile of mb.partition(tile_orbs, xsplit) instead of x-windows: core = the tile's
+    orbitals, window = every device orbital within tov Å (3D, minimum image) of a tile atom, absorbing ramp over the
+    outer d Å of that shell (the lead faces are real boundaries and keep Sigma)."""
 
     def __init__(self, dev, inp, width=16.0, s=2.0, d=3.0, spacing=None, solver="dense", dE0=0.0, centres="all",
-                 workers=1, split=None, tov=2.5):
+                 workers=1, split=None, tov=2.5, tile_orbs=2500, xsplit=1, tile_cut=""):
         ax = inp["meta"]["axis"]
         atom = np.repeat(np.arange(len(inp["norb"])), inp["norb"])
         self.x = x = inp["xyz"][atom[dev.dev], ax]
+        if centres == "tile":
+            self._tiles(dev, inp, atom[dev.dev], tov, tile_orbs, xsplit, ax, tile_cut)
+            width = f"tile {tile_orbs}/x{xsplit} +{tov}"
+            split = None
+        else:
+            self._xwin(dev, inp, atom, x, width, spacing, centres, split, tov)
+        cov = np.zeros(len(x), int)
+        for i, c in zip(self.idx, self.core):
+            cov[i[c]] += 1
+        assert (cov == 1).all(), "window cores must partition the device"
+        self.s, self.d, self.solver, self.dE0, self.dev = s, d, solver, dE0, dev
+        self.pool = ThreadPoolExecutor(workers) if workers > 1 else None   # windows are independent (additive)
+        log(f"CapSchwarz: {len(self.centres)} {centres} windows of {width} Å at x = {', '.join(f'{c:.1f}' for c in self.centres)}, "
+            f"{min(map(len, self.idx))}..{max(map(len, self.idx))} orbitals (sum {sum(map(len, self.idx))}), "
+            f"absorbing {s} eV over {d} Å, {solver} LU" + (f" at E {dE0:+g} eV" if dE0 else "")
+            + (f", transverse split {split} (+{tov} Å)" if split and max(split) > 1 else ""))
+
+    def _tiles(self, dev, inp, atom_d, tov, tile_orbs, xsplit, ax, tile_cut=""):
+        blocks, _, _ = mb.partition(dev, cores=False, tile_orbs=tile_orbs, xsplit=xsplit, axis=ax,
+                                    cut=mb.parse_cut(tile_cut))
+        geo = mb.Geometry(inp["xyz"], inp["meta"].get("periodic"))
+        dat = np.unique(atom_d)
+        tree_d = geo.tree(dat)
+        self.idx, self.core, self.dist = [], [], []
+        for b in blocks:
+            near = dat[np.unique(np.concatenate([np.asarray(q, int) for q in
+                                                 tree_d.query_ball_point(geo.points(b["atoms"]), tov + 1e-9)]))]
+            wa = np.union1d(near, b["atoms"])
+            i = np.where(np.isin(atom_d, wa))[0]
+            dt = geo.tree(b["atoms"]).query(geo.points(atom_d[i]))[0]
+            self.idx.append(i)
+            self.core.append(np.isin(atom_d[i], b["atoms"]))
+            self.dist.append((dt, tov))
+        self.centres = np.array([np.mean(self.x[i[c]]) for i, c in zip(self.idx, self.core)])
+        self.tcut = [[] for _ in self.idx]
+
+    def _xwin(self, dev, inp, atom, x, width, spacing, centres, split, tov):
+        self.dist = None
         sl = [np.arange(dev.sb[k], dev.sb[k + 1]) for k in range(len(dev.ns))]
         xi = [0.5 * (x[sl[k]].max() + x[sl[k + 1]].min()) for k in range(len(sl) - 1)]
         anchors = [x.min()] + xi + [x.max()]
@@ -133,16 +174,6 @@ class CapSchwarz:
                     core.append(c[w] & (du[w] < L / (2 * n)) | c[w] & (du[w] == L / (2 * n)) & (j == 0))
                     tcut.append([(dv[w], h) for dv, h in tc] + [(du[w], L / (2 * n) + tov)])
             self.idx, self.core, self.tcut = idx, core, tcut
-        cov = np.zeros(len(x), int)
-        for i, c in zip(self.idx, self.core):
-            cov[i[c]] += 1
-        assert (cov == 1).all(), "window cores must partition the device"
-        self.s, self.d, self.solver, self.dE0, self.dev = s, d, solver, dE0, dev
-        self.pool = ThreadPoolExecutor(workers) if workers > 1 else None   # windows are independent (additive)
-        log(f"CapSchwarz: {len(self.centres)} {centres} windows of {width} Å at x = {', '.join(f'{c:.1f}' for c in self.centres)}, "
-            f"{min(map(len, self.idx))}..{max(map(len, self.idx))} orbitals (sum {sum(map(len, self.idx))}), "
-            f"absorbing {s} eV over {d} Å, {solver} LU" + (f" at E {dE0:+g} eV" if dE0 else "")
-            + (f", transverse split {split} (+{tov} Å)" if split and max(split) > 1 else ""))
 
     def set_energy(self, E, A, delta=None):
         S, x = self.dev.S.tocsr(), self.x
@@ -154,9 +185,12 @@ class CapSchwarz:
             xi = x[idx]
             lo, hi = xi.min(), xi.max()
             ramp = np.zeros(len(idx))
-            if lo > xmin + 1e-6:                                   # a cut on the left (not the lead face)
+            if self.dist is not None:                              # tile window: ramp over the outer d of the shell
+                dt, h = self.dist[k]
+                ramp = np.clip((dt - (h - self.d)) / self.d, 0, 1) ** 2
+            elif lo > xmin + 1e-6:                                 # a cut on the left (not the lead face)
                 ramp = np.maximum(ramp, np.clip((lo + self.d - xi) / self.d, 0, 1) ** 2)
-            if hi < xmax - 1e-6:
+            if self.dist is None and hi < xmax - 1e-6:
                 ramp = np.maximum(ramp, np.clip((xi - (hi - self.d)) / self.d, 0, 1) ** 2)
             for du, h in self.tcut[k]:                             # transverse cuts at |du| = h
                 ramp = np.maximum(ramp, np.clip((du - (h - self.d)) / self.d, 0, 1) ** 2)
@@ -240,6 +274,41 @@ def fgmres_block(A, b, x0, prec, tol=1e-8, m=60, clock=None, cb=None):
     return x, its, res
 
 
+def fgmres_restart(A, b, x0, prec, tol=1e-8, m=60, maxit=1000, clock=None, cb=None, log=None):
+    """Restarted block FGMRES(m) with frozen columns: cycles of fgmres_block on the still active columns only. After
+    each cycle x is updated and the true residual b - A x is computed; columns with |r_j| <= tol |b_j| are frozen
+    (dropped from all further cycles: no matvec, preconditioner or orthogonalization work). Stops after maxit
+    iterations in total. Returns x, iterations per column, true relative residuals, number of cycles.
+    cb(i, est): after global iteration i with the residual estimates of all columns (frozen: their true residual)."""
+    n, nc = b.shape
+    x = x0.copy()
+    bn = np.linalg.norm(b, axis=0)
+    res = np.full(nc, np.inf)
+    its = np.zeros(nc, int)
+    act = np.arange(nc)
+    done, cyc = 0, 0
+    while len(act) and done < maxit:
+        mm = min(m, maxit - done)
+        def cbc(i, est, act=act, done=done):
+            if cb is not None:
+                e = res.copy(); e[act] = est
+                cb(done + i, e)
+        xa, ia, ra = fgmres_block(A, b[:, act], x[:, act], prec, tol, mm, clock, cbc)
+        x[:, act] = xa
+        its[act] += ia
+        res[act] = ra
+        if ia.max() == 0:
+            break
+        done += int(ia.max())
+        cyc += 1
+        new = act[ra > tol]
+        if log is not None:
+            log(f"  restart cycle {cyc}: {int(ia.max())} its (total {done}), true residual max {ra.max():.2e}, "
+                f"frozen {nc - len(new)} / {nc} columns")
+        act = new
+    return x, its, res, cyc
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--inputs", required=True)
@@ -255,7 +324,11 @@ def main():
     p.add_argument("--cap-spacing", type=float, help="cap smoother: largest distance between window centres [Å] "
                    "(default: interfaces + slab middles)")
     p.add_argument("--cap-solver", default="dense", choices=["dense", "dense64", "pardiso"], help="cap local LU")
-    p.add_argument("--cap-centres", default="all", choices=["all", "iface", "ends"], help="cap smoother: windows on the "
+    p.add_argument("--cap-tile-orbs", type=int, default=2500, help="cap smoother with --cap-centres tile: tile size")
+    p.add_argument("--cap-tile-cut", default="", help="cap smoother with --cap-centres tile: tiles by msbasis.parse_cut "
+                   "(as run_ms --tile-cut), e.g. '0:n2@1,2'")
+    p.add_argument("--cap-xsplit", type=int, default=1, help="cap smoother with --cap-centres tile: tile pieces along x")
+    p.add_argument("--cap-centres", default="all", choices=["all", "iface", "ends", "tile"], help="cap smoother: windows on the "
                    "interfaces and between them (all), on the slab interfaces only (iface), interfaces + lead-face windows (ends)")
     p.add_argument("--cap-split", default="1,1", help="cap smoother: pieces per periodic transverse axis (meta order)")
     p.add_argument("--cap-tov", type=float, default=2.5, help="cap smoother: transverse overlap on each side of a box [Å]")
@@ -267,6 +340,10 @@ def main():
     p.add_argument("--l1-cap", default="32,2,2", help="level-1 Schwarz: window width [Å], absorbing strength [eV], ramp [Å]")
     p.add_argument("--l1-centres", default="iface", choices=["iface", "all"], help="level-1 windows on the slab "
                    "interfaces (iface) or also on the slab middles (all)")
+    p.add_argument("--l1-split", default="none", choices=["none", "tile"], help="level-1 windows: full cross-section "
+                   "(none) or also cut transversely along the tile cuts (tile)")
+    p.add_argument("--l1-tov", type=float, default=2.5, help="level-1 tile split: transverse overlap [Å]")
+    p.add_argument("--l1-wmin", type=float, default=0.1, help="level-1 tile split: least column weight in a region + overlap")
     p.add_argument("--workers", type=int, default=1, help="cap smoother: windows factored / solved concurrently")
     p.add_argument("--pre", type=int, help="pre-smoothing steps (default --nu); post-smoothing = --nu")
     p.add_argument("--k", type=int, default=10, help="GMRES(k) smoother steps")
@@ -282,7 +359,7 @@ def main():
     p.add_argument("--out", help="json (default next to --psi: <psi>_mg.json)")
     a = p.parse_args()
     inp = read_inputs(a.inputs)
-    c = np.load(a.psi)
+    c = dict(np.load(a.psi))                                   # dict: ms_solution may re-phase psi_m
     dev, E, b, A, x0, cs, T = ms_solution(inp, c, a.modes, a.sigma_cache)
     psi = c["psi_m"]
     Ec = inp["meta"]["edges"]["Ec_lead"]
@@ -307,14 +384,15 @@ def main():
             mids = [0.5 * (p + q) for p, q in zip([xs.min()] + xi, xi + [xs.max()])]
             cen = np.sort(np.array(xi + (mids if a.l1_centres == "all" else [])))
             w1, s1, d1 = (float(v) for v in a.l1_cap.split(","))
-            S1 = lev.schwarz1(cen, w1, s1, d1)
+            S1 = lev.schwarz1(cen, w1, s1, d1, split=a.l1_split == "tile", tov=a.l1_tov, wmin=a.l1_wmin)
         else:
             S1 = {"coarse": None, "exact": "exact"}[a.l1]
         Pc = lev.cycle1(S1)
         log(f"tile levels ({a.basis}), level 1: {a.l1}; tile mode space x0: err "
             f"{np.linalg.norm(c['psi_m'] - x0) / np.linalg.norm(c['psi_m']):.2e}, T {(T(x0) - T(c['psi_m'])) / T(c['psi_m']):+.1e}")
     nb, npsi, Tex = np.linalg.norm(b), np.linalg.norm(psi), T(psi)
-    log(f"E = Ec {E - Ec:+.3f}: {b.shape[1]} columns, N {cs.N}, T exact {Tex:.6f}")
+    log(f"E = Ec {E - Ec:+.3f}: {b.shape[1]} columns, N {cs.N}, T exact {Tex:.6f}; mode space x0: err "
+        f"{np.linalg.norm(psi - x0) / npsi:.2e}, T {(T(x0) - Tex) / Tex:+.1e}, residual {np.linalg.norm(b - A @ x0) / nb:.1e}")
 
     def stats(x, nmv):
         n = dens(x)
@@ -370,10 +448,11 @@ def main():
                 t = time.time()
                 S = CapSchwarz(dev, inp, *(float(v) for v in a.cap.split(",")), spacing=a.cap_spacing,
                                solver=a.cap_solver, dE0=a.cap_dE0, centres=a.cap_centres,
-                               workers=a.workers, split=[int(v) for v in a.cap_split.split(",")], tov=a.cap_tov)
+                               workers=a.workers, split=[int(v) for v in a.cap_split.split(",")], tov=a.cap_tov,
+                               tile_orbs=a.cap_tile_orbs, xsplit=a.cap_xsplit, tile_cut=a.cap_tile_cut)
                 S.set_energy(E, A)
                 tag = (f"cap-schwarz {a.cap} {a.cap_centres} h {a.cap_spacing} {a.cap_solver} dE0 {a.cap_dE0:g} "
-                       f"split {a.cap_split} tov {a.cap_tov:g} "
+                       f"split {a.cap_split} tov {a.cap_tov:g} " + (f"tiles {a.cap_tile_orbs}/x{a.cap_xsplit} " if a.cap_centres == "tile" else "") +
                        f"(factor {time.time() - t:.0f} s)")
             elif sm == "schwarz":
                 sw.set_energy(E, A, delta)

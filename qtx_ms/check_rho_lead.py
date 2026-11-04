@@ -2,14 +2,14 @@
 rho_00 = -(1/pi) Im int_[mu1, mu2] (E S00 - H00 - Sigma_L - Sigma_R)^-1 dE (contour as msbasis.rho_contour)
 must equal the k integral of the window Bloch projectors, int dk/2pi sum_{E_n(k) in window} psi psi^H.
 
-    python -m mgms.check_rho_lead --inputs inputs/mos2_20nm [--npts 24]
+    python -m qtx_ms.check_rho_lead --inputs inputs/mos2_20nm [--npts 24]
 """
 import argparse, time
 import numpy as np
 import scipy.linalg as sla
-from mgms.prep.inputs import read_inputs
-from mgms import msbasis as mb
-from mgms.lead_rms import LeadCell
+from qtx_ms.prep.inputs import read_inputs
+from qtx_ms import msbasis as mb
+from qtx_ms.lead_rms import LeadCell
 
 p = argparse.ArgumentParser()
 p.add_argument("--inputs", required=True)

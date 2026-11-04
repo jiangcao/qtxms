@@ -17,7 +17,7 @@ the device's own end cells); the lead cell is the first block and its coupling t
 block. The right lead block is reordered into the lead-cell atom order; `perm` maps every orbital of the returned
 matrices to its index in the QuaTrEx files.
 """
-import json, time, tomllib
+import hashlib, json, time, tomllib
 from pathlib import Path
 import numpy as np
 import scipy.linalg as sla
@@ -72,9 +72,35 @@ def lead_bands(lead, ks):
     return np.array(out)
 
 
-def read_quatrex(folder, cells=None, trim=False, potential=False, nk=41, log=print):
+def lead_edges(lead, mid, nk, cache_dir=None, log=print):
+    """Lead band edges (Ev, Ec) around mid from nk k points on [0, pi]. With cache_dir they are stored in
+    cache_dir/lead_edges.json under a hash of the lead H00, H01, S00, S01, mid and nk, and reused."""
+    h = hashlib.sha1(np.array([mid, nk], float).tobytes())
+    for k in ("H00", "H01", "S00", "S01"):
+        M = sp.csr_matrix(lead[k]).copy()
+        M.sum_duplicates(); M.sort_indices()
+        for x in (np.array(M.shape), M.indptr, M.indices, M.data):
+            h.update(np.ascontiguousarray(x).tobytes())
+    key = h.hexdigest()
+    f = Path(cache_dir) / "lead_edges.json" if cache_dir else None
+    db = json.loads(f.read_text()) if f and f.exists() else {}
+    if key in db:
+        log(f"  lead band edges from {f}")
+        return db[key]["Ev"], db[key]["Ec"]
+    E = lead_bands(lead, np.linspace(0, np.pi, nk))
+    Ev, Ec = float(E[E < mid].max()), float(E[E > mid].min())
+    if f:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        db = json.loads(f.read_text()) if f.exists() else {}
+        db[key] = dict(Ev=Ev, Ec=Ec, mid=mid, nk=nk)
+        f.write_text(json.dumps(db, indent=1))
+    return Ev, Ec
+
+
+def read_quatrex(folder, cells=None, trim=False, potential=False, nk=41, cache_dir=None, log=print):
     """Device dict: labels, xyz, norb, blocks, H, S, lead, lead_right, perm, meta (axis, block_length,
-    transport = device / lead blocks, edges = lead band edges Ev_lead, Ec_lead)."""
+    transport = device / lead blocks, edges = lead band edges Ev_lead, Ec_lead; cached in cache_dir, see
+    lead_edges)."""
     t0 = time.time()
     root = Path(folder)
     dc = tomllib.loads((root / "quatrex_config.toml").read_text())["device"]
@@ -190,9 +216,7 @@ def read_quatrex(folder, cells=None, trim=False, potential=False, nk=41, log=pri
                           S00=lead["S00"], S01=lead["S01"])
         log(f"  right lead = left lead + {dV:+.4f} eV * S")
     log(f"  lead periodicity (max |difference|): {checks}")
-    ks = np.linspace(0, np.pi, nk)
-    E = lead_bands(lead, ks)
-    Ev, Ec = float(E[E < mid].max()), float(E[E > mid].min())
+    Ev, Ec = lead_edges(lead, mid, nk, cache_dir, log=log)
     log(f"  lead {len(o0)} orbitals: Ev {Ev:.4f}, Ec {Ec:.4f} eV, gap {Ec - Ev:.3f} eV; {time.time() - t0:.0f} s")
     meta = dict(name=root.name, axis=ax, block_length=float(m * acell), cells_per_block=int(m), nblocks=int(nb),
                 coupling_range=rng, trimmed=trimmed, lead_checks=checks,

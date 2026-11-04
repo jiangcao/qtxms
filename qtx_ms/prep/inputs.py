@@ -13,7 +13,7 @@
 
 Model-specific extras may sit next to these (e.g. structure.npz of the Si sheet with bonds and species
 codes); solvers that only need the generic part must not depend on them. The files are readable by
-mgms.abtb as well (read_xyz, parse_norb with norb.txt, read_sparse with the .npz files).
+qtx_ms.abtb as well (read_xyz, parse_norb with norb.txt, read_sparse with the .npz files).
 """
 import json
 import numpy as np

@@ -1,7 +1,7 @@
 import sys, time
 import numpy as np, scipy.sparse as sp, scipy.sparse.linalg as spla
-from mgms.device import Device
-from mgms.em import basis_ldm, assemble_U, TwoLevel, transmission_from_psi
+from qtx_ms.device import Device
+from qtx_ms.em import basis_ldm, assemble_U, TwoLevel, transmission_from_psi
 for L in (10.0, 20.0, 40.0):
     dev = Device(L=L); H = dev.full_H()
     eps, _ = dev.lead_modes(); e1 = eps[0] - 2 * dev.t

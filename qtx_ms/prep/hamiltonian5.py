@@ -1,10 +1,10 @@
-"""sp3d5s* Hamiltonian for the Si/SiO2 structures of mgms.prep.structure (drop-in for hamiltonian.build_H).
+"""sp3d5s* Hamiltonian for the Si/SiO2 structures of qtx_ms.prep.structure (drop-in for hamiltonian.build_H).
 
 * Channel Si (SI_C): sp3d5s*, 10 orbitals, Boykin-Klimeck-Oyafuso PRB 69, 115201 (2004)
-  (mgms.prep.sp3d5s), onsite energies shifted so that the bulk Si valence-band top is 0 eV
+  (qtx_ms.prep.sp3d5s), onsite energies shifted so that the bulk Si valence-band top is 0 eV
   (same reference as the sp3s* model). Si-Si integrals scaled as (d0/d)^2 (Harrison); in the
   generated structures all Si-Si bonds have the ideal length, so this is inactive there.
-* Oxide Si (SI_OX) and O: the sp3 Harrison oxide of mgms.prep.hamiltonian, unchanged, with the
+* Oxide Si (SI_OX) and O: the sp3 Harrison oxide of qtx_ms.prep.hamiltonian, unchanged, with the
   onsite shifts dSiox, dO refitted so the bulk oxide network has VB / CB offsets of 4.4 / 3.2 eV
   to the sp3d5s* Si band edges.
 * Interface Si-O bonds (SI_C - OX): Harrison s and p integrals between the s, p orbitals of

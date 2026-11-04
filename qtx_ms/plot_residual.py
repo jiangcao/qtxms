@@ -39,7 +39,14 @@ def ms_solution(inp, c, modes, sigma_cache, eta=0.0, tol=1e-4, obc="folded"):
     cs = Coarse(dev, V)
     x = cs.prolong(cs.Ac(E, SL, SR).solve(cs.restrict(b)))
     A = dev.A(E, SL, SR)
-    assert np.linalg.norm(b - A @ c["psi_m"]) < 1e-8 * np.linalg.norm(b), "psi does not solve this system"
+    ps = c["psi_m"]
+    if np.linalg.norm(b - A @ ps) > 1e-8 * np.linalg.norm(b):
+        # injection columns with other phases (Gamma eigenvectors from another BLAS thread count): b = b_psi Q
+        Q = np.linalg.lstsq((A @ ps)[dev.bL], b[dev.bL], rcond=None)[0]
+        ps = ps @ Q
+        if isinstance(c, dict):
+            c["psi_m"] = ps
+    assert np.linalg.norm(b - A @ ps) < 1e-8 * np.linalg.norm(b), "psi does not solve this system"
     GR = 1j * (SR - SR.conj().T)
     T = lambda y: float(np.real(np.einsum("ic,ij,jc->", y[dev.bR].conj(), GR, y[dev.bR])))
     return dev, E, b, A, x, cs, T

@@ -5,7 +5,7 @@ Row 1: |H|, |S| of the device (max |entry| per pixel, log scale), slabs 0-1 zoom
 Row 2: the same for H_MS = U^H H U, S_MS = U^H S U; last panel: eigenvalues of the isolated slab 0,
 (H_00, S_00) vs (V^H H_00 V, V^H S_00 V), near the band edges.
 
-    python -m mgms.plot_hs --inputs inputs/mos2_20nm --rho results_ms/mos2_20nm_l2direct/rho_....npz --l2-thr 1e-7
+    python -m qtx_ms.plot_hs --inputs inputs/mos2_20nm --rho results_ms/mos2_20nm_l2direct/rho_....npz --l2-thr 1e-7
 """
 import argparse, os
 import numpy as np
@@ -16,8 +16,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
-from mgms.prep.inputs import read_inputs
-from mgms import msbasis as mb
+from qtx_ms.prep.inputs import read_inputs
+from qtx_ms import msbasis as mb
 
 INK, MUTED, GRID, SURF, BLUE, ORANGE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb", "#2a78d6", "#eb6834"
 CMAP = LinearSegmentedColormap.from_list("seq", ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"])

@@ -1,11 +1,11 @@
 """Prepare transport inputs for the rough Si nanosheet with oxide shell (sp3s* or sp3d5s* TB).
 
 Builds the open device  [L0 L1 L2 | D1 .. Dn | R0 R1 R2]  (blocks of 2 Si cells, 10.86 A along x),
-its TB Hamiltonian and the periodic lead cell, and writes the generic input set of mgms.prep.inputs
+its TB Hamiltonian and the periodic lead cell, and writes the generic input set of qtx_ms.prep.inputs
 plus structure.npz (species codes, bonds, union sites, roughness profiles, TB parameters in meta.json)
 for the Si-specific level-1 core basis of qtmode.cms.
 
-    python -m mgms.prep.si_sheet --model sp3d5s --xsec 3x5 --out inputs/si3x5_sp3d5s
+    python -m qtx_ms.prep.si_sheet --model sp3d5s --xsec 3x5 --out inputs/si3x5_sp3d5s
 
 Transport convention (as in the qtmode pipeline): device = blocks 2 .. nb-nl (L2 + D + R0), coupled to
 lead cells L1 (left) and R1 (right); lead_H00 / lead_H01 are the R1 cell and its coupling to R2.

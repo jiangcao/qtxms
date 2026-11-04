@@ -1,8 +1,8 @@
 """Coupled mode space on the rough Si nanosheet: conventional per-slab CMS vs the union-cross-section CMS
-(mgms.cms_union), stand-alone mode-space error vs basis size M, optionally as the coarse level of the
+(qtx_ms.cms_union), stand-alone mode-space error vs basis size M, optionally as the coarse level of the
 two-level solver.
 
-    python -m mgms.run_cms --inputs inputs/si3x5_sp3s [--M 16,32,64,128,256,512] [--mg-M 64,256]
+    python -m qtx_ms.run_cms --inputs inputs/si3x5_sp3s [--M 16,32,64,128,256,512] [--mg-M 64,256]
 
 Per energy: exact QTBM solve (sparse direct), and for every basis and M the Galerkin mode-space solution
 psi_MS = U A_c^-1 U^T b, A_c = U^T (E - H - Sigma) U (block tridiagonal), T = sum psi_R^H Gamma_R psi_R.
@@ -13,11 +13,11 @@ import argparse, json, os, time
 import numpy as np
 import scipy.sparse as sp
 
-from mgms.prep.inputs import read_inputs
-from mgms.prep import si_sheet, model
-from mgms import msbasis as mb
-from mgms import cms_union as cu
-from mgms.twolevel import TwoLevel
+from qtx_ms.prep.inputs import read_inputs
+from qtx_ms.prep import si_sheet, model
+from qtx_ms import msbasis as mb
+from qtx_ms import cms_union as cu
+from qtx_ms.twolevel import TwoLevel
 
 log = mb.log
 p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

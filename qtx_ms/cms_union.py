@@ -1,4 +1,4 @@
-"""Coupled mode space (CMS) bases for the rough Si nanosheet with oxide shell (mgms.prep.si_sheet inputs).
+"""Coupled mode space (CMS) bases for the rough Si nanosheet with oxide shell (qtx_ms.prep.si_sheet inputs).
 
 conventional : per device slab s, the lowest M eigenvectors of the closed slab H_ss above mid-gap
                (one eigenproblem per slab).

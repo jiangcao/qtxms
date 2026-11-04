@@ -22,8 +22,8 @@ channel atoms).
   The modes of every stage are saved as <out>/modes/mu<mu>_<stage>_slab<s>.npy (slab-local orbitals x modes).
   --l2-thr / --nmodes take comma lists: the stages 1-2 run for each basis size (rho eigendecomposed once).
 
-    python -m mgms.run_l2_clean --inputs inputs/mos2_hfo2 --exact-from results_ms/mos2_hfo2_leadcms/results.json
-    python -m mgms.run_l2_clean --inputs inputs/mos2_hfo2 --nmodes 100,200,400 --no-res --mg \
+    python -m qtx_ms.run_l2_clean --inputs inputs/mos2_hfo2 --exact-from results_ms/mos2_hfo2_leadcms/results.json
+    python -m qtx_ms.run_l2_clean --inputs inputs/mos2_hfo2 --nmodes 100,200,400 --no-res --mg \
         --exact-from results_ms/mos2_hfo2_leadcms/results.json
 """
 import argparse, json, os, time
@@ -32,10 +32,10 @@ import scipy.linalg as sla
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
-from mgms.prep.inputs import read_inputs
-from mgms import msbasis as mb
-from mgms.twolevel import TwoLevel
-from mgms.lead_rms import LeadCell, RMS, slab_cell_map, to_cell, to_slab, band_stats, plot_bands
+from qtx_ms.prep.inputs import read_inputs
+from qtx_ms import msbasis as mb
+from qtx_ms.twolevel import TwoLevel
+from qtx_ms.lead_rms import LeadCell, RMS, slab_cell_map, to_cell, to_slab, band_stats, plot_bands
 
 log = mb.log
 
@@ -161,6 +161,8 @@ def main():
     p.add_argument("--mg-cols", type=int, default=0,
                    help="MG on the n strongest channels only, checked against their exact solutions (0: all)")
     p.add_argument("--mg-stages", help="comma list of stages solved with MG (default all)")
+    p.add_argument("--sigma-cache", help="lead self-energy cache (default results_ms/sigma/<inputs name>; results_ms/sigma_qtx/<name> for QuaTrEx Sigma from qtx_ms.prep.quatrex_obc)")
+    p.add_argument("--obc", default="auto", choices=["auto", "qttools", "folded"], help="lead OBC on the real axis: qttools (QuaTrEx spectral OBC; auto falls back to the folded lead when it does not import) or mgms (folded lead); --exact-from values must come from the same OBC")
     a = p.parse_args()
 
     name = os.path.basename(os.path.normpath(a.inputs))
@@ -170,8 +172,9 @@ def main():
     inp = read_inputs(a.inputs)
     ed = inp["meta"]["edges"]
     Ec, Ev = ed["Ec_lead"], ed.get("Ev_lead", ed.get("Ev_bulk", ed["Ec_lead"] - 1.0))
-    dev = mb.Device(inp)
-    dev.sigma_cache = os.path.join("results_ms", "sigma", name)
+    dev = mb.Device(inp, obc=a.obc)
+    log(f"lead OBC: {'qttools on the real axis' if dev.qtt is not None else 'folded lead'}")
+    dev.sigma_cache = a.sigma_cache or os.path.join("results_ms", "sigma", name)
     nsl = len(dev.ns)
     sigma = lambda E: dev.sigma(E + 1e-6j)
     log(f"{name}: device {dev.n} orbitals, slabs {dev.ns}; Ec {Ec:.4f}, Ev {Ev:.4f} eV")
@@ -418,7 +421,7 @@ def main():
         key = f"{dE:.4f}"
         r = dict(E=E)
         SL, SR = sigma(E)
-        B = mb.injection(SL)[0]
+        B = dev.inject(SL)
         GR = 1j * (SR - SR.conj().T)
         b = np.zeros((dev.n, B.shape[1]), complex)
         b[dev.bL] = B

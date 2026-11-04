@@ -4,13 +4,13 @@
 
 ```
 uv sync                                  # creates .venv (Python 3.12, numpy, scipy, pypardiso)
-uv run python -m mgms.run_tb --help      # or: source .venv/bin/activate
+uv run python -m qtx_ms.run_tb --help      # or: source .venv/bin/activate
 ```
 
 Prototype on an effective-mass rough Si nanosheet (5 × 3 nm, a = 0.25 nm, m* = 0.26, 3 eV oxide barrier,
 top/bottom roughness rms 0.3 nm, Λ = 1.5 nm, uniform ideal leads). Reference: exact RGF.
 
-## Method (`mgms/em.py`)
+## Method (`qtx_ms/em.py`)
 - Prolongation P = U (block-diagonal per-slab basis), restriction U†, Galerkin A_c = U† A U, A = E − H − Σ_L − Σ_R.
 - Coarse-grid projector π = U A_c⁻¹ U† A (checked idempotent to ~1e-14). Mode-space solution = π ψ_exact.
 - Right-preconditioned GMRES on A ψ = b (b = Γ_L^{1/2} injection columns, QTBM), started from the mode-space solution.
@@ -19,12 +19,12 @@ top/bottom roughness rms 0.3 nm, Λ = 1.5 nm, uniform ideal leads). Reference: e
   Valid in effective mass because the complement is (nearly) definite; TB will need a two-interval smoother.
 - Fine level uses the exact lead Σ; only the coarse solve sees U†ΣU.
 
-Bases (`mgms/em.py`):
+Bases (`qtx_ms/em.py`):
 - CMS M: lowest M eigenvectors of each slab H_ii (conventional coupled mode space).
 - LDM E_b: local density-matrix basis. For slab i, diagonalize slabs i−3..i+3 (zero-flux ends), keep all states below
   e1 + E_b, form ρ_i restricted to slab i, keep eigenvectors with weight > 1e-3 · max.
 
-## Results (`python -m mgms.run 20`, 80 slabs × 320 = 25 600 points, 6 energies 10–160 meV above the first subband, tol 1e-8)
+## Results (`python -m qtx_ms.run 20`, 80 slabs × 320 = 25 600 points, 6 energies 10–160 meV above the first subband, tol 1e-8)
 
 | basis | N/slab | mode-space max T error | after GMRES | GMRES its (mean) | fine matvecs / RHS |
 |---|---|---|---|---|---|
@@ -36,7 +36,7 @@ Bases (`mgms/em.py`):
 
 (Chebyshev degree 8. Degree 16 halves GMRES iterations but gives about the same matvec count.)
 
-Device-length scaling (`python -m mgms.scaling`, Chebyshev degree 8, 3 energies):
+Device-length scaling (`python -m qtx_ms.scaling`, Chebyshev degree 8, 3 energies):
 
 | L | n | no coarse: its / matvecs | LDM E_b=1: N, its / matvecs |
 |---|---|---|---|
@@ -60,14 +60,14 @@ Device-length scaling (`python -m mgms.scaling`, Chebyshev degree 8, 3 energies)
 - Your two-level basis as U (drop-in: pass its block-diagonal U to `TwoLevel`).
 - Bias / Poisson potential, many energies (basis reused, A_c rebuilt from precomputed U†HU).
 
-Files (in `mgms/`): `device.py` (model, leads, RGF), `em.py` (bases, projector, solver), `run.py` (sweep), `scaling.py`.
+Files (in `qtx_ms/`): `device.py` (model, leads, RGF), `em.py` (bases, projector, solver), `run.py` (sweep), `scaling.py`.
 
 ---
 
 # Ab initio tight-binding input (`abtb.py`, `twolevel.py`, `run_tb.py`)
 
 ```
-python -m mgms.run_tb --xyz device.xyz --H H.mtx --S S.mtx --norb "Si:10,H:1" --units eV \
+python -m qtx_ms.run_tb --xyz device.xyz --H H.mtx --S S.mtx --norb "Si:10,H:1" --units eV \
                  --dE 0.02,0.08,0.15 --Eb 0.6 --basis ldm,slab
 ```
 
@@ -94,7 +94,7 @@ What it does
    outer flexible GMRES. `--smoother cheb` only for definite cases. Reports σ_min(A_c) to flag spurious bands.
 6. RGF reference with variable slab sizes (`--no-ref` to skip).
 
-Tested on a synthetic non-orthogonal model (`python -m mgms.make_test_tb`: rough H-passivated wire, 2 orbitals/Si,
+Tested on a synthetic non-orthogonal model (`python -m qtx_ms.make_test_tb`: rough H-passivated wire, 2 orbitals/Si,
 1 orbital/H, 1st+2nd-neighbour H, NN overlap, gap 3 eV, 5928 orbitals, shuffled atoms, upper-triangle text):
 
 | E − Ec | channels | none: its / matvecs | ldm (N=221): MS err → final, its / matvecs | slab M=4 (N=240): MS err → final, its |
@@ -107,9 +107,9 @@ Not yet tested on real ab initio files (e.g. Wannier/CP2K sp3d5s*-size orbital s
 
 ---
 
-# Input preparation (`mgms/prep/`)
+# Input preparation (`qtx_ms/prep/`)
 
-Every TB model, empirical or ab initio, is turned into one generic input set (`mgms/prep/inputs.py`):
+Every TB model, empirical or ab initio, is turned into one generic input set (`qtx_ms/prep/inputs.py`):
 
 | file | content |
 |---|---|
@@ -120,12 +120,12 @@ Every TB model, empirical or ab initio, is turned into one generic input set (`m
 | `lead_{H,S}{00,01}.npz` | periodic lead cell and its coupling to the next cell (+x) |
 | `meta.json` | units, axis, block length, device / lead blocks, band edges, model info |
 
-`read_inputs(dir)` returns them as a dict; `mgms.abtb` reads the same files (`read_xyz`, `parse_norb norb.txt`,
+`read_inputs(dir)` returns them as a dict; `qtx_ms.abtb` reads the same files (`read_xyz`, `parse_norb norb.txt`,
 `read_sparse *.npz`). An ab initio model enters by writing its matrices with `write_inputs`.
 
 Rough Si nanosheet with oxide shell (structure and sp3s* / sp3d5s* TB from qtmode, unchanged):
 ```
-python -m mgms.prep.si_sheet --model sp3d5s --xsec 3x5 --out inputs/si3x5_sp3d5s
+python -m qtx_ms.prep.si_sheet --model sp3d5s --xsec 3x5 --out inputs/si3x5_sp3d5s
 ```
 Options: `--xsec 3x5|3x15|5x10` (or `--nt 12,8 --half-width 25,15`), `--n-dev`, `--rms`, `--corr`, `--seed`,
 `--no-lead-edge`. Device = blocks 2 … nb−nl (L2 + D + R0), lead cells L1 / R1, as in the qtmode pipeline.
@@ -136,17 +136,17 @@ lead E_c = 1.2051 eV (sp3s*).
 
 ---
 
-# QuaTrEx devices: MoS2 on HfO2 (`mgms/prep/quatrex.py`, `run_l2_clean.py`, `exact_T.py`, `ms_scan.py`)
+# QuaTrEx devices: MoS2 on HfO2 (`qtx_ms/prep/quatrex.py`, `run_l2_clean.py`, `exact_T.py`, `ms_scan.py`)
 
 Device `examples/device_MoS2HfO2_2808a_29088o` (deviceBuilder; 2808 atoms, 29 088 orbitals, non-orthogonal; Mo 26,
 S 13, Hf 10, O 4 orbitals per atom; lead cell 3120 orbitals, Ec_lead = 0.504 eV). `examples/` is not in git.
 ```
-python -m mgms.prep.quatrex examples/device_MoS2HfO2_2808a_29088o --out inputs/mos2_hfo2          # 5 cells per block
-python -m mgms.prep.quatrex ... --out inputs/mos2_hfo2_trim_c3 --cells 3 --trim                     # block-tridiagonal truncation
-python -m mgms.exact_T --inputs inputs/mos2_hfo2 --dE 0.02,0.05 --Ec 0.50435      # -> results_ms/exact/<name>.json
-python -m mgms.run_l2_clean --inputs inputs/mos2_hfo2 --nmodes 200,400 --no-res --dE 0.05,0.15,0.3,0.45 \
+python -m qtx_ms.prep.quatrex examples/device_MoS2HfO2_2808a_29088o --out inputs/mos2_hfo2          # 5 cells per block
+python -m qtx_ms.prep.quatrex ... --out inputs/mos2_hfo2_trim_c3 --cells 3 --trim                     # block-tridiagonal truncation
+python -m qtx_ms.exact_T --inputs inputs/mos2_hfo2 --dE 0.02,0.05 --Ec 0.50435      # -> results_ms/exact/<name>.json
+python -m qtx_ms.run_l2_clean --inputs inputs/mos2_hfo2 --nmodes 200,400 --no-res --dE 0.05,0.15,0.3,0.45 \
        --exact-from results_ms/exact/mos2_hfo2.json --Ec 0.50435
-python -m mgms.ms_scan --inputs inputs/mos2_hfo2 --modes results_ms/mos2_hfo2_l2direct/modes/mu-0.15_0.6_n400_lead \
+python -m qtx_ms.ms_scan --inputs inputs/mos2_hfo2 --modes results_ms/mos2_hfo2_l2direct/modes/mu-0.15_0.6_n400_lead \
        --dE 0:0.5:0.01
 ```
 `--Ec` fixes the energy reference (E = Ec + dE) so that exact T values in `results_ms/exact/*.json` are reused; a json

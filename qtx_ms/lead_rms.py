@@ -16,7 +16,7 @@ z_k on the circle through the window. (1 / 2 pi i) oint sigma'/sigma dz is the c
 eigenvalues inside the circle when xi is added, so minimizing it pushes spurious eigenvalues out of the window.
 Later C are kept orthogonal to earlier ones.
 
-    python -m mgms.lead_rms --inputs inputs/mos2_20nm --rho results_ms/mos2_20nm_l2direct/rho_....npz --slab 0
+    python -m qtx_ms.lead_rms --inputs inputs/mos2_20nm --rho results_ms/mos2_20nm_l2direct/rho_....npz --slab 0
 """
 import argparse, json, os, time
 import numpy as np
@@ -61,13 +61,14 @@ def slab_cell_map(inp, dev, s, tol=0.6, return_info=False):
     xyz, blocks, norb, lab = inp["xyz"], inp["blocks"], inp["norb"], inp["labels"]
     off = np.concatenate([[0], np.cumsum(norb)])
     ax, L = meta["axis"], meta["block_length"]
-    per = meta.get("periodic")
+    from qtx_ms import msbasis as mb
+    per = mb.periodic_axes(meta.get("periodic"))
     cb, sb = tr["lead_left_block"], tr["device_blocks"][s]
     ca, sa = np.where(blocks == cb)[0], np.where(blocks == sb)[0]
     d = xyz[sa][None] - xyz[ca][:, None]
     d[..., ax] -= (sb - cb) * L
-    if per:
-        d[..., per["axis"]] -= per["length"] * np.round(d[..., per["axis"]] / per["length"])
+    for pa, pl in per:
+        d[..., pa] -= pl * np.round(d[..., pa] / pl)
     dist = np.linalg.norm(d, axis=2)
     dist[lab[ca][:, None] != lab[sa][None]] = np.inf
     pi, pj = np.unravel_index(np.argsort(dist, axis=None), dist.shape)
@@ -98,7 +99,7 @@ def slab_cell_map(inp, dev, s, tol=0.6, return_info=False):
 def lead_rho_basis(cell, mu1, mu2, thr=1e-5, nk=64):
     """Lead-cell basis: k integral of the Bloch projectors with E_n(k) in [mu1, mu2], eigenvectors with
     occupation (S00 metric) above thr * max (mb.level2_basis with S)."""
-    from mgms import msbasis as mb
+    from qtx_ms import msbasis as mb
     R = np.zeros((cell.n, cell.n), complex)
     kk = np.linspace(-np.pi, np.pi, nk, endpoint=False)
     for k in kk:
@@ -121,17 +122,21 @@ def to_slab(X, cmap, n_slab):
 
 
 class RMS:
-    def __init__(self, cell, Phi, ks, window, nz=3):
+    def __init__(self, cell, Phi, ks, window, nz=3, Xi=None):
+        """Xi: candidate space (orthonormal, orthogonal to Phi) instead of orth[(1 - Phi Phi^H) H(q) Phi]."""
         self.cell, self.Phi, self.ks = cell, Phi, np.asarray(ks)
         self.E1, self.E2 = window
         self.ec, self.rho = 0.5 * (self.E1 + self.E2), 0.5 * (self.E2 - self.E1)
         self.nz = nz
         self.zk = self.ec + self.rho * np.exp(1j * np.pi * (np.arange(1, 2 * nz + 1) - 0.5) / nz)
-        R = np.hstack([cell.hk(q)[0] @ Phi for q in (0.0, np.pi)])
-        for _ in range(2):
-            R -= Phi @ (Phi.conj().T @ R)
-        Ux, sx, _ = np.linalg.svd(R, full_matrices=False)
-        self.Xi = Ux[:, sx > 1e-8 * sx[0]]
+        if Xi is not None:
+            self.Xi = Xi
+        else:
+            R = np.hstack([cell.hk(q)[0] @ Phi for q in (0.0, np.pi)])
+            for _ in range(2):
+                R -= Phi @ (Phi.conj().T @ R)
+            Ux, sx, _ = np.linalg.svd(R, full_matrices=False)
+            self.Xi = Ux[:, sx > 1e-8 * sx[0]]
         self.c = {}
         for q in self.ks:
             H, S = cell.hk(q)
@@ -231,7 +236,13 @@ class RMS:
                 fd = (self.cost(C0 + hh * dC, S)[0] - self.cost(C0 - hh * dC, S)[0]) / (2 * hh)
                 log(f"  gradient check: analytic {self.cost(C0, S)[1] @ dC:.6e}, finite difference {fd:.6e}")
             r = minimize(self.cost, C0, args=(S,), jac=True, method="L-BFGS-B", options=dict(maxiter=300))
-            Ce = r.x - self.Cs @ (self.Cs.T @ r.x) if self.Cs.shape[1] else r.x
+            Ce = r.x.copy()
+            for _ in range(2):                                    # re-orthogonalize: r.x can lie almost in span(Cs)
+                if self.Cs.shape[1]:
+                    Ce -= self.Cs @ (self.Cs.T @ Ce)
+            if np.linalg.norm(Ce) < 1e-6 * np.linalg.norm(r.x):
+                log(f"  iteration {it}: new direction lies in the span of the previous ones, stop")
+                break
             self.Cs = np.hstack([self.Cs, (Ce / np.linalg.norm(Ce))[:, None]])
             hist.append(dict(it=it, flagged=int(nflag.sum()), q=[float(self.ks[j] / np.pi) for j in pick],
                              f0=float(f0), f=float(r.fun), t=time.time() - t))
@@ -257,7 +268,7 @@ def band_stats(e_red, Eex, lo, hi, tol=0.005):
     return dict(spurious=nsp, p95_meV=float(1e3 * np.nanpercentile(acc, 95)), max_meV=float(1e3 * np.nanmax(acc)))
 
 
-def plot_bands(fname, ks, Eex, red, edges, ylim, title, windows=(), energies=(), tol=0.005):
+def plot_bands(fname, ks, Eex, red, edges, ylim, title, windows=(), energies=(), tol=0.005, legend_loc="lower right"):
     """Exact lead bands (ink lines) and reduced bands per panel (dots; spurious ones in orange)."""
     import matplotlib
     matplotlib.use("Agg")
@@ -310,7 +321,7 @@ def plot_bands(fname, ks, Eex, red, edges, ylim, title, windows=(), energies=(),
             else:
                 ax.set_title(f"{lab}: {int(sp.sum())} spurious", fontsize=10, color=ink, loc="left")
             if ip == npan - 1:
-                ax.legend(loc="lower right", fontsize=8, frameon=False)
+                ax.legend(loc=legend_loc, fontsize=8, frameon=False)
         ax.set_xlim(0, 1); ax.set_ylim(*ylim)
         ax.set_xlabel("k (π / cell length)", fontsize=9, color=muted)
         ax.grid(color=grid, lw=0.6); ax.set_axisbelow(True)
@@ -325,8 +336,8 @@ def plot_bands(fname, ks, Eex, red, edges, ylim, title, windows=(), energies=(),
 
 
 if __name__ == "__main__":
-    from mgms.prep.inputs import read_inputs
-    from mgms import msbasis as mb
+    from qtx_ms.prep.inputs import read_inputs
+    from qtx_ms import msbasis as mb
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--inputs", required=True)
     p.add_argument("--rho", help="level-2 density matrix (run_ms cache, direct-l2) for the slab basis")

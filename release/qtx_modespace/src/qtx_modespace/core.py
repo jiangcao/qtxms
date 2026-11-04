@@ -279,35 +279,67 @@ class Coarse:
         return np.vstack([self.V[s].conj().T @ X[b[s]:b[s + 1]] for s in range(len(self.V))])
 
 
+def is_real(blk):
+    """True if all slab blocks of H and S are real: A(z) is then complex symmetric (see g_diag)."""
+    return all(not np.iscomplexobj(M) or not np.abs(M.imag).any() for k in ("HD", "SD", "HU", "SU") for M in blk[k])
+
+
+def g_diag(blk, z, SL, SR, iL, iR, sym=False):
+    """Diagonal blocks G_ss of G = A(z)^-1, A = z S - H - Sigma_L - Sigma_R (Sigma_L on rows / columns iL of the first
+    slab, Sigma_R on iR of the last), by left-connected block recursion:
+        forward   g_s = (D_s - Y_{s-1} U_{s-1})^-1,  Y_s = L_s g_s
+        backward  G_ss = g_s + X_s G_{s+1,s+1} Y_s,  X_s = g_s U_s
+    (D_s, U_s, L_s = diagonal / upper / lower blocks of A). sym (real H and S: L_s = U_s^T, g_s = g_s^T) uses
+    X_s = Y_s^T: 4 block products per slab instead of 5 (6 in the 0.1.0 recursion)."""
+    ns = len(blk["HD"])
+    Up = lambda s: z * blk["SU"][s] - blk["HU"][s]
+    Lo = lambda s: z * blk["SU"][s].conj().T - blk["HU"][s].conj().T
+    gl, Y = [None] * ns, [None] * (ns - 1)
+    for s in range(ns):
+        D = z * blk["SD"][s] - blk["HD"][s]
+        if s == 0:
+            D[np.ix_(iL, iL)] -= SL
+        if s == ns - 1:
+            D[np.ix_(iR, iR)] -= SR
+        if s > 0:
+            D -= Y[s - 1] @ Up(s - 1)
+        gl[s] = np.linalg.inv(D)
+        del D
+        if s < ns - 1:
+            Y[s] = Lo(s) @ gl[s]
+    out = [None] * ns
+    out[-1] = G = gl[-1]
+    for s in range(ns - 2, -1, -1):
+        X = Y[s].T if sym else gl[s] @ Up(s)
+        out[s] = G = gl[s] + X @ (G @ Y[s])
+        gl[s] = Y[s] = None
+    return out
+
+
 def rho_contour(dev, mu1, mu2, npts, log=log):
     """Slab density matrices of the open device, rho_ss = -(1/pi) Im int G_ss dz over the upper half circle from mu1
-    to mu2 (Gauss-Legendre in the angle), G = (z S - H - Sigma(z))^-1 by left-connected block recursion."""
+    to mu2 (Gauss-Legendre in the angle), G_ss from g_diag (block recursion; real H, S use the symmetric variant)."""
     blk = slab_blocks(dev)
-    ns = len(blk["HD"])
+    sym = is_real(blk)
+    if sym:
+        for k in ("HD", "SD", "HU", "SU"):
+            blk[k] = [np.ascontiguousarray(np.real(M)) for M in blk[k]]
+    iL, iR = dev.bL, dev.bR - dev.sb[-2]                     # lead faces in the end slabs
     c, r = 0.5 * (mu1 + mu2), 0.5 * (mu2 - mu1)
     x, w = np.polynomial.legendre.leggauss(npts)
     th, w = 0.5 * np.pi * (x + 1), 0.5 * np.pi * w
-    PL, PR = np.eye(dev.ns[0])[dev.bL], np.eye(dev.ns[-1])[dev.bR - dev.sb[-2]]
     acc = [np.zeros(h.shape, complex) for h in blk["HD"]]
     t0 = time.time()
     for ip, (t_, w_) in enumerate(zip(th, w)):
         z = c + r * np.exp(1j * t_)
         dz = -1j * r * np.exp(1j * t_) * w_
+        t1 = time.time()
         SL, SR = dev.sigma(z)
-        D = [z * blk["SD"][s] - blk["HD"][s] for s in range(ns)]
-        D[0] = D[0] - PL.T @ SL @ PL
-        D[-1] = D[-1] - PR.T @ SR @ PR
-        Up = [z * blk["SU"][s] - blk["HU"][s] for s in range(ns - 1)]
-        Lo = [z * blk["SU"][s].conj().T - blk["HU"][s].conj().T for s in range(ns - 1)]
-        gl = [None] * ns
-        for s in range(ns):
-            gl[s] = np.linalg.inv(D[s] if s == 0 else D[s] - Lo[s - 1] @ gl[s - 1] @ Up[s - 1])
-        G = gl[-1]
-        acc[-1] += G * dz
-        for s in range(ns - 2, -1, -1):
-            G = gl[s] + gl[s] @ Up[s] @ G @ Lo[s] @ gl[s]
-            acc[s] += G * dz
-        log(f"    contour point {ip + 1}/{npts}, {time.time() - t0:.0f} s")
+        t2 = time.time()
+        for a, G in zip(acc, g_diag(blk, z, SL, SR, iL, iR, sym)):
+            a += G * dz
+        log(f"    contour point {ip + 1}/{npts}, {time.time() - t0:.0f} s (sigma {t2 - t1:.0f} s, "
+            f"recursion {time.time() - t2:.0f} s)")
     return [-((a - a.conj().T) / 2j) / np.pi for a in acc]
 
 

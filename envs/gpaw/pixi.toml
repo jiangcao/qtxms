@@ -1,7 +1,7 @@
 # DFT environment for input preparation only (GPAW LCAO -> generic input set read by the uv environment).
 #   export PIXI_CACHE_DIR=/usr/scratch/mont-fort15/jiacao/.cache/pixi   (home quota is full)
 #   pixi install --manifest-path envs/gpaw/pixi.toml
-#   pixi run --manifest-path envs/gpaw/pixi.toml python -m mgms.prep.mos2 ...   (from the repo root)
+#   pixi run --manifest-path envs/gpaw/pixi.toml python -m qtx_ms.prep.mos2 ...   (from the repo root)
 [workspace]
 name = "mgms-gpaw"
 channels = ["conda-forge"]

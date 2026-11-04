@@ -17,6 +17,22 @@ python -m qtx_modespace DEVICE_FOLDER --out t_out --cells 3 --trim \
 ```
 `qtx-modespace` is installed as a console script with the same arguments. Set `OMP_NUM_THREADS` / `MKL_NUM_THREADS`.
 
+Options can also come from a TOML file, `--config run.toml`, keyed by the long option names (dashes or underscores;
+`folder` is the device folder); the command line overrides the file. Lists are accepted for list options
+(`dE = [0.05, 0.15]`, windows as `mu = [[-0.15, 0.6], [0.5, 0.9]]`). Every run writes its resolved options to
+`<out>/config.toml`; `python -m qtx_modespace --config <out>/config.toml` repeats the run (relative paths are taken
+from the launch directory, which the file's first line records).
+```
+folder = "DEVICE_FOLDER"
+out = "t_out"
+modes = "data/mos2_hfo2_n400/modes"
+transmission = true
+exact = true
+dE = [0.02, 0.05, 0.15, 0.3, 0.45]
+sigma-cache = "sigma_mos2_hfo2"
+psi-dir = "psi_exact"
+```
+
 ## Input
 
 A deviceBuilder folder:
@@ -64,8 +80,10 @@ Only the R = [0, 0, 0] block is used (no transverse k). Triangle-only storage is
 | `basis.json` | slab sizes, N per slab, window, occupations, cleanup summary per end slab, device info, arguments |
 | `eig_mu…_top<neig>.npz` | cached slab eigenpairs; a rerun with the same window and `--neig` skips the contour |
 | `rho_mu….npz` | slab density matrices, only with `--save-rho` (2.2 GB for the device below) |
-| `sigma/` | cached lead self-energies (`--sigma-cache none` to disable) |
-| `transmission.json`, `.png` | per energy: channels, T_MS, T_exact, relative error, timings |
+| `config.toml` | resolved options of the run (input for `--config`) |
+| `sigma/` | cached lead self-energies and lead band edges `lead_edges.json` (`--sigma-cache none` to disable) |
+| `transmission.json`, `.png` | per energy: channels, T_MS, T_exact, relative error, timings; with `--exact` also the errors of the QTBM solution vectors (`err_psi`: Frobenius over channels, `err_psi_max`: worst channel, `err_psi_S`: S norm, `err_psi_last` / `err_psi_slab`: right end slab / each slab, `err_psi_best`: best approximation in range(U), `err_res`: residual), all relative to the exact solution |
+| `--psi-dir` | exact QTBM solutions `psi_<E>_<eta>.npy`, reused by any later run (checked by their residual) |
 
 The full basis is U = diag(U_0, …, U_{S-1}) over the slabs; in QuaTrEx orbital indices,
 `U[orbitals_s, cols_s] = slab<s>.npy`. Orbitals of the two lead blocks are not in any slab. Inside the code the
@@ -190,6 +208,51 @@ Ec + 0.2 eV); `--cells 4 --trim` by at most 0.18%. Global magnitude cuts of H, S
 Cost on this device (4 threads, shared machine): basis 1.5–2 h (contour 24 points ~80 min, of which most is the lead
 self-energies; eigenvectors and cleanup ~10 min); per energy: lead self-energy ~3 min, mode-space solve ~1 s, exact
 solve 4–9 min.
+
+## Open-boundary eigenmodes (`qtx_modespace.obc_eig`)
+
+The resonances and bound states of the open device, i.e. the solutions of the nonlinear eigenproblem
+T(z) v = 0, T(z) = zS − H − Σ_L(z) − Σ_R(z), inside an ellipse, by Beyn's contour-integral method. Their span
+against a saved basis (`--modes`) tells whether the basis holds the physical resonant states; `--plot` draws each mode.
+```
+python -m qtx_modespace.obc_eig DEVICE --out eig_c1 --center 0.017 --a 0.015 --b 0.01 --npts 24 --probes 200 \
+       --modes data/mos2_hfo2_n400/modes --plot
+for w in 0 1 2; do                                   # parallel: points per worker, then one run that combines them
+  python -m qtx_modespace.obc_eig DEVICE --out eig_c1 ... --points $(seq -s, $w 3 23) &
+done; wait
+```
+`qtx-modespace-obc-eig` is the same as a console script.
+
+- **Second sheet.** The resonances lie below the real axis on the continuation of the retarded Σ^R(E + i0). The lead
+  Bloch modes of one decimation at z are classified by their flux, and below the axis the n propagating modes that
+  have the wrong direction are swapped. Here n is the channel count at the contour centre on the real axis. This
+  continuation is analytic only between consecutive lead subband edges, which are its branch points. **A contour must
+  lie inside one such interval and stay a few meV away from its edges.** The lead band edges are printed by the main
+  driver (`sigma/lead_edges.json`); on MoS2/HfO2 the edges near Ec are at Ec + 0, 0.034, 0.136 and 0.232 eV, and
+  above that they are only meV apart.
+- **Probes.** The number of eigenvalues inside the contour must stay below `--probes` × `--kmom`. The rank of the
+  moment matrix is printed, with a warning when it comes close to that limit. The singular values are in `eig.json`.
+- **Cost.** One dense block-tridiagonal LU of T(z) per contour point, with `--probes` right-hand sides, plus one
+  continued Σ per point. Below the axis, each continued Σ also needs two lead mode eigendecompositions. The residual
+  check costs one more Σ per eigenvalue (`--resid n` limits it to the n eigenvalues closest to the centre). On the
+  device below: about 2 min per solve and 2.5–4 min per Σ (4 threads). The solves and Σ are cached, so a run
+  can be resumed or extended.
+- **Output** (`--out`): `eigpairs.npz` (`lam`; `vec`, device orbitals × modes; `orbitals`, the QuaTrEx index of each
+  row; with `--modes` also `missing` = |(1 − P)v|/|v| and `missing_slab`), `eig.json` (eigenvalues, E − Ec, residuals
+  |T(λ)v|/(max|T| |v|), span, contour, channel counts), `eigmodes.png` (Mulliken weight per atom in two projections,
+  and the profile along transport per species; dashed lines = slab boundaries), and `X/` (the solves per point).
+
+MoS2/HfO2 (the device below, level-1 basis N1 2301 of the qtx_ms study; three contours between the lead edges, all
+eigenvalues found):
+
+| contour (E − Ec, eV) | eigenvalues | Im λ (eV) | missing in span(U1) | residual |
+|---|---|---|---|---|
+| 0.002–0.032, depth 0.01 (also 0.05: the same one) | 1 | −1.5e-4 | 8.2e-4 | 4.5e-10 |
+| 0.040–0.130, depth 0.03 | 3 | −1.3e-7 … −2.0e-4 | 3.2e-4 – 6.0e-4 | ≈ 2e-14 |
+| 0.144–0.224, depth 0.03 | 5 | −2.0e-4 … −2.5e-3 | 5.2e-4 – 9.6e-4 | ≈ 2e-11 |
+
+All of them are narrow states (Γ ≤ 5 meV) at the two ends of the HfO2 layer. Below Ec + 0.17 eV they are almost
+pure Hf/O. Above that they move into the MoS2 channel near the right oxide end (57–98 % on Mo/S).
 
 ## Notes and limits
 

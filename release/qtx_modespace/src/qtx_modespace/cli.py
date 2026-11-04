@@ -17,12 +17,17 @@
      orbital index in the QuaTrEx hamiltonian.h5), basis.json (sizes, occupations, cleanup, device info)
      --modes DIR: use a saved basis (DIR/slab<s>.npy, checked against slab<s>_orbitals.npy) instead of 1-4
   5. --transmission: T of the mode-space solution x = U A_c^-1 U^H b (QTBM injection, Galerkin A_c with the exact
-     lead Sigma projected) at the --dE energies, with --exact also the exact T (sparse direct solve) and the error
+     lead Sigma projected) at the --dE energies, with --exact also the exact T (sparse direct solve) and the error,
+     and the error of the solution vectors x_MS - x (see psi_errors); --psi-dir keeps the exact x for reuse
+
+Config file: --config FILE.toml sets any option by its long name (dashes or underscores, folder = the device
+folder); options on the command line override it. Every run writes the resolved options to <out>/config.toml, so
+'python -m qtx_modespace --config <out>/config.toml' repeats it (relative paths: from the launch directory).
 
     python -m qtx_modespace DEVICE_FOLDER --out ms_out --cells 3 --trim --nmodes 400 \\
         --transmission --dE 0:0.5:0.05 --exact
 """
-import argparse, json, os, time
+import argparse, json, os, time, tomllib
 import numpy as np
 
 from .quatrex import read_quatrex, lead_bands
@@ -154,11 +159,55 @@ def build_basis(a, inp, dev, Ec, t0):
     return V, info
 
 
+def psi_errors(dev, c, A, b, X, Xms):
+    """Errors of the mode-space QTBM solutions Xms against the exact X (columns = injected channels), relative to
+    the exact solution: Frobenius over all channels (psi), worst channel (psi_max), S norm (psi_S), the right end
+    slab (psi_last; T is read off there) and each slab (psi_slab); psi_best = |X - U U^H X| / |X| is the error of
+    the best plain-norm approximation in range(U); res = |b - A Xms| / |b|."""
+    E, b_ = Xms - X, dev.sb
+    fro = lambda M: float(np.linalg.norm(M))
+    sn = lambda M: float(np.sqrt(max(np.real(np.vdot(M, dev.S @ M)), 0.0)))
+    col = np.linalg.norm(E, axis=0) / np.maximum(np.linalg.norm(X, axis=0), 1e-300)
+    return dict(psi=fro(E) / fro(X), psi_max=float(col.max()), psi_S=sn(E) / sn(X),
+                psi_last=fro(E[b_[-2]:]) / fro(X[b_[-2]:]),
+                psi_slab=[fro(E[b_[s]:b_[s + 1]]) / fro(X[b_[s]:b_[s + 1]]) for s in range(len(dev.ns))],
+                psi_best=fro(X - c.prolong(c.restrict(X))) / fro(X), res=fro(b - A @ Xms) / fro(b))
+
+
+def load_config(p, f):
+    """Options of the TOML file f as parser defaults: keys = long option names, lists joined by ',' (lists of lists:
+    windows, joined by ';'), values of string options converted to str."""
+    acts = {x.dest: x for x in p._actions}
+    out = {}
+    for k, v in tomllib.loads(open(f).read()).items():
+        d = k.replace("-", "_")
+        if d not in acts or d in ("help", "config"):
+            p.error(f"{f}: unknown option '{k}'")
+        if isinstance(v, list):
+            v = ";".join(",".join(map(str, x)) for x in v) if v and isinstance(v[0], list) else ",".join(map(str, v))
+        elif acts[d].type in (None, str) and not isinstance(v, (str, bool)):
+            v = str(v)
+        out[d] = v
+    return out
+
+
+def save_config(f, a):
+    """The resolved options of the run as TOML (None = unset, left out)."""
+    lines = [f"# python -m qtx_modespace --config {f}   (launched from {os.getcwd()})"]
+    for k, v in vars(a).items():
+        if v is None or k == "config":
+            continue
+        lines.append(f"{k} = " + (("true" if v else "false") if isinstance(v, bool) else
+                                  json.dumps(v) if isinstance(v, str) else repr(v)))
+    open(f, "w").write("\n".join(lines) + "\n")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="qtx_modespace", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("folder", help="QuaTrEx device folder (quatrex_config.toml, inputs/)")
-    p.add_argument("--out", required=True)
+    p.add_argument("folder", nargs="?", help="QuaTrEx device folder (quatrex_config.toml, inputs/)")
+    p.add_argument("--config", help="TOML file of options (command line overrides it)")
+    p.add_argument("--out")
     g = p.add_argument_group("device")
     g.add_argument("--cells", type=int, help="contact cells per block (default: smallest covering the coupling range)")
     g.add_argument("--trim", action="store_true", help="drop H, S entries coupling non-neighbouring blocks")
@@ -188,15 +237,23 @@ def main(argv=None):
     g.add_argument("--dE", default="0.02,0.05,0.15,0.3", help="energies - Ec: list or lo:hi:step [eV]")
     g.add_argument("--Ec", type=float, help="reference edge for --dE (default Ec_lead)")
     g.add_argument("--eta", type=float, default=1e-6, help="imaginary part of E for the lead self-energies [eV]")
-    p.add_argument("--sigma-cache", help="directory for lead self-energies (default <out>/sigma; 'none' = off)")
+    g.add_argument("--psi-dir", help="--exact: store / reuse the exact solutions here (psi_<E>.npy, any basis)")
+    p.add_argument("--sigma-cache", help="directory for lead self-energies and lead band edges (default <out>/sigma; 'none' = off)")
+    c, _ = p.parse_known_args(argv)
+    if c.config:
+        p.set_defaults(**load_config(p, c.config))
     a = p.parse_args(argv)
+    for k in ("folder", "out"):
+        if not getattr(a, k):
+            p.error(f"{k} is required (command line or --config)")
 
     t0 = time.time()
     os.makedirs(os.path.join(a.out, "modes"), exist_ok=True)
-    inp = read_quatrex(a.folder, cells=a.cells, trim=a.trim, potential=a.potential, log=log)
+    save_config(os.path.join(a.out, "config.toml"), a)
+    cache = None if a.sigma_cache == "none" else (a.sigma_cache or os.path.join(a.out, "sigma"))
+    inp = read_quatrex(a.folder, cells=a.cells, trim=a.trim, potential=a.potential, cache_dir=cache, log=log)
     meta = inp["meta"]
     Ec, Ev = meta["edges"]["Ec_lead"], meta["edges"]["Ev_lead"]
-    cache = None if a.sigma_cache == "none" else (a.sigma_cache or os.path.join(a.out, "sigma"))
     dev = Device(inp, sigma_cache=cache)
     nsl = len(dev.ns)
     log(f"device {dev.n} orbitals, slabs {dev.ns}; Ec {Ec:.4f}, Ev {Ev:.4f} eV")
@@ -237,17 +294,33 @@ def main(argv=None):
         b[dev.bL] = B
         Tof = lambda x: float(np.real(np.einsum("ic,ij,jc->", x[dev.bR].conj(), GR, x[dev.bR])))
         t = time.time()
-        r.update(E=E, channels=int(B.shape[1]), T_ms=Tof(c.prolong(c.Ac(E, SL, SR).solve(c.restrict(b)))),
-                 t_ms=time.time() - t, t_sigma=ts)
-        if a.exact and "T_exact" not in r:
-            t = time.time()
-            cs = CSolver(dev.A(E, SL, SR))
-            r.update(T_exact=Tof(cs.solve(b)), res_exact=cs.res, t_exact=time.time() - t)
-            cs.free()
+        Xms = c.prolong(c.Ac(E, SL, SR).solve(c.restrict(b)))
+        r.update(E=E, channels=int(B.shape[1]), T_ms=Tof(Xms), t_ms=time.time() - t, t_sigma=ts)
+        if a.exact and ("T_exact" not in r or "err_psi" not in r):
+            A = dev.A(E, SL, SR)
+            fpsi = a.psi_dir and os.path.join(a.psi_dir, f"psi_{E:+.8f}_{a.eta:.2e}.npy")
+            X = np.load(fpsi) if fpsi and os.path.exists(fpsi) else None
+            if X is not None and (X.shape != b.shape or np.linalg.norm(b - A @ X) > 1e-8 * np.linalg.norm(b)):
+                log(f"  {fpsi} does not solve this system, recomputed")
+                X = None
+            if X is None:
+                t = time.time()
+                cs = CSolver(A)
+                X = cs.solve(b)
+                r.update(res_exact=cs.res, t_exact=time.time() - t)
+                cs.free()
+                if fpsi:
+                    os.makedirs(a.psi_dir, exist_ok=True)
+                    np.save(fpsi, X)
+            r["T_exact"] = Tof(X)
+            r.update({"err_" + k: v for k, v in psi_errors(dev, c, A, b, X, Xms).items()})
         if r.get("T_exact", 0) > 0:
             r["err"] = (r["T_ms"] - r["T_exact"]) / r["T_exact"]
         log(f"E = Ec {dE:+.3f}: {r['channels']} channels, T_MS {r['T_ms']:.5f}"
             + (f", T_exact {r['T_exact']:.5f} ({100 * r['err']:+.4f}%)" if "err" in r else "")
+            + (f"; psi error {r['err_psi']:.2e} (max channel {r['err_psi_max']:.2e}, S {r['err_psi_S']:.2e}, "
+               f"last slab {r['err_psi_last']:.2e}, best in U {r['err_psi_best']:.2e}), residual {r['err_res']:.1e}"
+               if "err_psi" in r else "")
             + f"; sigma {ts:.0f} s, MS {r['t_ms']:.1f} s" + (f", exact {r['t_exact']:.0f} s" if "t_exact" in r else ""))
         tr["E"] = dict(sorted(res.items(), key=lambda kv: float(kv[0])))
         res = tr["E"]
@@ -256,6 +329,9 @@ def main(argv=None):
     errs = [abs(r["err"]) for r in res.values() if "err" in r]
     if errs:
         log(f"max |T_MS - T| / T = {100 * max(errs):.4f}% over {len(errs)} energies")
+    errs = [r["err_psi"] for r in res.values() if "err_psi" in r]
+    if errs:
+        log(f"max |psi_MS - psi| / |psi| = {max(errs):.2e} over {len(errs)} energies")
     log(f"done, {time.time() - t0:.0f} s -> {ftr}")
 
 

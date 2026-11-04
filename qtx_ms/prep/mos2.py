@@ -12,11 +12,11 @@ Structure [lead | device slabs | lead]. Three kinds of disorder in the device sl
 bond-length disorder (random displacements, hoppings scaled by (d0/d)^eta), S vacancies (orbitals removed,
 unrelaxed, not self-consistent), and a background potential from oxide-interface roughness (Gaussian field)
 and random interface dipoles. Lead band edges from the generalized eigenproblem of the lead cell.
-Writes the generic input set (mgms.prep.inputs) plus disorder.npz (V per atom, displacements, vacancy
+Writes the generic input set (qtx_ms.prep.inputs) plus disorder.npz (V per atom, displacements, vacancy
 positions, dipoles) and lead_bands.npz.
 
-    pixi run --manifest-path envs/gpaw/pixi.toml python -m mgms.prep.mos2 dft --out inputs/mos2_hr.npz
-    uv run python -m mgms.prep.mos2 device --hr inputs/mos2_hr.npz --length 200 --ny 9 --out inputs/mos2
+    pixi run --manifest-path envs/gpaw/pixi.toml python -m qtx_ms.prep.mos2 dft --out inputs/mos2_hr.npz
+    uv run python -m qtx_ms.prep.mos2 device --hr inputs/mos2_hr.npz --length 200 --ny 9 --out inputs/mos2
 """
 import argparse
 import json
@@ -99,7 +99,7 @@ def dft_super(out, nsc=(9, 9), rms=1.0, corr=12.0, seed=0, a=3.18, thickness=3.1
     local normal n = (-h_x, -h_y, 1) / |.|, so the in-plane bonds stretch with the local slope (unrelaxed).
     GPAW LCAO at Gamma only: the supercell is longer than twice the coupling range (checked in stage 2), so
     H(Gamma) splits uniquely into the couplings to the neighbouring supercells along x, and is already folded
-    at k_y = 0 along y. Run with MPI: mpiexec -n N python -m mgms.prep.mos2 dft-super."""
+    at k_y = 0 along y. Run with MPI: mpiexec -n N python -m qtx_ms.prep.mos2 dft-super."""
     from gpaw import GPAW, FermiDirac
     from gpaw.lcao.tools import get_lcao_hamiltonian
     from gpaw.mpi import world

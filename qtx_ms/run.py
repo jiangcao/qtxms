@@ -1,8 +1,8 @@
 import sys, time, json
 import numpy as np
 import scipy.sparse.linalg as spla
-from mgms.device import Device, rgf_column
-from mgms.em import basis_cms, basis_ldm, assemble_U, TwoLevel, transmission_from_psi
+from qtx_ms.device import Device, rgf_column
+from qtx_ms.em import basis_cms, basis_ldm, assemble_U, TwoLevel, transmission_from_psi
 
 L = float(sys.argv[1]) if len(sys.argv) > 1 else 20.0
 dev = Device(L=L)

@@ -83,6 +83,7 @@ def main(argv=None):
     p.add_argument("--cells", type=int)
     p.add_argument("--trim", action="store_true")
     p.add_argument("--potential", action="store_true")
+    p.add_argument("--cache", help="directory for the lead band edges (lead_edges.json; e.g. the --sigma-cache)")
     p.add_argument("--dE", default="0:0.5:0.05", help="energies - Ec: list or lo:hi:step [eV]")
     p.add_argument("--Ec", type=float, help="reference edge (default Ec_lead)")
     p.add_argument("--solver", default="pardiso", help="QuaTrEx electron.solver.direct_solver")
@@ -93,7 +94,7 @@ def main(argv=None):
     root = Path(a.folder)
     cfg = tomllib.loads((root / "quatrex_config.toml").read_text())
     dc = cfg["device"]
-    inp = read_quatrex(root, cells=a.cells, trim=a.trim, potential=a.potential, log=log)
+    inp = read_quatrex(root, cells=a.cells, trim=a.trim, potential=a.potential, cache_dir=a.cache, log=log)
     meta = inp["meta"]
     ax, m, nb = meta["axis"], meta["cells_per_block"], meta["nblocks"]
     H, S, xyz, labels, norb, blocks = inp["H"], inp["S"], inp["xyz"], inp["labels"], inp["norb"], inp["blocks"]

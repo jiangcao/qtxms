@@ -1,7 +1,7 @@
 """Diagnostics for the two-level solver (MG1: coarse = level-1 basis U1) at given energies, strongest
 injection channel. Uses the bases cached by run_ms (same --inputs / --no-cores / basis options).
 
-    python -m mgms.diag_mg --inputs inputs/si3x5_sp3s --E 1.21 [--neig 30] [-- <extra run_ms options>]
+    python -m qtx_ms.diag_mg --inputs inputs/si3x5_sp3s --E 1.21 [--neig 30] [-- <extra run_ms options>]
 
 Per energy:
   [exact]    PARDISO: perturbed pivots, residual vs refinement steps, CSolver with GMRES fallback
@@ -30,7 +30,7 @@ d, rest = p.parse_known_args()
 sys.argv = ["run_ms", "--inputs", d.inputs, "--E", d.E] + [x for x in rest if x != "--"]
 src = open(__file__.replace("diag_mg.py", "run_ms.py")).read()
 exec(compile(src.split("# " + "-" * 66 + " transmission")[0], "run_ms_setup", "exec"))
-from mgms.twolevel import TwoLevel, gmres_fixed
+from qtx_ms.twolevel import TwoLevel, gmres_fixed
 
 
 def sigma(E):

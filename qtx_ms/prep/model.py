@@ -1,9 +1,9 @@
 """Tight-binding model switch for the whole pipeline.
 
-    QT_MODEL=sp3s     (default) Vogl sp3s* Si, 5 orbitals per channel Si   (mgms.prep.hamiltonian)
-    QT_MODEL=sp3d5s   Boykin sp3d5s* Si, 10 orbitals per channel Si        (mgms.prep.hamiltonian5)
+    QT_MODEL=sp3s     (default) Vogl sp3s* Si, 5 orbitals per channel Si   (qtx_ms.prep.hamiltonian)
+    QT_MODEL=sp3d5s   Boykin sp3d5s* Si, 10 orbitals per channel Si        (qtx_ms.prep.hamiltonian5)
 
-select() sets the orbital-count table in mgms.prep.structure in place, so Structure.norb / .offsets,
+select() sets the orbital-count table in qtx_ms.prep.structure in place, so Structure.norb / .offsets,
 partition() and every block index follow the chosen model. Results go to separate folders
 (results_transport + suffix()) so the two models never share caches.
 

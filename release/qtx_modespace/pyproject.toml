@@ -1,6 +1,6 @@
 [project]
 name = "qtx-modespace"
-version = "0.1.0"
+version = "0.2.0.dev0"
 description = "Mode-space basis for QuaTrEx devices: direct level-2 slab modes, spurious lead-band cleanup, transmission check"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,6 +16,7 @@ plot = ["matplotlib>=3.8"]
 
 [project.scripts]
 qtx-modespace = "qtx_modespace.cli:main"
+qtx-modespace-obc-eig = "qtx_modespace.obc_eig:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,4 +1,4 @@
-"""Two-level mode-space basis (the qtmode method) built from the generic input set (mgms.prep.inputs).
+"""Two-level mode-space basis (the qtmode method) built from the generic input set (qtx_ms.prep.inputs).
 
 Level 1 (orbitals -> block modes), per transport slab:
   cores : crystalline atoms, found from device.xyz: label core_label and at least d_core from any atom
@@ -12,13 +12,19 @@ Level 1 (orbitals -> block modes), per transport slab:
           with a CAP W on its outer d_cap, at a few energies (randomized range finder); the sets of all
           energies are merged by one SVD, keep s^2 > tile_thr * a_ref.
   U1 = diag(blocks) per slab (orthonormal), H1 = U1^T H U1, S1 = U1^T S U1 in slab blocks.
+  enrichment (optional, enrich_round): residuals of window Ritz pairs of local clusters of H1 (slabs s +- w,
+          or a tile and the tiles coupled to it) appended to the blocks (qtmode.enrich with generalized S,
+          complex H and local instead of global Ritz problems).
 Level 2 (block modes -> slab modes): contour-integrated slab density matrix of the open level-1 system
   rho_ss = -(1/pi) Im int_arc G1_ss(z) dz,  G1 = (z S1 - H1 - Sigma1(z))^-1,  arc over [mu1, mu2],
   eigenvectors with lambda > thr * lambda_max.  U = U1 U2 (block diagonal over slabs).
 Leads: exact Sigma(z) at complex z, lead interior folded onto its faces, then decimation of the folded chain
 (general: complex Hermitian H, any S; fast path for real H, S = I: qtmode face decimation on the smaller face).
+On the real axis (|Im z| <= Device.qtt_eta) Sigma and the injected modes come from qttools' spectral OBC (QuaTrEx)
+when it imports (on sys.path or in $QTTOOLS_SRC, a QuaTrEx src folder; needs the `qtx` extra: mpi4py, numba):
+flux-normalized incoming Bloch modes, one column per propagating channel, like QuaTrEx's QTBM.
 """
-import os, time
+import os, sys, time, warnings
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
@@ -111,10 +117,126 @@ def gmres_right(mv, prec, b, x0, tol, maxit):
 
 
 # ------------------------------------------------------------------ device and leads
-class Device:
-    """Device part of a generic input set: slabs = device blocks, lead coupling, exact Sigma(z)."""
+_QTT = None
 
-    def __init__(self, inp, fast_lead=None):
+
+def qttools_obc():
+    """(Spectral, Full) from qttools (QuaTrEx), or None when it does not import or runs on cupy."""
+    global _QTT
+    if _QTT is None:
+        _QTT = False
+        src = os.environ.get("QTTOOLS_SRC")
+        for path in (None, src) if src else (None,):
+            if path and path not in sys.path:
+                sys.path.append(path)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    from qttools import xp
+                    from qttools.boundary_conditions.obc.spectral import Spectral
+                    from qttools.nevp import Full
+            except ImportError:
+                continue
+            _QTT = (Spectral, Full) if xp is np else False
+            break
+    return _QTT or None
+
+
+class QttLead:
+    """Lead cell (H00, S00, coupling H01, S01 to the next cell along +x) through qttools' spectral OBC at real E.
+    sections = primitive cells per lead cell (the NEVP runs on one primitive cell). Per side:
+      g  surface Green's function of the semi-infinite lead (cell next to the device included),
+      u  lead-cell amplitudes of the flux-normalized incoming modes: the device source is A_dl u
+         (QuaTrEx's contact source -A_ji b, with the contact cell eliminated), so B B^H = Gamma on the device face.
+    perm: lead-cell orbital order with the primitive cells contiguous along +x and in the same internal order. qttools
+    reads the periodic layer from the first (outermost) primitive row, with the cells numbered towards a_ij (inwards):
+    +x for the left lead, reversed for the right lead. g and u are returned in the original order."""
+
+    def __init__(self, H00, H01, S00, S01, sections=1, perm=None, **opts):
+        Spectral, Full = qttools_obc()
+        n = H00.shape[0]
+        assert n % sections == 0, f"lead cell {n} not divisible into {sections}"
+        m = n // sections
+        p = np.arange(n) if perm is None else np.asarray(perm)
+        self.p = {"L": p, "R": p.reshape(sections, m)[::-1].ravel()}
+        self.H00, self.H01, self.S00, self.S01 = (np.asarray(sp.csr_matrix(M)[p][:, p].toarray(), complex)
+                                                  for M in (H00, H01, S00, S01))
+        blk = lambda M, i, j: M[i * m:(i + 1) * m, j * m:(j + 1) * m]
+        self.toeplitz_dev = []                       # Toeplitz in the primitive cells? (the NEVP uses cell 0's row)
+        for nm, M in (("H", self.H00), ("S", self.S00)):
+            d = max([abs(blk(M, i, i) - blk(M, 0, 0)).max() for i in range(sections)] +
+                    [abs(blk(M, i, i + 1) - blk(M, 0, 1)).max() for i in range(sections - 1)])
+            self.toeplitz_dev.append(float(d))
+            if d > 1e-2 * max(abs(M).max(), 1):
+                raise RuntimeError(f"lead cell is not {sections} identical primitive cells (max |d{nm}| {d:.2e})")
+            if d > 1e-8:
+                log(f"  qttools lead: primitive cells of the lead cell differ by up to {d:.1e} in {nm}; "
+                    f"the OBC uses the first cell's couplings (as QuaTrEx)")
+        kw = dict(num_ref_iterations=4)
+        kw.update(opts)
+        self.sections = sections
+        self.solver = Spectral(Full(), block_sections=sections, **kw)
+
+    def modes(self, E, side):
+        a00 = E * self.S00 - self.H00                     # in perm order (cells along +x)
+        a01 = E * self.S01 - self.H01                     # cell n -> n+1
+        a10 = E * self.S01.conj().T - self.H01.conj().T  # cell n+1 -> n
+        a_ji, a_ij = (a10, a01) if side == "L" else (a01, a10)   # a_ji: towards the outer cell
+        r = np.argsort(self.p["L"])[self.p[side]]         # perm order -> this side's cell order
+        a_xx = tuple(M[np.ix_(r, r)][None] for M in (a_ji, a00, a_ij))
+        if self.sections > 1:
+            # exactly periodic lead from the outermost primitive cell (as QuaTrEx's contact): refining g with the
+            # slightly non-periodic cell blocks breaks the recursion (MoS2/HfO2: 8e-3 eV between cells, error 0.72)
+            from qttools.toeplitz.toeplitz import periodize_layer
+            a_xx = tuple(np.ascontiguousarray(x) for x in periodize_layer(a_xx, self.sections))
+        a_ji = a_xx[0][0]
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            g, b = self.solver(a_xx, "", return_injected=True)
+        bad = [str(x.message) for x in w if "recursion error" in str(x.message)]
+        if bad:
+            raise RuntimeError(f"qttools OBC {side} at E = {E}: {bad[0]}")
+        g = g[0]
+        u = g @ (a_ji @ b[0])
+        ip = np.argsort(self.p[side])                      # back to the lead-matrix order
+        return g[np.ix_(ip, ip)], u[ip]
+
+
+def lead_cell_perm(inp, orbs, sections):
+    """Orbital order of a lead cell (global orbitals orbs, in lead-matrix order) with its `sections` primitive cells
+    contiguous along the transport axis and every cell's atoms in the order of the first cell (matched by
+    translation by the primitive period)."""
+    if sections <= 1:
+        return None
+    norb, ax = inp["norb"], inp["meta"]["axis"]
+    off = np.concatenate([[0], np.cumsum(norb)])
+    atom_of = np.repeat(np.arange(len(norb)), norb)
+    atoms = np.unique(atom_of[orbs])
+    x = inp["xyz"][atoms]
+    a = inp["meta"].get("lead_cell_length", np.ptp(x[:, ax]) * sections / (sections - 1)) / sections
+    cell = np.floor((x[:, ax] - x[:, ax].min() + 0.25 * a) / a).astype(int)
+    assert cell.min() == 0 and cell.max() == sections - 1, f"lead cell atoms span cells {cell.min()}..{cell.max()}"
+    first = np.where(cell == 0)[0]
+    tree = cKDTree(x[first])
+    order = []
+    for c in range(sections):
+        shift = np.zeros(3); shift[ax] = c * a
+        mine = np.where(cell == c)[0]
+        d, j = tree.query(x[mine] - shift)
+        assert d.max() < 1e-2 and len(np.unique(j)) == len(first) == len(mine), f"lead cell {c} does not match cell 0"
+        order.extend(mine[np.argsort(j)])
+    pos = {o: i for i, o in enumerate(orbs)}                      # global orbital -> lead-matrix index
+    return np.array([pos[o] for k in order for o in range(off[atoms[k]], off[atoms[k] + 1])])
+
+
+class Device:
+    """Device part of a generic input set: slabs = device blocks, lead coupling, exact Sigma(z).
+    obc: "auto" (qttools on the real axis, else the folded-lead decimation), "qttools" (fail instead of falling back
+    on the real axis) or "folded" (folded lead only; the old name "mgms" is accepted)."""
+
+    qtt_eta = 1e-5                  # |Im z| up to which Sigma(z) is taken from qttools at E = Re z
+
+    def __init__(self, inp, fast_lead=None, obc="auto"):
         self.inp, m = inp, inp["meta"]
         self.meta = m
         norb, blocks = inp["norb"], inp["blocks"]
@@ -156,22 +278,79 @@ class Device:
         # A = z S - H blocks between device boundary and lead face: (lead, dev) and (dev, lead)
         self.cL = [cut(M, oL, dev[self.bL]) for M in (H, S)] + [cut(M, dev[self.bL], oL) for M in (H, S)]
         self.cR = [cut(M, oR, dev[self.bR]) for M in (H, S)] + [cut(M, dev[self.bR], oR) for M in (H, S)]
+        # qttools path: whole lead cell (not only its faces) against the device boundary orbitals
+        obc = {"mgms": "folded"}.get(obc, obc)                 # old name of the folded-lead OBC
+        assert obc in ("auto", "qttools", "folded"), obc
+        self.obc, self.qtt, self._inj = obc, None, {}
+        if obc != "folded" and qttools_obc() is not None:
+            sec = int(m.get("source", {}).get("cells_per_block", 1))
+            perm = lead_cell_perm(inp, O[tr["lead_left_block"]], sec)
+            lead = inp["lead"]
+            try:
+                self.qtt = QttLead(lead["H00"], lead["H01"], lead["S00"], lead["S01"], sec, perm)
+                self.qttR = self.qtt if lr is None else QttLead(lr["H00"], lr["H01"], lr["S00"], lr["S01"], sec, perm)
+            except RuntimeError as e:
+                if obc == "qttools":
+                    raise
+                log(f"  qttools OBC not used: {e}")
+                self.qtt = None
+            self.qL = [cut(M, O[tr["lead_left_block"]], dev[self.bL]) for M in (H, S)] + \
+                      [cut(M, dev[self.bL], O[tr["lead_left_block"]]) for M in (H, S)]
+            self.qR = [cut(M, O[tr["lead_right_block"]], dev[self.bR]) for M in (H, S)] + \
+                      [cut(M, dev[self.bR], O[tr["lead_right_block"]]) for M in (H, S)]
+        elif obc == "qttools":
+            raise RuntimeError("obc='qttools': qttools does not import (install the qtx extra, set QTTOOLS_SRC)")
 
     sigma_cache = None              # directory: Sigma(z) is read from / written to sig_<Re z>_<Im z>.npz there
+                                    # (qsig_... with the injected modes BL, BR for the qttools path)
+
+    def uses_qttools(self, z):
+        return self.qtt is not None and abs(complex(z).imag) <= self.qtt_eta
 
     def sigma(self, z):
-        """Sigma_L on bL, Sigma_R on bR (device indices) at complex z: A_dl g_L A_ld, A_dr g_R A_rd."""
+        """Sigma_L on bL, Sigma_R on bR (device indices) at complex z: A_dl g_L A_ld, A_dr g_R A_rd.
+        qttools path (real axis): at E = Re z; the injected modes are kept for inject()."""
         z = complex(z)
-        if self.sigma_cache:
-            f = os.path.join(self.sigma_cache, f"sig_{z.real:+.8f}_{z.imag:.8e}.npz")
-            if os.path.exists(f):
-                c = np.load(f)
-                return c["SL"], c["SR"]
-        out = self._sigma(z)
-        if self.sigma_cache:
+        q = self.uses_qttools(z)
+        if q:
+            try:
+                return self._sigma_cached(z, "qsig", self._sigma_qtt)
+            except RuntimeError as e:
+                if self.obc == "qttools":
+                    raise
+                log(f"  {e}; folded-lead Sigma instead")
+        return self._sigma_cached(z, "sig", self._sigma)
+
+    def _sigma_cached(self, z, pre, fun):
+        f = self.sigma_cache and os.path.join(self.sigma_cache, f"{pre}_{z.real:+.8f}_{z.imag:.8e}.npz")
+        if f and os.path.exists(f):
+            c = np.load(f)
+            out = c["SL"], c["SR"]
+            if "BL" in c:
+                self._inj = {id(out[0]): c["BL"], id(out[1]): c["BR"]}
+            return out
+        out, inj = fun(z)
+        self._inj = {id(out[0]): inj[0], id(out[1]): inj[1]} if inj else {}
+        if f:
             os.makedirs(self.sigma_cache, exist_ok=True)
-            np.savez(f, SL=out[0], SR=out[1])
+            np.savez(f, SL=out[0], SR=out[1], **(dict(BL=inj[0], BR=inj[1]) if inj else {}))
         return out
+
+    def _sigma_qtt(self, z):
+        E = z.real
+        out, inj = [], []
+        for side, lead, (Hld, Sld, Hdl, Sdl) in (("L", self.qtt, self.qL), ("R", self.qttR, self.qR)):
+            g, u = lead.modes(E, side)
+            Adl = E * Sdl - Hdl
+            out.append(Adl @ g @ (E * Sld - Hld))
+            inj.append(Adl @ u)
+        return tuple(out), tuple(inj)
+
+    def inject(self, Sg, tol=1e-4):
+        """Injection columns for the self-energy Sg returned by the last sigma(): the qttools incoming modes when
+        they came with it, else the Gamma eigenchannels above tol (injection())."""
+        B = self._inj.get(id(Sg))
+        return injection(Sg, tol)[0] if B is None else B
 
     def _sigma(self, z):
         gL, gR = self.lead.surface_gfs(z)
@@ -180,7 +359,7 @@ class Device:
         out = []
         for g, (Hld, Sld, Hdl, Sdl) in ((gL, self.cL), (gR, self.cR)):
             out.append((z * Sdl - Hdl) @ g @ (z * Sld - Hld))
-        return tuple(out)
+        return tuple(out), None
 
     def A(self, E, SL, SR):
         """Sparse fine operator E S - H - Sigma_L - Sigma_R."""
@@ -295,8 +474,41 @@ def bisect(atoms, pos2d, w, nt):
     return bisect(o[:cut], pos2d, w, k1) + bisect(o[cut:], pos2d, w, nt - k1)
 
 
-def partition(dev, cores=True, core_label="Si", d_core=6.0, tile_orbs=2500, axis=0):
-    """Blocks per slab: dict(kind, slab, atoms (global atom ids, sorted), orbs (slab-local orbitals))."""
+def parse_cut(spec):
+    """Tile cuts, ';'-separated, applied in order: '<axis>:<c1>,<c2>,...@<s1>,<s2>,...' (cut planes) or
+    '<axis>:n<k>@<slabs>' (k pieces of equal orbital weight) -> list of dict(axis, n, at, slabs) (see partition);
+    None / '' -> None."""
+    if not spec:
+        return None
+    out = []
+    for item in spec.split(";"):
+        ax, rest = item.split(":")
+        at, sl = rest.split("@") if "@" in rest else (rest, "")
+        out.append(dict(axis=int(ax), n=int(at[1:]) if at.startswith("n") else None,
+                        at=None if at.startswith("n") else sorted(float(x) for x in at.split(",")),
+                        slabs=[int(x) for x in sl.split(",")] if sl else None))
+    return out
+
+
+def cut_pieces(atoms, coord, at, period=None):
+    """Atoms grouped by the intervals between the cut positions `at` along one coordinate; with a period the
+    coordinate is taken modulo it and the pieces below at[0] and above at[-1] are one piece (wrap-around)."""
+    c = coord[atoms] % period if period else coord[atoms]
+    k = np.searchsorted(np.asarray(at), c)
+    if period:
+        k[k == len(at)] = 0
+    return [np.sort(atoms[k == j]) for j in np.unique(k)]
+
+
+def partition(dev, cores=True, core_label="Si", d_core=6.0, tile_orbs=2500, axis=0, xsplit=1, cut=None):
+    """Blocks per slab: dict(kind, slab, atoms (global atom ids, sorted), orbs (slab-local orbitals)).
+    Tiles: recursive transverse bisection to ~tile_orbs orbitals, then each tile cut into xsplit pieces of equal orbital
+    weight along the transport axis (xsplit = 1: tiles span the whole slab in x).
+    cut = [dict(axis, n, at, slabs), ...] (parse_cut): instead of the bisection, the slabs in `slabs` (all if None) are cut at the
+    planes coord[axis] = at (periodic axis: modulo the period, the outermost pieces joined), every other slab is one
+    tile; '0:n2@1,2' = slabs 1, 2 cut into two halves of equal orbital weight along x, slabs 0, 3 one tile each;
+    '2:8.5,15.5@1,2' = the MoS2 layer and the (wrapped) oxide of slabs 1, 2 as two tiles each; '0:n2@1,2;2:9,15.5@1,2'
+    both (4 tiles in slabs 1, 2)."""
     inp = dev.inp
     labels, xyz, norb = inp["labels"], inp["xyz"], inp["norb"]
     core, dmin = (find_cores(labels, Geometry(xyz, dev.meta.get("periodic")), core_label, d_core) if cores
@@ -308,9 +520,20 @@ def partition(dev, cores=True, core_label="Si", d_core=6.0, tile_orbs=2500, axis
         if core[a].any():
             blocks.append(dict(kind="core", slab=s, atoms=a[core[a]]))
         rest = a[~core[a]]
-        nt = max(1, int(round(norb[rest].sum() / tile_orbs)))
-        for t in bisect(rest, xyz[:, tr], norb, nt):
-            blocks.append(dict(kind="tile", slab=s, atoms=np.sort(t)))
+        if cut is not None:
+            pieces = [rest]
+            for c in cut:
+                if c["slabs"] is not None and s not in c["slabs"]:
+                    continue
+                per = dict(periodic_axes(dev.meta.get("periodic"))).get(c["axis"])
+                pieces = [q for t in pieces for q in (
+                    [np.sort(u) for u in bisect(t, xyz[:, [c["axis"]]], norb, c["n"])] if c["n"]
+                    else cut_pieces(t, xyz[:, c["axis"]], c["at"], per))]
+        else:
+            pieces = bisect(rest, xyz[:, tr], norb, max(1, int(round(norb[rest].sum() / tile_orbs))))
+        for j, t in enumerate(pieces):
+            for tx in bisect(t, xyz[:, [axis]], norb, xsplit):
+                blocks.append(dict(kind="tile", slab=s, atoms=np.sort(tx), tpar=j))   # tpar: transverse piece
     for blk in blocks:
         g = np.concatenate([np.arange(dev.off[i], dev.off[i + 1]) for i in blk["atoms"]])
         blk["orbs"] = dev.loc[g]
@@ -408,25 +631,34 @@ def core_basis(bulk, pos, kst, cst, thr=1e-2, chunk=4000):
 
 
 # ------------------------------------------------------------------ level 1: tiles
+def periodic_axes(periodic):
+    """[(axis, length)] from meta["periodic"]: None, {"axis": k, "length": L} or a list of such dicts."""
+    if not periodic:
+        return []
+    return [(int(p["axis"]), float(p["length"])) for p in ([periodic] if isinstance(periodic, dict) else periodic)]
+
+
 class Geometry:
-    """Distance queries on atom positions, minimum image along a periodic transverse axis
-    (meta["periodic"] = {"axis": k, "length": L}, e.g. a 2D sheet folded at k_y = 0)."""
+    """Distance queries on atom positions, minimum image along the periodic transverse axes
+    (meta["periodic"]: {"axis": k, "length": L} or a list of them, e.g. a 2D sheet folded at k_y = 0, or a
+    QuaTrEx Gamma-point supercell periodic in y and z)."""
 
     def __init__(self, xyz, periodic=None):
         self.xyz = np.asarray(xyz, float)
         self.box = None
-        if periodic:
-            lo = self.xyz.min(0) - 1.0
-            self.lo = lo
+        self.per = periodic_axes(periodic)
+        if self.per:
+            self.lo = self.xyz.min(0) - 1.0
             self.box = np.full(3, 2 * np.ptp(self.xyz, axis=0).max() + 1e3)
-            self.box[periodic["axis"]] = periodic["length"]
-            self.ax, self.L = periodic["axis"], periodic["length"]
+            for ax, L in self.per:
+                self.box[ax] = L
 
     def _map(self, r):
         if self.box is None:
             return r
         q = r - self.lo
-        q[:, self.ax] %= self.L
+        for ax, L in self.per:
+            q[:, ax] %= L
         return q
 
     def tree(self, idx=None):
@@ -437,20 +669,203 @@ class Geometry:
         return self._map(self.xyz[idx])
 
 
+def _tile_embedding(inp, geo, tree, atoms, d_emb, d_cap, eta_cap, obc=None):
+    """CAP-terminated embedding of a tile: device atoms within d_emb (lead-block atoms dropped when obc is a Device),
+    CAP eta_cap ((d - (d_emb - d_cap)) / d_cap)^2 on the outer d_cap shell. Tile orbitals pidx in tile atom order
+    (the same row order for every d_emb)."""
+    norb = inp["norb"]
+    off = np.concatenate([[0], np.cumsum(norb)])
+    near = tree.query_ball_point(geo.points(atoms), d_emb)
+    emb = np.union1d(np.unique(np.concatenate([np.asarray(q, int) for q in near])), atoms)
+    if obc is not None:
+        emb = emb[np.isin(emb, obc_atoms(obc))]
+    d, _ = geo.tree(atoms).query(geo.points(emb), k=1)
+    w = eta_cap * np.clip((d - (d_emb - d_cap)) / d_cap, 0, None) ** 2
+    oe = np.concatenate([np.arange(off[i], off[i + 1]) for i in emb])
+    ne = norb[emb]
+    eoff = np.concatenate([[0], np.cumsum(ne)])
+    pe = np.searchsorted(emb, atoms)
+    pidx = np.concatenate([np.arange(eoff[j], eoff[j + 1]) for j in pe])
+    return dict(emb=emb, oe=oe, pidx=pidx, He=inp["H"][oe][:, oe].tocsr(), Se=inp["S"][oe][:, oe].tocsr(),
+                W=sp.diags(np.repeat(w, ne)), faces=[] if obc is None else obc_faces(obc, oe), d_emb=d_emb)
+
+
+def _sig_emb(obc, e, z):
+    """-Sigma_L/R(z) on the embedded lead-face orbitals (sparse, embedding size)."""
+    n = e["He"].shape[0]
+    if not e["faces"] or not any(len(p) for p, _ in e["faces"]):
+        return sp.csr_matrix((n, n), dtype=complex)
+    SL, SR = obc.sigma(z)
+    M = sp.csr_matrix((n, n), dtype=complex)
+    for (pos, fi), Sg in zip(e["faces"], (SL, SR)):
+        if len(pos):
+            ii, jj = np.meshgrid(pos, pos, indexing="ij")
+            M = M - sp.csr_matrix((Sg[np.ix_(fi, fi)].ravel(), (ii.ravel(), jj.ravel())), shape=(n, n))
+    return M
+
+
+def tile_rho_contour(inp, geo, tree, atoms, contour, d_emb=12.0, d_cap=3.0, eta_cap=0.3, obc=None, gpp="schur",
+                     env_prec="single", refine=1, emb_far=None, workers=1, threads=None, rhs=None,
+                     dense_fill=0.02, dense_max=30000):
+    """Accelerated contour integral of the tile block of the CAP(+OBC) embedding Green's function,
+    acc = int_arc G_PP(z) R dz on the upper arc (Gauss-Legendre in theta, as tile_modes(contour=)); returns
+    (acc, info). R = rhs (m x r probes; None: identity, the full G_PP).
+    gpp = "schur": G_PP = (A_PP - A_PE A_EE^-1 A_EP)^-1 R, A = z S - H + iW - Sigma_emb(z): the environment E is
+      factorized alone and only m columns are solved; env_prec = "single": A_EE LU in complex64, `refine` steps of
+      iterative refinement of X = A_EE^-1 A_EP in complex128 (residual with the sparse A_EE), Schur complement and
+      its inverse in complex128. "full": one LU of the whole embedding (tile_modes' original path, double).
+    emb_far = [(imz, d), ...]: contour points with Im z >= imz use the smaller embedding d (largest matching imz);
+      G decays faster away from the real axis, the full d_emb is needed near the window edges only.
+    workers > 1: contour points split over forked processes with `threads` BLAS threads each (threadpoolctl)."""
+    mu1, mu2, npts = contour
+    c, rr = 0.5 * (mu1 + mu2), 0.5 * (mu2 - mu1)
+    x, wq = np.polynomial.legendre.leggauss(int(npts))
+    th, wq = 0.5 * np.pi * (x + 1), 0.5 * np.pi * wq
+    zs = c + rr * np.exp(1j * th)
+    rules = sorted(emb_far or [])
+    dz = []
+    for z in zs:
+        d = d_emb
+        for imz, dd in rules:
+            if z.imag >= imz:
+                d = dd
+        dz.append(min(d, d_emb))
+    embs = {d: _tile_embedding(inp, geo, tree, atoms, d, d_cap, eta_cap, obc) for d in sorted(set(dz))}
+    m = len(embs[d_emb if d_emb in embs else max(embs)]["pidx"])
+    r = m if rhs is None else rhs.shape[1]
+    cdt = np.complex64 if env_prec == "single" else np.complex128
+
+    def point(k):
+        z, e = zs[k], embs[dz[k]]
+        He, Se, W, pidx = e["He"], e["Se"], e["W"], e["pidx"]
+        n = He.shape[0]
+        A = (z * Se - He + 1j * W + _sig_emb(obc, e, z)).tocsr()
+        dense = (He + Se).nnz > dense_fill * n * n and n <= dense_max
+        RP = np.eye(m, dtype=complex) if rhs is None else rhs.astype(complex)
+        if gpp == "full":
+            R = np.zeros((n, r), complex)
+            R[pidx] = RP
+            if dense:
+                lu = sla.lu_factor(A.toarray(), check_finite=False, overwrite_a=True)
+                return sla.lu_solve(lu, R, check_finite=False)[pidx]
+            cs = CSolver(A)
+            G = cs.solve(R)[pidx]
+            cs.free()
+            return G
+        eidx = np.setdiff1d(np.arange(n), pidx)
+        Ar = A[eidx]
+        AEE, AEP = Ar[:, eidx].tocsr(), Ar[:, pidx].toarray()
+        Ap = A[pidx]
+        APP, APE = Ap[:, pidx].toarray(), Ap[:, eidx].tocsr()
+        if dense:
+            AEEd = AEE.toarray()                                          # dense: threaded GEMM residual
+            lu = sla.lu_factor(AEEd.astype(cdt), check_finite=False, overwrite_a=True)
+            X = sla.lu_solve(lu, AEP.astype(cdt), check_finite=False).astype(complex)
+            if env_prec == "single":
+                for _ in range(refine):
+                    X += sla.lu_solve(lu, (AEP - AEEd @ X).astype(cdt), check_finite=False)
+            del lu, AEEd
+        else:
+            cs = CSolver(AEE)
+            X = cs.solve(AEP)
+            cs.free()
+        Sp = APP - APE @ X
+        del X
+        return np.linalg.inv(Sp) if rhs is None else sla.solve(Sp, RP, check_finite=False)
+
+    def run(ks):
+        acc = np.zeros((m, r), complex)
+        for k in ks:
+            acc += point(k) * (-1j * rr * np.exp(1j * th[k]) * wq[k])
+        return acc
+
+    t0 = time.time()
+    if workers <= 1:
+        if threads:
+            from threadpoolctl import threadpool_limits
+            with threadpool_limits(threads):
+                acc = run(range(len(zs)))
+        else:
+            acc = run(range(len(zs)))
+    else:
+        import multiprocessing as mp
+        ctx = mp.get_context("fork")
+        q = ctx.Queue()
+        cost = np.array([embs[d]["He"].shape[0] ** 3 for d in dz], float)
+        load, parts = np.zeros(workers), [[] for _ in range(workers)]
+        for k in np.argsort(-cost):                                       # greedy balance by n^3
+            j = int(np.argmin(load))
+            parts[j].append(int(k))
+            load[j] += cost[k]
+
+        def child(j):
+            from threadpoolctl import threadpool_limits
+            try:
+                with threadpool_limits(threads or 1):
+                    q.put((j, run(parts[j]), None))
+            except Exception as ex:                                       # noqa: BLE001
+                q.put((j, None, repr(ex)))
+        ps = [ctx.Process(target=child, args=(j,)) for j in range(workers) if parts[j]]
+        for p_ in ps:
+            p_.start()
+        acc = np.zeros((m, r), complex)
+        for _ in ps:
+            j, a_, err = q.get()
+            if err:
+                raise RuntimeError(f"tile_rho_contour worker {j}: {err}")
+            acc += a_
+        for p_ in ps:
+            p_.join()
+    info = dict(t=time.time() - t0, n_emb={d: embs[d]["He"].shape[0] for d in embs}, d_per_point=dz,
+                imz=zs.imag.tolist(), nemb_atoms=len(embs[max(embs)]["emb"]))
+    return acc, info
+
+
 def tile_modes(inp, geo, tree, atoms, energies, d_emb=12.0, d_cap=3.0, eta_cap=0.3, rank=None, n_power=1,
-               tile_thr=1e-4, a_ref=0.335, rng=None):
+               tile_thr=1e-4, a_ref=0.335, rng=None, dense_fill=0.02, dense_max=30000, eta=0.0, contour=None,
+               rho_thr=1e-3, sketch=0, probes="gauss", boundary="cap", obc=None, fast=None):
     """Tile basis from the local spectral function A_PP(E) = i (G - G^H)_PP / 2 pi, G = (E S - H + iW)^-1,
     in a CAP-terminated embedding (qtmode.cms.tile_spectral_modes); randomized range finder, all energies
     merged: Y = [X_E sqrt(lambda_E)], SVD, keep s^2 > tile_thr * a_ref. Real H, S: A X = -Im(G X) / pi
     with real probes (one factorization). Complex Hermitian H, S: G^H = (E S - H - iW)^-1 is factorized
-    as well and the basis is complex. Rows: tile orbitals in atom order."""
+    as well and the basis is complex. Embeddings with nnz > dense_fill n^2 (long-range ab initio H, e.g.
+    MoS2/HfO2: ~1300 nonzeros per row) and n <= dense_max use one dense LU per energy instead (G^H solves by
+    the transposed factorization). Rows: tile orbitals in atom order.
+    eta > 0: spectral function at E + i eta (Lorentzian width eta for every state, also for states that never
+    reach the CAP, e.g. traps deep in an oxide, whose peaks are otherwise too narrow to be sampled).
+    contour = (mu1, mu2, npts) (real H, S): instead of the sampled A(E), the tile density matrix of the window,
+    rho_PP = -(1/pi) Im int_arc G_PP dz on the upper arc from mu1 to mu2 (Gauss-Legendre in theta, as
+    rho_contour), built exactly (one solve with the m tile columns per point); keeps the eigenvectors with
+    occupation > rho_thr, so every state in the window counts in full, whatever its width. Returns
+    (U, occupations, embedding atoms) in that case. sketch = r > 0: one-pass Nystrom sketch instead,
+    Y = rho Omega with r Gaussian probes accumulated over the points (r solves per point instead of m),
+    rho ~ Y (Omega^T Y)^+ Y^T; r must exceed the number of kept occupations (warned if not, by 20%).
+    probes: "gauss" or "sign" (random +-1, the real random-phase probe: every orbital, also of a state
+    localized on a few atoms, overlaps each probe with weight exactly 1).
+    boundary = "schur": no CAP; the tile P sees the environment E (embedding atoms outside the tile, a closed
+    cluster cut at d_emb) through the Schur-complement self-energy Sigma_P(z) = A_PE A_EE(z)^-1 A_EP,
+    A = z S - H, and G_PP = (A_PP - Sigma_P)^-1 is formed explicitly (m solves with A_EE per point, dense m x m
+    inverse). Sigma_P is Hermitian with poles at the closed-environment levels on the real axis, so it needs
+    complex z: the contour, or eta > 0 at the sampled energies (then A_PP is formed exactly, no range finder;
+    complex H: G(z)^H = G(conj z), one solve per energy).
+    obc = Device (contour, CAP boundary): the embedding keeps device atoms only; lead-block atoms are replaced by
+    the exact lead self-energy, -Sigma_L/R(z) added on the lead-face orbitals inside the embedding (the principal
+    submatrix when the embedding holds only part of the face). The CAP stays on the other embedding cuts.
+    fast = dict (contour, CAP boundary): tile_rho_contour options (gpp, env_prec, refine, emb_far, workers, threads):
+    Schur-complement G_PP with a low-precision environment, smaller embeddings away from the axis, contour points
+    in parallel."""
+    assert boundary in ("cap", "schur")
+    assert obc is None or (contour is not None and boundary == "cap"), "obc: contour with CAP boundary only"
+    assert boundary == "cap" or contour is not None or eta > 0, "boundary schur: needs the contour or eta > 0"
     rng = np.random.default_rng(0) if rng is None else rng
     norb = inp["norb"]
     off = np.concatenate([[0], np.cumsum(norb)])
     near = tree.query_ball_point(geo.points(atoms), d_emb)
     emb = np.union1d(np.unique(np.concatenate([np.asarray(q, int) for q in near])), atoms)
+    if obc is not None:
+        emb = emb[np.isin(emb, obc_atoms(obc))]
     d, _ = geo.tree(atoms).query(geo.points(emb), k=1)
-    w = eta_cap * np.clip((d - (d_emb - d_cap)) / d_cap, 0, None) ** 2
+    w = eta_cap * np.clip((d - (d_emb - d_cap)) / d_cap, 0, None) ** 2 * (boundary == "cap")
     oe = np.concatenate([np.arange(off[i], off[i + 1]) for i in emb])
     ne = norb[emb]
     eoff = np.concatenate([[0], np.cumsum(ne)])
@@ -462,14 +877,124 @@ def tile_modes(inp, geo, tree, atoms, energies, d_emb=12.0, d_cap=3.0, eta_cap=0
     W = sp.diags(np.repeat(w, ne))
     n, m = He.shape[0], len(pidx)
     r = min(rank or int(np.clip(0.1 * m, 100, 600)), m)
+    dense = (He + Se).nnz > dense_fill * n * n and n <= dense_max
+    faces = [] if obc is None else obc_faces(obc, oe)
+
+    def sig_emb(z):                                                      # sparse -Sigma on the embedded face orbitals
+        if not faces:
+            return 0
+        SL, SR = obc.sigma(z)
+        M = 0
+        for (pos, fi), Sg in zip(faces, (SL, SR)):
+            if len(pos):
+                ii, jj = np.meshgrid(pos, pos, indexing="ij")
+                M = M - sp.csr_matrix((Sg[np.ix_(fi, fi)].ravel(), (ii.ravel(), jj.ravel())), shape=(n, n))
+        return M
+    if boundary == "schur":
+        eidx = np.setdiff1d(np.arange(n), pidx)
+        HPP, SPP = He[pidx][:, pidx].toarray(), Se[pidx][:, pidx].toarray()
+        HPE, SPE = He[pidx][:, eidx], Se[pidx][:, eidx]
+        HEP, SEP = He[eidx][:, pidx], Se[eidx][:, pidx]
+        HEE, SEE = He[eidx][:, eidx], Se[eidx][:, eidx]
+
+        def gpp(z):                                                      # (A_PP - A_PE A_EE^-1 A_EP)^-1
+            B = (z * SEP - HEP).toarray()
+            if dense:
+                lu = sla.lu_factor((z * SEE - HEE).toarray(), check_finite=False, overwrite_a=True)
+                X = sla.lu_solve(lu, B, check_finite=False)
+                del lu
+            else:
+                cs = CSolver(z * SEE - HEE)
+                X = cs.solve(B)
+                cs.free()
+            return np.linalg.inv(z * SPP - HPP - (z * SPE - HPE) @ X)
+    if contour is not None and boundary == "cap" and fast is not None:
+        assert real, "tile contour: real H, S only (G(z) complex symmetric, rho = -Im int G dz / pi)"
+        Om = None
+        if sketch:
+            Om = (rng.standard_normal((m, min(sketch, m))) if probes == "gauss" else
+                  rng.choice([-1.0, 1.0], size=(m, min(sketch, m))))
+        acc, info = tile_rho_contour(inp, geo, tree, atoms, contour, d_emb, d_cap, eta_cap, obc, rhs=Om,
+                                     dense_fill=dense_fill, dense_max=dense_max, **fast)
+        log(f"    tile rho ({fast}): embeddings {info['n_emb']} orb, {info['t']:.0f} s")
+        if sketch:
+            Y = -acc.imag / np.pi
+            d, V = np.linalg.eigh(0.5 * (Om.T @ Y + Y.T @ Om))
+            ok = d > 1e-10 * d.max()
+            F = Y @ (V[:, ok] / np.sqrt(d[ok]))
+            X, sv, _ = np.linalg.svd(F, full_matrices=False)
+            lam = sv ** 2
+            return X[:, lam > rho_thr], lam, len(emb)
+        rho = -acc.imag / np.pi
+        lam, X = np.linalg.eigh(0.5 * (rho + rho.T))
+        keep = lam > rho_thr
+        return X[:, keep][:, ::-1], lam[::-1], len(emb)
+    if contour is not None:
+        assert real, "tile contour: real H, S only (G(z) complex symmetric, rho = -Im int G dz / pi)"
+        mu1, mu2, npts = contour
+        c, rr = 0.5 * (mu1 + mu2), 0.5 * (mu2 - mu1)
+        x, wq = np.polynomial.legendre.leggauss(int(npts))
+        th, wq = 0.5 * np.pi * (x + 1), 0.5 * np.pi * wq
+        if sketch:
+            Om = (rng.standard_normal((m, min(sketch, m))) if probes == "gauss" else
+                  rng.choice([-1.0, 1.0], size=(m, min(sketch, m))))
+            R = np.zeros((n, Om.shape[1]))
+            R[pidx] = Om
+        else:
+            R = np.zeros((n, m))
+            R[pidx, np.arange(m)] = 1.0
+        acc = np.zeros((m, R.shape[1]), complex)
+        for t_, w_ in zip(th, wq):
+            z = c + rr * np.exp(1j * t_)
+            if boundary == "schur":
+                G = gpp(z) @ R[pidx]
+            elif dense:
+                lu = sla.lu_factor((z * Se - He + 1j * W + sig_emb(z)).toarray(), check_finite=False, overwrite_a=True)
+                G = sla.lu_solve(lu, R, check_finite=False)[pidx]
+                del lu
+            else:
+                cs = CSolver(z * Se - He + 1j * W + sig_emb(z))
+                G = cs.solve(R)[pidx]
+                cs.free()
+            acc += G * (-1j * rr * np.exp(1j * t_) * w_)
+        if sketch:
+            Y = -acc.imag / np.pi                                         # rho Omega
+            d, V = np.linalg.eigh(0.5 * (Om.T @ Y + Y.T @ Om))
+            ok = d > 1e-10 * d.max()
+            F = Y @ (V[:, ok] / np.sqrt(d[ok]))                             # rho ~ F F^T
+            X, sv, _ = np.linalg.svd(F, full_matrices=False)
+            lam = sv ** 2
+            keep = lam > rho_thr
+            if keep.sum() > 0.8 * Om.shape[1]:
+                log(f"    tile sketch: {keep.sum()} occupations > {rho_thr:g} with {Om.shape[1]} probes; increase sketch")
+            return X[:, keep], lam, len(emb)
+        rho = -acc.imag / np.pi
+        lam, X = np.linalg.eigh(0.5 * (rho + rho.T))
+        keep = lam > rho_thr
+        return X[:, keep][:, ::-1], lam[::-1], len(emb)
     Ys = []
     for E in energies:
-        cs = CSolver(E * Se - He + 1j * W)
-        csH = None if real else CSolver(E * Se - He - 1j * W)
+        E = E + 1j * eta
+        if boundary == "schur":
+            G = gpp(E)
+            lam, X = np.linalg.eigh((1j / (2 * np.pi)) * (G - G.conj().T))
+            Ys.append(X * np.sqrt(np.clip(lam, 0, None))[None])
+            continue
+        if dense:
+            lu = sla.lu_factor((E * Se - He + 1j * W).toarray(), check_finite=False, overwrite_a=True)
+            cs = csH = None
+        else:
+            cs = CSolver(E * Se - He + 1j * W)
+            csH = None if real else CSolver(np.conj(E) * Se - He - 1j * W)
 
         def apply_A(X):
             R = np.zeros((n, X.shape[1]), X.dtype)
             R[pidx] = X
+            if dense:
+                G = sla.lu_solve(lu, R, check_finite=False)
+                if real:
+                    return -G[pidx].imag / np.pi
+                return (1j / (2 * np.pi)) * (G - sla.lu_solve(lu, R, trans=2, check_finite=False))[pidx]
             if real:
                 return -cs.solve(R)[pidx].imag / np.pi
             return (1j / (2 * np.pi)) * (cs.solve(R) - csH.solve(R))[pidx]
@@ -483,13 +1008,153 @@ def tile_modes(inp, geo, tree, atoms, energies, d_emb=12.0, d_cap=3.0, eta_cap=0
         Q = np.linalg.qr(Y)[0]
         Bm = Q.conj().T @ apply_A(Q)
         lam, X = np.linalg.eigh(0.5 * (Bm + Bm.conj().T))
-        cs.free()
+        if dense:
+            del lu
+        else:
+            cs.free()
         if csH is not None:
             csH.free()
         Ys.append((Q @ X) * np.sqrt(np.clip(lam, 0, None))[None])
     Uu, s, _ = np.linalg.svd(np.hstack(Ys), full_matrices=False)
     keep = s ** 2 > tile_thr * a_ref
     return Uu[:, keep], s, len(emb)
+
+
+def obc_atoms(dev):
+    """Atoms of the device slabs (cached on dev)."""
+    if getattr(dev, "_atoms", None) is None:
+        atom_of = np.repeat(np.arange(len(dev.inp["norb"])), dev.inp["norb"])
+        dev._atoms = np.unique(atom_of[dev.dev])
+    return dev._atoms
+
+
+def obc_faces(dev, oe):
+    """For global orbitals oe: [(positions in oe on the left lead face, their rows in Sigma_L), (same, right)]."""
+    if getattr(dev, "_gdev", None) is None:
+        dev._gdev = -np.ones(dev.inp["H"].shape[0], int)
+        dev._gdev[dev.dev] = np.arange(dev.n)
+    dl = dev._gdev[oe]
+    out = []
+    for b in (dev.bL, dev.bR):
+        pos = np.where(np.isin(dl, b))[0]
+        out.append((pos, np.searchsorted(b, dl[pos])))
+    return out
+
+
+# ------------------------------------------------------------------ level 1: tile embedding by message passing
+class TileBP:
+    """Tile Green's functions of the open device by iterated tile self-energies (block Gaussian belief
+    propagation / cavity method). A = z S - H - Sigma_L - Sigma_R (exact lead Sigma on the end slabs), tiles
+    i with orbital sets t_i (device indices). Round n:
+        G_i^(n) = (A_ii - sum_j M_{j->i}^(n-1))^-1,   M^(0) = 0 (closed tiles + leads),
+        M_{j->i}^(n) = A_ij g_j^(n, -i) A_ji,
+    mode "cavity": g_j^(-i) = Green's function of tile j with tile i removed, on the orbitals b of j coupled to i:
+        g_bb = ((G_j)_bb^-1 + (M_{i->j})_bb)^-1  (M_{i->j} lives on b only, so this undoes i's own contribution);
+        exact on a tree of tiles (one tile per slab: RGF after ~ns rounds), approximate with loops.
+    mode "full": g_j = G_j (the tile's full G, which already contains i's self-energy: double counting).
+    Everything is dense per tile; couplings are kept on the coupled orbitals only."""
+
+    def __init__(self, dev, tiles, mode="cavity"):
+        assert mode in ("cavity", "full")
+        self.dev, self.t, self.mode = dev, [np.asarray(t) for t in tiles], mode
+        own = -np.ones(dev.n, int)
+        for i, t in enumerate(self.t):
+            own[t] = i
+        assert (own >= 0).all(), "tiles must cover the device"
+        loc = np.zeros(dev.n, int)
+        for t in self.t:
+            loc[t] = np.arange(len(t))
+        self.loc = loc
+        P = (abs(dev.H) + abs(dev.S)).tocoo()
+        r, c = P.row, P.col
+        for b in (dev.bL, dev.bR):                                    # lead Sigma couples all of bL (bR)
+            ii, jj = np.meshgrid(b, b, indexing="ij")
+            r, c = np.concatenate([r, ii.ravel()]), np.concatenate([c, jj.ravel()])
+        oi, oj = own[r], own[c]
+        x = oi != oj
+        self.b = {}                                                   # (i, j): local orbitals of i coupled to j
+        for i, j in set(zip(oi[x].tolist(), oj[x].tolist())):
+            sel = (oi == i) & (oj == j)
+            self.b[i, j] = np.unique(loc[r[sel]])
+        self.nbr = [sorted(j for (i_, j) in self.b if i_ == i) for i in range(len(self.t))]
+        H, S = dev.H.tocsr(), dev.S.tocsr()
+        self.HD = [H[t][:, t].toarray() for t in self.t]
+        self.SD = [S[t][:, t].toarray() for t in self.t]
+        self.HC, self.SC = {}, {}                                      # (i, j): on b[i, j] x b[j, i]
+        for (i, j), bi in self.b.items():
+            bj = self.b[j, i]
+            self.HC[i, j] = H[self.t[i][bi]][:, self.t[j][bj]].toarray()
+            self.SC[i, j] = S[self.t[i][bi]][:, self.t[j][bj]].toarray()
+        self.edges = sorted(self.b)
+
+    def _blocks(self, z, SL, SR):
+        dev = self.dev
+        AD = [z * S_ - H_ for H_, S_ in zip(self.HD, self.SD)]
+        AC = {k: z * self.SC[k] - self.HC[k] for k in self.edges}
+        for Sg, bb in ((SL, dev.bL), (SR, dev.bR)):
+            tl = [np.isin(self.t[i], bb) for i in range(len(self.t))]
+            for i in range(len(self.t)):
+                if not tl[i].any():
+                    continue
+                li = np.where(tl[i])[0]
+                pi = np.searchsorted(bb, self.t[i][li])
+                AD[i][np.ix_(li, li)] -= Sg[np.ix_(pi, pi)]
+                for j in self.nbr[i]:
+                    bi, bj = self.b[i, j], self.b[j, i]
+                    mi, mj = np.isin(self.t[i][bi], bb), np.isin(self.t[j][bj], bb)
+                    if mi.any() and mj.any():
+                        AC[i, j][np.ix_(mi, mj)] -= Sg[np.ix_(np.searchsorted(bb, self.t[i][bi][mi]),
+                                                               np.searchsorted(bb, self.t[j][bj][mj]))]
+        return AD, AC
+
+    def _G(self, AD, M, i):
+        D = AD[i].astype(complex)
+        for j in self.nbr[i]:
+            bi = self.b[i, j]
+            D[np.ix_(bi, bi)] -= M[i, j]
+        return np.linalg.inv(D)
+
+    def _msg(self, AC, G, M, j, i):
+        """M_{j->i} = A_ij g A_ji from G_j; cavity g = G_bb (1 + M_{i->j} G_bb)^-1 on b = b[j, i]."""
+        bj = self.b[j, i]
+        g = G[j][np.ix_(bj, bj)]
+        if self.mode == "cavity":
+            g = np.linalg.solve((np.eye(len(bj)) + M[j, i] @ g).T, g.T).T
+        return AC[i, j] @ g @ AC[j, i]
+
+    def solve(self, z, SL, SR, maxit=40, tol=1e-8, damp=0.0, keep=(), order="gs", Gref=None):
+        """Iterate to max_i |G_i^(n) - G_i^(n-1)| / |G_i^(n)| < tol (or maxit rounds). order "jacobi": all
+        messages from the previous round; "gs": sweeps over the tiles (alternating forward / backward), each
+        tile's outgoing messages updated right after its G. Returns (G, hist, conv[, err]): final tile G's,
+        {n: [G_i^(n) for i in keep]}, the change per round, and with Gref (exact tile blocks) the max relative
+        error per round."""
+        AD, AC = self._blocks(z, SL, SR)
+        nt = len(self.t)
+        M = {k: np.zeros((len(self.b[k]),) * 2, complex) for k in self.edges}   # M[i, j] = M_{j->i} on b[i, j]
+        G = [self._G(AD, M, i) for i in range(nt)]                  # round 0: closed tiles + leads
+        hist, conv, err = {0: [G[i] for i in keep]}, [], []
+        rel = lambda G: max(np.linalg.norm(a - b) / np.linalg.norm(b) for a, b in zip(G, Gref))
+        if Gref is not None:
+            err.append(rel(G))
+        for n in range(1, maxit + 1):
+            G0 = list(G)
+            if order == "jacobi":
+                Mn = {(i, j): self._msg(AC, G, M, j, i) for (i, j) in self.edges}
+                M = Mn if damp == 0 else {k: (1 - damp) * Mn[k] + damp * M[k] for k in self.edges}
+                G = [self._G(AD, M, i) for i in range(nt)]
+            else:
+                for j in (range(nt) if n % 2 else range(nt - 1, -1, -1)):
+                    G[j] = self._G(AD, M, j)
+                    for i in self.nbr[j]:
+                        Mn = self._msg(AC, G, M, j, i)
+                        M[i, j] = Mn if damp == 0 else (1 - damp) * Mn + damp * M[i, j]
+            hist[n] = [G[i] for i in keep]
+            conv.append(max(np.linalg.norm(a - b) / np.linalg.norm(a) for a, b in zip(G, G0)))
+            if Gref is not None:
+                err.append(rel(G))
+            if conv[-1] < tol:
+                break
+        return (G, hist, conv) if Gref is None else (G, hist, conv, err)
 
 
 # ------------------------------------------------------------------ level 1: assembly
@@ -513,14 +1178,268 @@ def slab_blocks(dev, Us):
     """Level-1 slab blocks: HD, SD (s, s), HU, SU (s, s+1) of U^T H U, U^T S U."""
     b = dev.sb
     nsl = len(Us)
+    Us = [u.toarray() if sp.issparse(u) else np.asarray(u) for u in Us]    # sparse H times dense U: fast
     out = dict(HD=[], SD=[], HU=[], SU=[])
     for M, kD, kU in ((dev.H, "HD", "HU"), (dev.S, "SD", "SU")):
         for s in range(nsl):
-            X = (Us[s].conj().T @ (M[b[s]:b[s + 1], b[s]:b[s + 1]] @ Us[s])).toarray()
+            X = Us[s].conj().T @ (M[b[s]:b[s + 1], b[s]:b[s + 1]] @ Us[s])
             out[kD].append(0.5 * (X + X.conj().T))
             if s < nsl - 1:
-                out[kU].append((Us[s].conj().T @ (M[b[s]:b[s + 1], b[s + 1]:b[s + 2]] @ Us[s + 1])).toarray())
+                out[kU].append(Us[s].conj().T @ (M[b[s]:b[s + 1], b[s + 1]:b[s + 2]] @ Us[s + 1]))
     return out
+
+
+# ------------------------------------------------------------------ slab bases: transport residual enrichment
+def _dense_or_sparse_inv(A, dense_fill=0.02):
+    """Solver for a sub-block of the fine operator: dense LU if > dense_fill filled, else CSolver."""
+    n = A.shape[0]
+    if A.nnz > dense_fill * n * n:
+        lu = sla.lu_factor(A.toarray(), check_finite=False, overwrite_a=True)
+        return lambda R: sla.lu_solve(lu, R, check_finite=False), lambda: None
+    cs = CSolver(A)
+    return cs.solve, cs.free
+
+
+def residual_enrich(dev, Us, energies, sigma, corr="cluster", width=1, tol=1e-2, nadd=40, inj_tol=1e-4, log=log,
+                    rhs="inject", nprobe=20, rng=None, weights=None):
+    """One round of enrichment of the slab bases Us (slab-local orbitals x modes, orthonormal columns) from the
+    residual of the original open system. Per training energy E (real, or complex contour points):
+        A = E S - H - Sigma_L - Sigma_R,  psi = U A_c^-1 U^H b  (mode space, A_c = U^H A U),
+        rhs "inject": b = QTBM injection columns (the states transport sees);
+        rhs "random": b = nprobe Gaussian probes over all device orbitals, so e below samples the range of the
+          mode-space error operator (I - pi) A^-1 (randomized range finder of what U misses at E, e.g. oxide
+          traps that the injection hardly excites),
+        weights = contour weights dz (rhs "random", real H and S): the same probes at every point and only the
+          integrated correction -Im sum_z e(z) dz / pi = (rho - rho_MS) omega is used, i.e. the part of the window
+          density matrix that U misses (states outside the window, which dominate (I - pi) A^-1 omega at a single
+          point, are filtered out),
+        r = b - A psi  (U^H r = 0),  e ~ A^-1 r = psi_exact - psi  by
+          corr "raw"     : e = r
+          corr "slab"    : e_s = A_ss^-1 r_s                       (block Jacobi)
+          corr "cluster" : e_s = [A_KK^-1 r_K]_s, K = slabs s-w..s+w  (overlapping Schwarz, closed at the cluster ends)
+          corr "exact"   : e = A^-1 r                               (psi_exact enters the basis at E); dense
+                           block-tridiagonal LU over the fine slabs when every slab has <= 12000 orbitals,
+                           else a sparse direct solve
+    The slab blocks e_s / |psi| (all channels, all energies) are orthogonalized against U_s; the left singular
+    vectors with singular value > tol (relative error in psi) are appended, at most nadd per slab.
+    Returns (added per slab, stats); stats per energy: |r| / |b|, |e| / |psi|."""
+    nsl, sb = len(Us), dev.sb
+    U = sp.block_diag(Us, format="csr")
+    blk = slab_blocks(dev, Us)
+    PL, PR = Us[0][dev.bL].toarray(), Us[-1][dev.bR - sb[-2]].toarray()
+    cols = [[] for _ in range(nsl)]
+    st = dict(E=[], res=[], err=[], t=0.0)
+    t0 = time.time()
+    rng = np.random.default_rng(0) if rng is None else rng
+    if weights is not None:
+        assert rhs == "random"
+        b0 = rng.standard_normal((dev.n, nprobe)).astype(complex)
+        eacc = np.zeros((dev.n, nprobe), complex)
+        pacc = np.zeros((dev.n, nprobe), complex)
+    fine = None
+    if corr == "exact" and max(dev.ns) <= 12000:
+        fine = slab_blocks(dev, [sp.identity(n, format="csr") for n in dev.ns])
+    for ip, E in enumerate(energies):
+        SL, SR = sigma(E)
+        if weights is not None:
+            b = b0
+        elif rhs == "inject":
+            B = dev.inject(SL, inj_tol)
+            if B.shape[1] == 0:
+                continue
+            b = np.zeros((dev.n, B.shape[1]), complex)
+            b[dev.bL] = B
+        else:
+            b = rng.standard_normal((dev.n, nprobe)).astype(complex)
+        A = dev.A(E, SL, SR)
+        Ac = BlockTridiag(blk, E, PL.conj().T @ SL @ PL, PR.conj().T @ SR @ PR)
+        psi = U @ Ac.solve(U.conj().T @ b)
+        r = b - A @ psi
+        if corr == "raw":
+            e = r
+        elif corr == "exact" and fine is not None:
+            SL1 = np.zeros((dev.ns[0],) * 2, complex)
+            SL1[np.ix_(dev.bL, dev.bL)] = SL
+            SR1 = np.zeros((dev.ns[-1],) * 2, complex)
+            SR1[np.ix_(dev.bR - sb[-2], dev.bR - sb[-2])] = SR
+            e = BlockTridiag(fine, E, SL1, SR1).solve(r)
+        elif corr == "exact":
+            cs = CSolver(A)
+            e = cs.solve(r)
+            cs.free()
+        else:
+            w = 0 if corr == "slab" else width
+            e = np.zeros_like(r)
+            for s_ in range(nsl):
+                lo, hi = max(0, s_ - w), min(nsl, s_ + w + 1)
+                K = slice(sb[lo], sb[hi])
+                solve, free = _dense_or_sparse_inv(A[K, K].tocsr())
+                eK = solve(r[K])
+                free()
+                e[sb[s_]:sb[s_ + 1]] = eK[sb[s_] - sb[lo]:sb[s_ + 1] - sb[lo]]
+        npsi = np.linalg.norm(psi)
+        if weights is not None:
+            eacc += e * weights[ip]
+            pacc += psi * weights[ip]
+        st["E"].append([float(np.real(E)), float(np.imag(E))]); st["res"].append(float(np.linalg.norm(r) / np.linalg.norm(b)))
+        st["err"].append(float(np.linalg.norm(e) / npsi))
+        for s_ in range(nsl):
+            if weights is None:
+                cols[s_].append(e[sb[s_]:sb[s_ + 1]] / npsi)
+        log(f"    residual E {E:.4f}: {b.shape[1]} {'channels' if rhs == 'inject' else 'probes'}, |r|/|b| {st['res'][-1]:.2e}, |e|/|psi| {st['err'][-1]:.2e}, "
+            f"{time.time() - t0:.0f} s")
+    if weights is not None:
+        de, rms = -eacc.imag / np.pi, -pacc.imag / np.pi               # (rho - rho_MS) omega, rho_MS omega
+        st["rho_err"] = float(np.linalg.norm(de) / np.linalg.norm(de + rms))
+        log(f"    integrated: |(rho - rho_MS) w| / |rho w| {st['rho_err']:.2e}")
+        nr = np.linalg.norm(de + rms)
+        for s_ in range(nsl):
+            cols[s_].append(de[sb[s_]:sb[s_ + 1]] / nr)
+    added = []
+    for s_ in range(nsl):
+        Y = np.hstack(cols[s_])
+        Q = Us[s_]
+        for _ in range(2):
+            Y = Y - Q @ (Q.conj().T @ Y)
+        u, sv, _ = np.linalg.svd(Y, full_matrices=False)
+        k = min(int(np.sum(sv > tol)), nadd)
+        added.append(u[:, :k])
+        st.setdefault("sv", []).append(sv[:max(k, 5)].tolist())
+    st["t"] = time.time() - t0
+    return added, st
+
+
+# ------------------------------------------------------------------ level 1: residual enrichment
+def cluster_dense(blk, sl):
+    """Dense H1, S1 of the consecutive slabs sl from the slab blocks."""
+    o = np.concatenate([[0], np.cumsum([blk["HD"][s].shape[0] for s in sl])])
+    dt = np.result_type(*blk["HD"], *blk["SD"], *(blk["HU"] or [0.0]), *(blk["SU"] or [0.0]))
+    H, S = np.zeros((o[-1], o[-1]), dt), np.zeros((o[-1], o[-1]), dt)
+    for i, s in enumerate(sl):
+        a, b = slice(o[i], o[i + 1]), slice(o[i + 1], o[i + 2]) if i + 1 < len(sl) else None
+        H[a, a], S[a, a] = blk["HD"][s], blk["SD"][s]
+        if b is not None:
+            H[a, b], S[a, b] = blk["HU"][s], blk["SU"][s]
+            H[b, a], S[b, a] = blk["HU"][s].conj().T, blk["SU"][s].conj().T
+    return H, S, o
+
+
+def block_pairs(dev, blocks, bases, tol=0.0):
+    """Fine and level-1 couplings of every coupled block pair i <= j (same or adjacent slab, max |H_ij| + |S_ij|
+    > tol): {(i, j): (H_ij, S_ij, Q_i^H H_ij Q_j, Q_i^H S_ij Q_j)}, H_ij, S_ij sparse in device orbitals."""
+    g = [dev.sb[b["slab"]] + b["orbs"] for b in blocks]
+    P = (abs(dev.H) + abs(dev.S)).tocsr()
+    out = {}
+    for i in range(len(blocks)):
+        Pi, Hi, Si = P[g[i]].tocsc(), dev.H[g[i]].tocsc(), dev.S[g[i]].tocsc()
+        for j in range(i, len(blocks)):
+            if abs(blocks[i]["slab"] - blocks[j]["slab"]) > 1:
+                continue
+            Pij = Pi[:, g[j]]
+            if Pij.nnz == 0 or Pij.max() <= tol:
+                continue
+            Hij, Sij = Hi[:, g[j]].tocsr(), Si[:, g[j]].tocsr()
+            Qi, Qj = bases[i], bases[j]
+            out[i, j] = (Hij, Sij, Qi.conj().T @ (Hij @ Qj), Qi.conj().T @ (Sij @ Qj))
+    return out
+
+
+def enrich_clusters(dev, blocks, pairs, mode="slab", width=1):
+    """[(cluster blocks, centre blocks)]. slab: slabs s-width..s+width around the blocks of slab s
+    (width < 0: one cluster = the device, every block centre); tile: block i and every block coupled to it."""
+    nsl, nb = len(dev.ns), len(blocks)
+    if mode == "tile":
+        nbr = [{i} for i in range(nb)]
+        for i, j in pairs:
+            nbr[i].add(j); nbr[j].add(i)
+        return [(sorted(nbr[i]), [i]) for i in range(nb)]
+    if width < 0:
+        return [(list(range(nb)), list(range(nb)))]
+    sl = [b["slab"] for b in blocks]
+    return [([i for i in range(nb) if abs(sl[i] - s) <= width], [i for i in range(nb) if sl[i] == s])
+            for s in range(nsl)]
+
+
+def enrich_round(dev, blocks, bases, ec, lwin=(-0.45, 0.40), rthr=1.0, smin=0.1, width=1, mode="slab", tol=0.0,
+                 slabs=None):
+    """One round of residual enrichment of the level-1 block bases (qtmode.enrich_round, generalized).
+    Per cluster C (enrich_clusters: mode "slab" = slabs s-width..s+width around slab s, "tile" = a block and
+    the blocks coupled to it, couplings <= tol ignored), closed in the level-1 basis: Ritz pairs
+    H1_C c = lam S1_C c with lam - ec in lwin, x = U1_C c (|x| = |c| = 1). Only the residual on the centre
+    blocks is used,
+        r_i = sum_{j in C} (H_ij - lam S_ij) Q_j c_j,
+    because the outer cluster blocks carry the artificial cluster cut (closed-end states, the missing coupling
+    to blocks outside C), while the cuts around the centre are interior to C (all its couplings in C for
+    "tile" with tol = 0, and for "slab" with width >= 1). Pairs with |r_centre| > rthr [eV] are flagged; per
+    centre block the part of r_i (flagged columns) orthogonal to the block basis is compressed by SVD
+    (keep s > smin [eV]) and appended. width < 0: one global cluster (H1 Ritz pairs of the device, as qtmode).
+    slabs: enrich only centre blocks in these slabs (e.g. the interior slabs, when the end slabs are cleaned
+    against the lead bands instead). Returns ({block index: added orthonormal columns}, stats); `bases` is not
+    modified."""
+    t0 = time.time()
+    pairs = block_pairs(dev, blocks, bases, tol)
+    clusters = enrich_clusters(dev, blocks, pairs, mode, width)
+    if slabs is not None:
+        clusters = [(cb, [i for i in c if blocks[i]["slab"] in slabs]) for cb, c in clusters]
+        clusters = [(cb, c) for cb, c in clusters if c]
+    R = {}                                          # centre block -> flagged residual columns (block orbitals)
+    n_win, n_spur, rn_all, sizes = 0, 0, [], []
+    for cb, centre in clusters:
+        o = np.concatenate([[0], np.cumsum([bases[i].shape[1] for i in cb])])
+        pos = {i: k for k, i in enumerate(cb)}
+        dt = np.result_type(*(bases[i] for i in cb), *(p[2] for p in pairs.values()))
+        H1, S1 = np.zeros((o[-1], o[-1]), dt), np.zeros((o[-1], o[-1]), dt)
+        for (i, j), (_, _, h, s_) in pairs.items():
+            if i in pos and j in pos:
+                a, b = slice(o[pos[i]], o[pos[i] + 1]), slice(o[pos[j]], o[pos[j] + 1])
+                H1[a, b], S1[a, b] = h, s_
+                if i != j:
+                    H1[b, a], S1[b, a] = h.conj().T, s_.conj().T
+        H1, S1 = 0.5 * (H1 + H1.conj().T), 0.5 * (S1 + S1.conj().T)
+        sizes.append(len(H1))
+        lam, C = sla.eigh(H1, S1, subset_by_value=(ec + lwin[0], ec + lwin[1]), check_finite=False)
+        if not len(lam):
+            continue
+        C = C / np.linalg.norm(C, axis=0)
+        X = {j: bases[j] @ C[o[k]:o[k + 1]] for k, j in enumerate(cb)}
+        Rc = {}
+        for i in centre:
+            r = 0
+            for j in cb:
+                key, tr = ((i, j), False) if (i, j) in pairs else ((j, i), True) if (j, i) in pairs else (None, 0)
+                if key is None:
+                    continue
+                Hij, Sij = pairs[key][:2]
+                if tr:
+                    Hij, Sij = Hij.conj().T, Sij.conj().T
+                r = r + Hij @ X[j] - (Sij @ X[j]) * lam
+            Rc[i] = r
+        rn = np.sqrt(sum(np.linalg.norm(r, axis=0) ** 2 for r in Rc.values()))
+        spur = rn > rthr
+        n_win += len(lam); n_spur += int(spur.sum()); rn_all.append(rn)
+        for i in centre:
+            R[i] = Rc[i][:, spur]
+    rn_all = np.concatenate(rn_all) if rn_all else np.zeros(0)
+    added = {}
+    for i, Rb in R.items():
+        if not Rb.shape[1]:
+            continue
+        Q = bases[i]
+        for _ in range(2):
+            Rb = Rb - Q @ (Q.conj().T @ Rb)
+        Ub, sv, _ = np.linalg.svd(Rb, full_matrices=False)
+        keep = sv > smin
+        if keep.any():
+            Z = Ub[:, keep]
+            Z = Z - Q @ (Q.conj().T @ Z)
+            added[i] = np.linalg.qr(Z)[0]
+    stats = dict(N1=int(sum(q.shape[1] for q in bases)), n_clusters=len(clusters),
+                 n_cluster_max=int(max(sizes)), n_cluster_mean=float(np.mean(sizes)),
+                 cluster_blocks=[len(c) for c, _ in clusters], n_window=int(n_win), n_spurious=n_spur,
+                 added=int(sum(z.shape[1] for z in added.values())),
+                 res_hist=np.histogram(rn_all, bins=[0, 0.1, 0.3, 0.5, 1, 2, 3, 5, 100])[0].tolist(),
+                 t=time.time() - t0)
+    return added, stats
 
 
 def project(blk, V):
@@ -530,6 +1449,29 @@ def project(blk, V):
                 SD=[V[s].conj().T @ blk["SD"][s] @ V[s] for s in range(n)],
                 HU=[V[s].conj().T @ blk["HU"][s] @ V[s + 1] for s in range(n - 1)],
                 SU=[V[s].conj().T @ blk["SU"][s] @ V[s + 1] for s in range(n - 1)])
+
+
+def rgf_blocks(blk, z, SL1, SR1, width=1):
+    """RGF of A_c(z) = z S_c - H_c - P^H Sigma P (end slabs): blocks G[(i, j)] of A_c^-1 for |i - j| <= width.
+    Left-connected g_s = (A_ss - A_s,s-1 g_s-1 A_s-1,s)^-1, then G_ss = g_s + g_s A_s,s+1 G_s+1,s+1 A_s+1,s g_s,
+    G_ij = -g_i A_i,i+1 G_i+1,j and G_ji = -G_j,i+1 A_i+1,i g_i (i < j)."""
+    n = len(blk["HD"])
+    D = [z * blk["SD"][s] - blk["HD"][s] for s in range(n)]
+    D[0] = D[0] - SL1
+    D[-1] = D[-1] - SR1
+    Up = [z * blk["SU"][s] - blk["HU"][s] for s in range(n - 1)]
+    Lo = [z * blk["SU"][s].conj().T - blk["HU"][s].conj().T for s in range(n - 1)]
+    g = [None] * n
+    for s in range(n):
+        g[s] = np.linalg.inv(D[s] if s == 0 else D[s] - Lo[s - 1] @ g[s - 1] @ Up[s - 1])
+    G = {(n - 1, n - 1): g[-1]}
+    for s in range(n - 2, -1, -1):
+        gU, Lg = g[s] @ Up[s], Lo[s] @ g[s]
+        for j in range(s + 1, min(s + width, n - 1) + 1):
+            G[(s, j)] = -gU @ G[(s + 1, j)]
+            G[(j, s)] = -G[(j, s + 1)] @ Lg
+        G[(s, s)] = g[s] - G[(s, s + 1)] @ Lg
+    return G
 
 
 class BlockTridiag:

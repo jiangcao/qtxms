@@ -12,16 +12,16 @@ device slab on the lead-like atoms only (coefficients on all other atoms, e.g. t
   5. --mg: the same basis as coarse level of twolevel.TwoLevel (Galerkin A_c, GMRES(k) smoother, flexible GMRES,
      x0 = mode-space solution) on the --mg-cols strongest channels, checked against their exact solutions
 
-    python -m mgms.run_lead_cms --inputs inputs/mos2_hfo2 --dE 0.02,0.05,0.15,0.3
+    python -m qtx_ms.run_lead_cms --inputs inputs/mos2_hfo2 --dE 0.02,0.05,0.15,0.3
 """
 import argparse, json, os, time
 import numpy as np
 import scipy.sparse as sp
 
-from mgms.prep.inputs import read_inputs
-from mgms import msbasis as mb
-from mgms.twolevel import TwoLevel
-from mgms.lead_rms import LeadCell, RMS, lead_rho_basis, slab_cell_map, to_slab, band_stats, plot_bands
+from qtx_ms.prep.inputs import read_inputs
+from qtx_ms import msbasis as mb
+from qtx_ms.twolevel import TwoLevel
+from qtx_ms.lead_rms import LeadCell, RMS, lead_rho_basis, slab_cell_map, to_slab, band_stats, plot_bands
 
 log = mb.log
 p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -38,6 +38,7 @@ p.add_argument("--tol", type=float, default=0.005, help="spurious: > tol [eV] fr
 p.add_argument("--map-tol", type=float, default=0.6, help="max displacement [A] of a matched atom")
 p.add_argument("--dE", default="0.02,0.05,0.15,0.3", help="test energies - Ec_lead [eV]")
 p.add_argument("--no-exact", action="store_true")
+p.add_argument("--save-modes", action="store_true", help="write the slab bases to <out>/modes/<tag>_slab<s>.npy (ms_scan --modes)")
 p.add_argument("--mg", action="store_true", help="also solve with twolevel.TwoLevel (GMRES smoother)")
 p.add_argument("--k", type=int, default=10, help="GMRES smoother steps")
 p.add_argument("--mg-tol", type=float, default=1e-8)
@@ -47,6 +48,7 @@ p.add_argument("--mg-stages", help="comma list of bases solved with MG (default 
 p.add_argument("--Ec", type=float, help="reference edge for --dE (default Ec_lead of the inputs, as in exact_T --Ec)")
 p.add_argument("--exact-from", help="results json with T_exact per dE (exact_T --json, or another results.json); "
                "must use the same reference edge")
+p.add_argument("--obc", default="auto", choices=["auto", "qttools", "folded"], help="lead OBC on the real axis: qttools (QuaTrEx spectral OBC; auto falls back to the folded lead when it does not import) or mgms (folded lead); --exact-from values must come from the same OBC")
 a = p.parse_args()
 
 name = os.path.basename(os.path.normpath(a.inputs))
@@ -56,7 +58,8 @@ t0 = time.time()
 inp = read_inputs(a.inputs)
 Ec = inp["meta"]["edges"]["Ec_lead"]
 EcT = Ec if a.Ec is None else a.Ec      # test energies E = EcT + dE; basis / spurious windows stay relative to Ec_lead
-dev = mb.Device(inp)
+dev = mb.Device(inp, obc=a.obc)
+log(f"lead OBC: {'qttools on the real axis' if dev.qtt is not None else 'folded lead'}")
 dev.sigma_cache = os.path.join("results_ms", "sigma", name)
 cell = LeadCell(inp["lead"])
 log(f"{name}: device {dev.n} orbitals, slabs {dev.ns}; lead cell {cell.n} orbitals, Ec {Ec:.4f} eV")
@@ -128,6 +131,10 @@ for tag, B in bases.items():
     sets[tag] = dict(Us=Us, blk=blk, PL=Us[0][dev.bL].toarray(), PR=Us[-1][dev.bR - dev.sb[-2]].toarray(),
                      U=sp.block_diag(Us, format="csr"))
     log(f"{tag}: N per slab {[u.shape[1] for u in Us]}, total {sum(u.shape[1] for u in Us)}")
+    if a.save_modes:
+        os.makedirs(os.path.join(out, "modes"), exist_ok=True)
+        for si, u in enumerate(Us):
+            np.save(os.path.join(out, "modes", f"{tag}_slab{si}.npy"), u.toarray())
 
 # ------------------------------------------------------------------ 4. transmission
 fres = os.path.join(out, "results.json")
@@ -151,7 +158,7 @@ for dE in (float(x) for x in a.dE.split(",")):
         r["T_exact"] = ex[f"{dE:.4f}"]["T_exact"]
     t = time.time()
     SL, SR = dev.sigma(E + 1e-6j)
-    B = mb.injection(SL)[0]
+    B = dev.inject(SL)
     GR = 1j * (SR - SR.conj().T)
     b = np.zeros((dev.n, B.shape[1]), complex)
     b[dev.bL] = B

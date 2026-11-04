@@ -13,7 +13,7 @@ import numpy as np
 
 from qtx_ms.prep.inputs import read_inputs
 from qtx_ms import msbasis as mb
-from qtx_ms.schwarz import CapSchwarz, fgmres_block
+from qtx_ms.schwarz import CapSchwarz, fgmres_block, fgmres_restart
 
 log = mb.log
 
@@ -31,10 +31,14 @@ def main():
     p.add_argument("--cap-centres", default="all", choices=["all", "iface", "ends"])
     p.add_argument("--cap-solver", default="dense64", choices=["dense", "dense64", "pardiso"])
     p.add_argument("--workers", type=int, default=4, help="windows factored / solved concurrently")
-    p.add_argument("--maxit", type=int, default=300, help="FGMRES iterations (no restart)")
+    p.add_argument("--maxit", type=int, default=300, help="FGMRES iterations in total")
+    p.add_argument("--restart", type=int, default=0, help="> 0: restarted FGMRES(m), columns converged at a restart are "
+                   "frozen (0: one unrestarted cycle of --maxit)")
     p.add_argument("--tol", type=float, default=1e-8, help="relative residual per column")
     p.add_argument("--exact", action="store_true", help="also the sparse direct solution: error in psi and T")
     p.add_argument("--psi-dir", help="save / reuse the exact psi here (psi_<E>.npz)")
+    p.add_argument("--psi-wait", type=float, default=0, help="with --exact: wait up to this many hours for psi_<E>.npz "
+                   "(written by a concurrent exact_T --save-psi) before solving directly")
     p.add_argument("--out", help="json (default results_ms/cap_fgmres/<inputs name>.json, merged across runs)")
     a = p.parse_args()
 
@@ -71,20 +75,39 @@ def main():
                     f"active {(est > a.tol).sum()}")
         clock = {}
         t = time.time()
-        x, its, rres = fgmres_block(A, b, np.zeros_like(b), S, a.tol, a.maxit, clock, cb)
+        if a.restart > 0:
+            x, its, rres, ncyc = fgmres_restart(A, b, np.zeros_like(b), S, a.tol, a.restart, a.maxit, clock, cb, log)
+        else:
+            x, its, rres = fgmres_block(A, b, np.zeros_like(b), S, a.tol, a.maxit, clock, cb)
+            ncyc = 1
         tit = time.time() - t
         Tx = T(x)
         r = dict(E=E, channels=int(B.shape[1]), its=its.tolist(), res=rres.tolist(), res_hist=hist, T=Tx,
-                 t_sigma=tsig, t_factor=S.twall, t_iter=tit, clock=clock, n_windows=len(S.idx),
+                 restart=a.restart, cycles=ncyc, t_sigma=tsig, t_factor=S.twall, t_iter=tit, clock=clock, n_windows=len(S.idx),
                  window_sizes=[len(i) for i in S.idx], cap=a.cap, centres=a.cap_centres, solver=a.cap_solver)
         log(f"  FGMRES: its {its.min()}..{its.max()}, true residual max {rres.max():.1e}, T {Tx:.6f}; factor "
             f"{S.twall:.0f} s + iterations {tit:.0f} s (" + ", ".join(f"{k} {v:.0f}" for k, v in clock.items()) + ")")
         if a.exact:
             fpsi = os.path.join(a.psi_dir, f"psi_{E:+.8f}.npz") if a.psi_dir else None
             t = time.time()
-            if fpsi and os.path.exists(fpsi) and np.linalg.norm(b - A @ np.load(fpsi)["psi_m"]) < 1e-8 * np.linalg.norm(b):
-                psi = np.load(fpsi)["psi_m"]
-            else:
+            psi = None
+            tw = time.time()
+            while fpsi and a.psi_wait > 0 and not os.path.exists(fpsi) and time.time() - tw < 3600 * a.psi_wait:
+                time.sleep(60)
+            t = time.time()                                        # direct-solve / reuse time, not the wait
+            if fpsi and os.path.exists(fpsi):
+                time.sleep(5)                                      # a file being written right now
+
+                # the saved psi may belong to injection columns with other phases / mixing (degenerate or
+                # sign-ambiguous Gamma eigenvectors): map it onto this b by the column transform Q, b = b_saved Q
+                ps = np.load(fpsi)["psi_m"]
+                if ps.shape[0] == dev.n:
+                    bs = A @ ps
+                    Q = np.linalg.lstsq(bs[dev.bL], b[dev.bL], rcond=None)[0]
+                    if np.linalg.norm(b - A @ (ps @ Q)) < 1e-8 * np.linalg.norm(b):
+                        psi = ps @ Q
+                        log(f"  exact psi reused from {fpsi} (column transform |Q - I| {np.linalg.norm(Q - np.eye(*Q.shape)):.1e})")
+            if psi is None:
                 cs = mb.CSolver(A)
                 psi = cs.solve(b)
                 cs.free()

@@ -1,15 +1,15 @@
 """Two-level (mode space as coarse grid) transport solve for an ab initio TB device.
 
 Example:
-  python -m mgms.run_tb --xyz device.xyz --H H.mtx --S S.mtx --norb "Si:10,H:1" --units eV \
+  python -m qtx_ms.run_tb --xyz device.xyz --H H.mtx --S S.mtx --norb "Si:10,H:1" --units eV \
                         --dE 0.02,0.06,0.10 --Eb 0.6 --basis ldm,slab
 """
 import argparse, json, time
 import numpy as np
 import scipy.sparse as sp
-from mgms.abtb import (read_xyz, parse_norb, read_sparse, TBDevice, UNITS, injection, rgf_transmission,
+from qtx_ms.abtb import (read_xyz, parse_norb, read_sparse, TBDevice, UNITS, injection, rgf_transmission,
                        basis_slab_window, basis_ldm)
-from mgms.twolevel import TwoLevel, build_A
+from qtx_ms.twolevel import TwoLevel, build_A
 
 p = argparse.ArgumentParser()
 p.add_argument("--xyz", required=True)

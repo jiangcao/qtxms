@@ -91,8 +91,8 @@ def strip_pristine(ny, nz, no, a, npl, e0, t, s1, complex_gauge):
 
 
 def dense_T(inp, E, eta=1e-6):
-    """Caroli T(E) on the device with Sigma from the unfolded cell (mgms.abtb.sancho_rubio)."""
-    from mgms.abtb import sancho_rubio
+    """Caroli T(E) on the device with Sigma from the unfolded cell (qtx_ms.abtb.sancho_rubio)."""
+    from qtx_ms.abtb import sancho_rubio
     m = inp["meta"]["transport"]
     ob = np.repeat(inp["blocks"], inp["norb"])
     dev = np.concatenate([np.where(ob == b)[0] for b in m["device_blocks"]])
