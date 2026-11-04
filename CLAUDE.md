@@ -27,6 +27,10 @@ Both levels are density matrices integrated over a complex contour covering the 
   slabs.)
 Use these names in code comments, logs, notes and reports: "local ρ" = level 1, "global ρ" = level 2; "tile" and
 "slab" name only the partition.
+All of these are density-matrix mode space (DMMS); lead CMS is the other family. Label a basis by partition, level and
+cut, e.g. "slab level 1, cut 1e-8", "slab level 2, cut 5e-14" (the direct level-2 n400 basis: top 400 per slab,
+λ_400 = 1e-14…6e-14, + end-slab lead RMS, N 1636), never just "DMMS". Global ρ decays much faster than local ρ:
+slab 1 level 2 keeps 322 vectors at 1e-10 (level 1: 1159), 220 at 1e-6 (level 1: 352).
 
 ## Method and key equations
 Per energy E:

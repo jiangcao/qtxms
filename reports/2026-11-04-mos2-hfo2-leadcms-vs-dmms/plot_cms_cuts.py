@@ -1,5 +1,5 @@
 """Lead CMS (no spurious-band removal) at different occupation cuts: T and |T_MS - T|/T vs E on the 10 meV grid,
-exact and DMMS for reference. Old: window Ec+0...0.4 eV, 32 k, cut 1e-5; sweep: window Ec-0.15...+0.6 eV, 64 k."""
+exact and slab level 2 (cut ~5e-14) for reference. Old: window Ec+0...0.4 eV, 32 k, cut 1e-5; sweep: window Ec-0.15...+0.6 eV, 64 k."""
 import json, os
 import numpy as np
 import matplotlib
@@ -34,7 +34,7 @@ for f, lab, c, m in S:
     e = np.abs(T - X) / X
     a2.semilogy(d, e, "-" + m, ms=4, lw=0.9, color=c, mec=SURF, mew=0.6, label=lab)
     print(f"{lab}: median {np.median(e):.2f} max {e.max():.2f}")
-a2.semilogy(dE, np.abs(Td - Tx) / Tx, "-D", ms=3.5, lw=0.9, color="#6250d6", mec=SURF, mew=0.6, label="DMMS (N 1636), reference")
+a2.semilogy(dE, np.abs(Td - Tx) / Tx, "-D", ms=3.5, lw=0.9, color="#6250d6", mec=SURF, mew=0.6, label="slab level 2, cut 5e-14 (N 1636), reference")
 a1.set_ylabel("transmission T"); a1.legend(frameon=False, fontsize=8.5)
 a1.set_title("MoS2/HfO2: lead CMS at different occupation cuts", loc="left", fontsize=11, color=INK)
 a2.set_ylabel("|T_MS − T| / T"); a2.set_xlabel("E − Ec (eV)"); a2.legend(frameon=False, fontsize=8, ncol=2, loc="lower left")

@@ -5,7 +5,8 @@
 bands: exact lead bands | lead CMS (N 84 per cell) | after spurious-band removal (RMS, N 100)
 scan : T, |T_MS - T| / T, MS residual |b - A x_MS| / |b| vs E on the 10 meV grid Ec + 0 ... 0.5 eV
        (lead CMS, lead CMS + RMS: results_ms/mos2_hfo2_leadcms/modes/*_scan.json;
-        DMMS = direct level 2, global rho, n400 per slab + end-slab lead RMS, N 1636:
+        slab level 2 (direct: global rho on the fine device), top 400 per slab = cut ~5e-14
+        (lambda_400 1e-14 ... 6e-14), + end-slab lead RMS, N 1636:
         results_ms/mos2_hfo2_l2direct/modes/mu-0.15_0.6_n400_lead_scan.json)
 contours: the Beyn contours c1 / c2 / c3 (complex E plane) next to the lead bands, eigenvalues found
 modes: full-size OBC nonlinear eigenmodes T(lambda) v = 0 (Beyn, contours c1 / c2 / c3, results_ms/obc_eig/c*),
@@ -27,7 +28,7 @@ from qtx_ms import msbasis as mb                                   # noqa: E402
 INK, MUTED, GRID, SURF = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
 SERIES = [("cms", "lead CMS (N 336)", "#2a78d6", "o"),
           ("cms_rms", "lead CMS + RMS (N 400)", "#eb6834", "s"),
-          ("dmms", "DMMS (N 1636)", "#1baf7a", "D")]
+          ("dmms", "slab level 2, cut 5e-14 (N 1636)", "#1baf7a", "D")]
 SCANS = dict(cms="results_ms/mos2_hfo2_leadcms/modes/cms_scan.json",
              cms_rms="results_ms/mos2_hfo2_leadcms/modes/cms_rms_scan.json",
              dmms="results_ms/mos2_hfo2_l2direct/modes/mu-0.15_0.6_n400_lead_scan.json")
