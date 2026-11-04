@@ -261,6 +261,14 @@ Per energy E:
   contour, trapezoid filter fails); no eigenpair below 1e-3 eV residual. A pole basis misses the band continuum that
   ρ_tt (integrated above the poles) captures smoothly.
 
+- OFF state with the flat-band bases reused (`prep/gate_barrier.py`: 0.4 eV tanh barrier over slabs 1-2, w 2 Å,
+  inputs/mos2_hfo2_gate0.4; results_ms/run_gate_off.sh, results_ms/gate_off/, report fig12): every basis fails below the
+  barrier top (Ec+0.4). T err median / max on the 20 meV exact grid: slab level 1 1e-6 0.24 / 430, 1e-8 0.08 / 41, 1e-10
+  0.011 / 22; tile level 1 1e-6 0.40 / 69; slab level 2 cut 5e-14 0.05 / 100 (Ec+0: T_MS 8e-7 vs 7.7e-9). Narrow spurious
+  resonance spikes (3–1000x the neighbours on the 10 meV grid) = mode-space states shifted into the barrier gap opening
+  tunnelling paths (user's concern confirmed). Linear-response G at EF = Ec−0.1…+0.1 (kT 25.9 meV) off by +220…+860%
+  (best bases) up to 50–300x; above the barrier top errors return to 1e-4–1e-2. Stand-alone MS needs a bias-aware
+  basis (or the two-level FGMRES correction) for OFF-state / subthreshold work.
 ## Code state (package `qtx_ms/`; Python 3, numpy, scipy only)
 All modules live in `qtx_ms/`; drivers are run from the repo root as `python -m qtx_ms.<name>`
 (outputs written to the current directory). Package `mgms` renamed `qtx_ms` (distribution `qtx-ms`) on 2026-11-02;
