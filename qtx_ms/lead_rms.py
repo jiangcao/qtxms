@@ -96,16 +96,22 @@ def slab_cell_map(inp, dev, s, tol=0.6, return_info=False):
     return cmap, info
 
 
-def lead_rho_basis(cell, mu1, mu2, thr=1e-5, nk=64):
+def lead_rho_basis(cell, mu1, mu2, thr=1e-5, nk=64, cache=None):
     """Lead-cell basis: k integral of the Bloch projectors with E_n(k) in [mu1, mu2], eigenvectors with
-    occupation (S00 metric) above thr * max (mb.level2_basis with S)."""
+    occupation (S00 metric) above thr * max (mb.level2_basis with S). cache: .npy file of the cell rho (shared by
+    every thr). The rank of rho is at most (states in the window per k) x nk."""
     from qtx_ms import msbasis as mb
-    R = np.zeros((cell.n, cell.n), complex)
-    kk = np.linspace(-np.pi, np.pi, nk, endpoint=False)
-    for k in kk:
-        e, Z = sla.eigh(*cell.hk(k))
-        sel = (e > mu1) & (e < mu2)
-        R += Z[:, sel] @ Z[:, sel].conj().T / nk
+    if cache and os.path.exists(cache):
+        R = np.load(cache)
+    else:
+        R = np.zeros((cell.n, cell.n), complex)
+        kk = np.linspace(-np.pi, np.pi, nk, endpoint=False)
+        for k in kk:
+            e, Z = sla.eigh(*cell.hk(k))
+            sel = (e > mu1) & (e < mu2)
+            R += Z[:, sel] @ Z[:, sel].conj().T / nk
+        if cache:
+            np.save(cache, R)
     return mb.level2_basis([R], thr, S=[cell.S00])[0]
 
 

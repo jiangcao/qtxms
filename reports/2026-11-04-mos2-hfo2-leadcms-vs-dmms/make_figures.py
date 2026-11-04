@@ -7,6 +7,7 @@ scan : T, |T_MS - T| / T, MS residual |b - A x_MS| / |b| vs E on the 10 meV grid
        (lead CMS, lead CMS + RMS: results_ms/mos2_hfo2_leadcms/modes/*_scan.json;
         DMMS = direct level 2, global rho, n400 per slab + end-slab lead RMS, N 1636:
         results_ms/mos2_hfo2_l2direct/modes/mu-0.15_0.6_n400_lead_scan.json)
+contours: the Beyn contours c1 / c2 / c3 (complex E plane) next to the lead bands, eigenvalues found
 modes: full-size OBC nonlinear eigenmodes T(lambda) v = 0 (Beyn, contours c1 / c2 / c3, results_ms/obc_eig/c*),
        one mode per figure (weight per atom, x-z / x-y projections, profile along x per species)
 """
@@ -128,7 +129,61 @@ def modes():
         print("->", fn)
 
 
+def contours():
+    """Beyn contours c1 / c2 / c3 in the complex E plane (Re E vertical) next to the exact lead bands, shared E axis;
+    OBC eigenvalues found inside each contour; lead band extrema at k = 0 and pi (branch points of Sigma) dotted."""
+    from qtx_ms.lead_rms import LeadCell
+    from qtx_ms.obc_eig import ellipse
+    cell = LeadCell(inp["lead"])
+    ks = np.linspace(0, np.pi, 25)
+    Eex = cell.bands(ks, cache="results_ms/mos2_hfo2_leadcms/bands_25.npz")
+    cols = {"c1": "#2a78d6", "c2": "#eb6834", "c3": "#1baf7a"}
+    lo, hi = Ec - 0.06, Ec + 0.30
+    fig, (ab, ac) = plt.subplots(1, 2, figsize=(10.5, 6.2), sharey=True, gridspec_kw=dict(width_ratios=[1.3, 1]))
+    for a in (ab, ac):
+        style(a)
+    sel = ((Eex > lo - 0.1) & (Eex < hi + 0.1)).any(0)
+    for b in np.where(sel)[0]:
+        ab.plot(ks / np.pi, Eex[:, b], color=INK, lw=1.0)
+    edges = np.unique(np.round(np.concatenate([Eex[0], Eex[-1]]), 4))
+    edges = edges[(edges > lo) & (edges < hi)]
+    for e in edges:
+        for a in (ab, ac):
+            a.axhline(e, color="#a3a29b", lw=0.6, ls=(0, (2, 2)), zorder=1)
+    for a in (ab, ac):
+        a.axhline(Ec, color=MUTED, lw=0.9, ls=(0, (5, 3)), zorder=1)
+    ab.text(0.99, Ec - 0.003, "Ec (lead)", color=MUTED, fontsize=8, ha="right", va="top")
+    ab.set_xlim(0, 1); ab.set_xlabel("k (π / cell length)"); ab.set_ylabel("E (eV)")
+    ab.set_title("exact lead bands (dotted: band extrema at k = 0, π)", loc="left", fontsize=10, color=INK)
+    for c in ("c1_Ec+0.017", "c2_Ec+0.085", "c3_Ec+0.184"):
+        tag = c.split("_")[0]
+        d = json.load(open(os.path.join("results_ms/obc_eig", c, "eig.json")))
+        ct = d["contour"]
+        z, _ = ellipse(ct["center"], ct["a"], ct["b"], ct["npts"])
+        th = np.linspace(0, 2 * np.pi, 400)
+        ac.plot(ct["b"] * np.sin(th) * 1e3, ct["center"] + ct["a"] * np.cos(th), color=cols[tag], lw=2,
+                label=f"{tag}: Ec{ct['center'] - Ec:+.3f} ± {ct['a']:.3f} eV, Im ± {1e3 * ct['b']:.0f} meV, "
+                      f"{ct['npts']} pts, {len(d['lam_re'])} eigenvalue{'s' * (len(d['lam_re']) > 1)}")
+        ac.plot(z.imag * 1e3, z.real, "o", ms=3.5, color=cols[tag], mec=SURF, mew=0.6)
+        for i, (lr, li) in enumerate(sorted(zip(d["lam_re"], d["lam_im"]))):
+            ac.plot(li * 1e3, lr, "*", ms=11, color=INK, mec=SURF, mew=0.6, zorder=5)
+            side = 1 if i % 2 == 0 else -1                                  # alternate sides: no overlaps
+            ac.text(li * 1e3 + 2.0 * side, lr, f"Ec{lr - Ec:+.4f} {1e3 * li:+.2f}i meV", fontsize=7, color=INK,
+                    ha="left" if side > 0 else "right", va="center",
+                    bbox=dict(fc=SURF, ec="none", pad=0.5, alpha=0.85), zorder=6)
+    ac.axvline(0, color=MUTED, lw=0.8)
+    ac.plot([], [], "*", ms=11, color=INK, label="OBC eigenvalue (Beyn)")
+    ac.set_xlabel("Im E (meV)")
+    ac.set_title("Beyn contours in the complex E plane", loc="left", fontsize=10, color=INK)
+    ac.legend(frameon=False, fontsize=7, loc="lower left", bbox_to_anchor=(0, 1.04), borderaxespad=0)
+    ac.set_ylim(lo, hi)
+    fig.tight_layout()
+    f = os.path.join(OUT, "fig6_obc_contours_lead_bands.png")
+    fig.savefig(f, dpi=150, facecolor=SURF); plt.close(fig)
+    print("->", f)
+
+
 if __name__ == "__main__":
-    what = sys.argv[1:] or ["bands", "scan", "modes"]
+    what = sys.argv[1:] or ["bands", "scan", "modes", "contours"]
     for w in what:
         globals()[w]()

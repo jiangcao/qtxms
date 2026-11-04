@@ -38,6 +38,7 @@ p.add_argument("--tol", type=float, default=0.005, help="spurious: > tol [eV] fr
 p.add_argument("--map-tol", type=float, default=0.6, help="max displacement [A] of a matched atom")
 p.add_argument("--dE", default="0.02,0.05,0.15,0.3", help="test energies - Ec_lead [eV]")
 p.add_argument("--no-exact", action="store_true")
+p.add_argument("--rho-cache", help="lead-cell rho .npy shared by runs with other --thr (default <out>/rho_mu.._nk...npy)")
 p.add_argument("--save-modes", action="store_true", help="write the slab bases to <out>/modes/<tag>_slab<s>.npy (ms_scan --modes)")
 p.add_argument("--mg", action="store_true", help="also solve with twolevel.TwoLevel (GMRES smoother)")
 p.add_argument("--k", type=int, default=10, help="GMRES smoother steps")
@@ -71,7 +72,8 @@ if os.path.exists(fphi):
     Phi = np.load(fphi)
 else:
     t = time.time()
-    Phi = lead_rho_basis(cell, m1, m2, a.thr, nk=a.nk_rho)
+    Phi = lead_rho_basis(cell, m1, m2, a.thr, nk=a.nk_rho,
+                         cache=a.rho_cache or os.path.join(out, f"rho_mu{a.mu.replace(',', '_')}_nk{a.nk_rho}.npy"))
     np.save(fphi, Phi)
     log(f"lead basis [{m1:.3f}, {m2:.3f}] eV, thr {a.thr:g}: {Phi.shape[1]} vectors, {time.time() - t:.0f} s")
 
