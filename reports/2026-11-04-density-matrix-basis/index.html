@@ -125,6 +125,55 @@ points are independent, so they run in parallel.</p>
 or <var>μ</var><sub>2</sub> count only partly. Measured on one tile, the 24-point quadrature reproduces ρ to about 1e-4.
 This is a soft window edge, not a source of missing states: the window is chosen wider than the transport energies.</p>
 
+<h2>3b. The contour integral, step by step</h2>
+<p>This is what the code does (<code>msbasis.rho_contour</code> for level 2, the contour branch of
+<code>msbasis.tile_modes</code> for level 1). Both levels use the same rule.</p>
+<ol>
+ <li><b>Why the path may leave the real axis.</b> With <var>G</var><sup>A</sup> = (<var>G</var><sup>R</sup>)<sup>†</sup>, the
+ spectral function is <var>A</var> = (i/2π)(<var>G</var><sup>R</sup> − <var>G</var><sup>A</sup>). Write
+ <var>X</var> = ∫<sub><var>μ</var><sub>1</sub></sub><sup><var>μ</var><sub>2</sub></sup> <var>G</var><sup>R</sup>(<var>E</var>) d<var>E</var>. Then
+ <div class="eq">ρ = (i/2π)(<var>X</var> − <var>X</var><sup>†</sup>) = −(1/π) · (<var>X</var> − <var>X</var><sup>†</sup>) / 2i<span class="lab">(5)</span></div>
+ the anti-Hermitian part of <var>X</var>. All poles of <var>G</var>(<var>z</var>) = (<var>zS</var> − <var>H</var> − Σ(<var>z</var>))<sup>−1</sup>
+ lie below the real axis (pushed there by the leads and the CAP), so <var>G</var> is analytic in the upper half plane.
+ By Cauchy's theorem the integral along the real segment equals the integral along any path above it with the same end
+ points: the semicircle.</li>
+ <li><b>Parametrize the arc.</b> Centre <var>c</var> = (<var>μ</var><sub>1</sub> + <var>μ</var><sub>2</sub>)/2, radius
+ <var>r</var> = (<var>μ</var><sub>2</sub> − <var>μ</var><sub>1</sub>)/2,
+ <var>z</var>(<var>θ</var>) = <var>c</var> + <var>r</var> e<sup>i<var>θ</var></sup>, with <var>θ</var> running from π (at
+ <var>μ</var><sub>1</sub>) down to 0 (at <var>μ</var><sub>2</sub>).</li>
+ <li><b>Place the nodes.</b> Take the 24 Gauss–Legendre nodes <var>x<sub>j</sub></var> and weights <var>w<sub>j</sub></var>
+ on [−1, 1] and map them to [0, π]:
+ <div class="eq"><var>θ<sub>j</sub></var> = (π/2)(<var>x<sub>j</sub></var> + 1), &nbsp; <var>w̃<sub>j</sub></var> = (π/2) <var>w<sub>j</sub></var>, &nbsp;
+ <var>z<sub>j</sub></var> = <var>c</var> + <var>r</var> e<sup>i<var>θ<sub>j</sub></var></sup>, &nbsp;
+ Δ<var>z<sub>j</sub></var> = −i <var>r</var> e<sup>i<var>θ<sub>j</sub></var></sup> <var>w̃<sub>j</sub></var><span class="lab">(6)</span></div>
+ The minus sign in Δ<var>z<sub>j</sub></var> comes from running <var>θ</var> from π to 0.</li>
+ <li><b>Solve at every node.</b> <var>X</var> ≈ Σ<sub><var>j</var></sub> <var>G</var><sub><var>PP</var></sub>(<var>z<sub>j</sub></var>) Δ<var>z<sub>j</sub></var>, where:
+  <ul>
+   <li><i>Level 1.</i> The block's embedding with <var>A</var>(<var>z</var>) = <var>zS</var> − <var>H</var> + i<var>W</var> − Σ<sub>emb</sub>(<var>z</var>).
+   The CAP <var>W</var> is real and positive, so it also moves poles below the axis. The fast path factors only the
+   environment <var>E</var> of the block: <var>G</var><sub><var>PP</var></sub> = (<var>A</var><sub><var>PP</var></sub> − <var>A</var><sub><var>PE</var></sub> <var>A</var><sub><var>EE</var></sub><sup>−1</sup> <var>A</var><sub><var>EP</var></sub>)<sup>−1</sup>.</li>
+   <li><i>Level 2.</i> One RGF sweep over the slabs. Forward: <var>g</var><sub><var>s</var></sub><sup>L</sup> = (<var>D<sub>s</sub></var> − <var>A</var><sub><var>s</var>,<var>s</var>−1</sub> <var>g</var><sub><var>s</var>−1</sub><sup>L</sup> <var>A</var><sub><var>s</var>−1,<var>s</var></sub>)<sup>−1</sup>,
+   with <var>D<sub>s</sub></var> = <var>z S<sub>ss</sub></var> − <var>H<sub>ss</sub></var> and Σ<sub>L</sub>, Σ<sub>R</sub> on the end slabs.
+   Backward: <var>G<sub>ss</sub></var> = <var>g</var><sub><var>s</var></sub><sup>L</sup> + <var>g</var><sub><var>s</var></sub><sup>L</sup> <var>A</var><sub><var>s</var>,<var>s</var>+1</sub> <var>G</var><sub><var>s</var>+1,<var>s</var>+1</sub> <var>A</var><sub><var>s</var>+1,<var>s</var></sub> <var>g</var><sub><var>s</var></sub><sup>L</sup>.</li>
+   <li><i>Lead self-energy.</i> Σ(<var>z<sub>j</sub></var>) at complex <var>z</var> comes from the folded-lead decimation and is
+   cached on disk per node, so both levels and every rerun share it.</li>
+  </ul></li>
+ <li><b>Take the anti-Hermitian part.</b> Level 2 uses eq. (5) as written. In level 1, <var>H</var>, <var>S</var> and
+ <var>W</var> are real, so <var>G</var> is complex symmetric (<var>G</var><sup>T</sup> = <var>G</var>), <var>X</var><sup>†</sup> is the
+ complex conjugate of <var>X</var>, and eq. (5) reduces to ρ = −Im(<var>X</var>)/π, symmetrized as (ρ + ρ<sup>T</sup>)/2.</li>
+ <li><b>Diagonalize and cut</b> (sections 4 and 5).</li>
+</ol>
+<p>The nodes for the MoS2/HfO2 window (<var>μ</var><sub>1</sub> = Ec − 0.15, <var>μ</var><sub>2</sub> = Ec + 0.6 eV,
+<var>r</var> = 0.375 eV). They come in mirror pairs <var>j</var> and 25 − <var>j</var> (<var>θ</var> → π − <var>θ</var>,
+same weight and Im <var>z</var>):</p>
+<div class="tbl"><table>
+ <thead><tr><th>node j / 25 − j</th><th>θ<sub>j</sub></th><th>w̃<sub>j</sub></th><th>Re z<sub>j</sub> − Ec (eV)</th><th>Re z<sub>25−j</sub> − Ec (eV)</th><th>Im z (meV)</th></tr></thead>
+ <tbody><tr><td>1 / 24</td><td>0.0076</td><td>0.0194</td><td>+0.6000</td><td>-0.1500</td><td>2.8</td></tr><tr><td>2 / 23</td><td>0.0397</td><td>0.0448</td><td>+0.5997</td><td>-0.1497</td><td>14.9</td></tr><tr><td>3 / 22</td><td>0.0970</td><td>0.0696</td><td>+0.5982</td><td>-0.1482</td><td>36.3</td></tr><tr><td>4 / 21</td><td>0.1784</td><td>0.0931</td><td>+0.5940</td><td>-0.1440</td><td>66.6</td></tr><tr><td>5 / 20</td><td>0.2827</td><td>0.1152</td><td>+0.5851</td><td>-0.1351</td><td>104.6</td></tr><tr><td>6 / 19</td><td>0.4082</td><td>0.1354</td><td>+0.5692</td><td>-0.1192</td><td>148.9</td></tr><tr><td>7 / 18</td><td>0.5528</td><td>0.1533</td><td>+0.5442</td><td>-0.0942</td><td>196.9</td></tr><tr><td>8 / 17</td><td>0.7141</td><td>0.1688</td><td>+0.5084</td><td>-0.0584</td><td>245.6</td></tr><tr><td>9 / 16</td><td>0.8894</td><td>0.1814</td><td>+0.4612</td><td>-0.0112</td><td>291.3</td></tr><tr><td>10 / 15</td><td>1.0759</td><td>0.1911</td><td>+0.4031</td><td>+0.0469</td><td>330.0</td></tr><tr><td>11 / 14</td><td>1.2706</td><td>0.1977</td><td>+0.3359</td><td>+0.1141</td><td>358.2</td></tr><tr><td>12 / 13</td><td>1.4702</td><td>0.2010</td><td>+0.2627</td><td>+0.1873</td><td>373.1</td></tr></tbody></table></div>
+<p class="note">The lowest nodes sit 2.8, 14.9 and 36 meV above the axis, next to the window edges. A state whose width is
+comparable to its distance from <var>μ</var><sub>1</sub> or <var>μ</var><sub>2</sub> is integrated poorly and gets partial
+weight. That soft edge is the ~1e-4 quadrature error of ρ, and the reason the window (Ec − 0.15 … Ec + 0.6) is wider than
+the transport energies (Ec + 0 … 0.5).</p>
+
 <h2>4. From ρ to a basis: occupations</h2>
 <p>Diagonalize the block of the density matrix:</p>
 <div class="eq">ρ<sub><var>PP</var></sub> = Σ<sub><var>i</var></sub> <var>λ<sub>i</sub></var> <var>u<sub>i</sub></var> <var>u<sub>i</sub></var><sup>†</sup>,
