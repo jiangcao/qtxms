@@ -27,3 +27,4 @@ packages = ["src/qtx_modespace"]
 
 [tool.hatch.build.targets.sdist]
 exclude = ["data", "dist"]
+artifacts = ["examples/*.sh"]          # the repo .gitignore hides examples/ (device data); keep the scripts
