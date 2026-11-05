@@ -97,8 +97,33 @@ def lead_edges(lead, mid, nk, cache_dir=None, log=print):
     return Ev, Ec
 
 
+def detect_periodic(xyz, norb, H, S, lat, ax, tol=1e-3):
+    """[{"axis": k, "length": L}] for the transverse axes k of the (orthorhombic) supercell Lattice along which
+    |H| + |S| > tol couples two atoms more than L / 2 apart, i.e. through the periodic image (QuaTrEx [0, 0, 0] blocks
+    of Gamma-point supercells), and per such axis the largest minimum-image |d_k| (must stay below L / 2)."""
+    if lat is None or np.abs(lat - np.diag(np.diag(lat))).max() > 1e-8:
+        return [], {}
+    atom = np.repeat(np.arange(len(norb)), norb)
+    P = (abs(H) + abs(S)).tocoo()
+    k = P.data > tol
+    ia, ja = atom[P.row[k]], atom[P.col[k]]
+    keep = ia < ja
+    D = xyz[ja[keep]] - xyz[ia[keep]]
+    per, info = [], {}
+    for t in range(3):
+        if t == ax:
+            continue
+        L = float(lat[t, t])
+        if len(D) and np.abs(D[:, t]).max() > 0.5 * L:
+            per.append(dict(axis=t, length=L))
+            Dm = D[:, t] - L * np.round(D[:, t] / L)
+            info[t] = dict(raw_max=float(np.abs(D[:, t]).max()), image_max=float(np.abs(Dm).max()),
+                           wrapped=int((np.abs(D[:, t]) > 0.5 * L).sum()))
+    return per, info
+
+
 def read_quatrex(folder, cells=None, trim=False, potential=False, nk=41, cache_dir=None, log=print):
-    """Device dict: labels, xyz, norb, blocks, H, S, lead, lead_right, perm, meta (axis, block_length,
+    """Device dict: labels, xyz, norb, blocks, H, S, lead, lead_right, perm, meta (axis, periodic, block_length,
     transport = device / lead blocks, edges = lead band edges Ev_lead, Ec_lead; cached in cache_dir, see
     lead_edges)."""
     t0 = time.time()
@@ -136,6 +161,11 @@ def read_quatrex(folder, cells=None, trim=False, potential=False, nk=41, cache_d
     counts = {str(k): int(v) for k, v in zip(*np.unique(labels, return_counts=True))}
     log(f"{root.name}: {len(labels)} atoms {counts}, {n} orbitals; "
         f"H nnz {H.nnz}, S nnz {S.nnz}")
+
+    periodic, pinfo = detect_periodic(xyz, norb, H, S, lat, ax)
+    if periodic:
+        log(f"  periodic transverse axes (couplings through the supercell image): "
+            f"{[(p['axis'], round(p['length'], 4)) for p in periodic]}, {pinfo}")
 
     V = None
     pot = root / "inputs" / "potential.npy"
@@ -218,7 +248,7 @@ def read_quatrex(folder, cells=None, trim=False, potential=False, nk=41, cache_d
     log(f"  lead periodicity (max |difference|): {checks}")
     Ev, Ec = lead_edges(lead, mid, nk, cache_dir, log=log)
     log(f"  lead {len(o0)} orbitals: Ev {Ev:.4f}, Ec {Ec:.4f} eV, gap {Ec - Ev:.3f} eV; {time.time() - t0:.0f} s")
-    meta = dict(name=root.name, axis=ax, block_length=float(m * acell), cells_per_block=int(m), nblocks=int(nb),
+    meta = dict(name=root.name, axis=ax, periodic=periodic or None, block_length=float(m * acell), cells_per_block=int(m), nblocks=int(nb),
                 coupling_range=rng, trimmed=trimmed, lead_checks=checks,
                 transport=dict(device_blocks=list(range(1, nb - 1)), lead_left_block=0, lead_right_block=int(nb - 1)),
                 edges=dict(Ev_lead=Ev, Ec_lead=Ec, mid_gap=mid, right_lead_shift=dV))

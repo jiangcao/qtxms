@@ -9,5 +9,6 @@ results_cms/
 envs/gpaw/.pixi/
 dist/
 examples/
+!release/qtx_modespace/examples/
 release/qtx_modespace/data/
 envs/quatrex/.venv/

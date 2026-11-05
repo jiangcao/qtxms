@@ -1,11 +1,17 @@
 """Device, lead self-energies, sparse / block-tridiagonal solvers and the contour slab density matrix.
 
+Lead OBC on the real axis (|Im z| <= Device.qtt_eta; the transmission, FGMRES and exact solves at real E): qttools'
+spectral OBC (QuaTrEx) by default, Sigma at E = Re z and the flux-normalized incoming Bloch modes as injection
+(one column per propagating channel, as QuaTrEx's QTBM). qttools is found on sys.path or in $QTTOOLS_SRC (a
+QuaTrEx src folder; needs mpi4py, numba). When it does not import (or fails at an energy) the folded lead below is
+used at E + i fallback_eta with the Gamma eigenchannels as injection. Complex z (contours): always the folded lead.
+
 Device: the device blocks of a read_quatrex dict are the slabs; the lead blocks enter through Sigma_L, Sigma_R.
 Lead Sigma(z): the lead-cell interior (orbitals not coupled to the neighbouring cells) is folded onto the coupled
 faces F, A_eff(z) = A_FF - A_FI A_II^-1 A_IF with A = z S - H, then Lopez-Sancho decimation of the folded chain
 (complex Hermitian H, any S).
 """
-import os, time
+import glob, os, sys, time, warnings
 import numpy as np
 import scipy.linalg as sla
 import scipy.sparse as sp
@@ -136,10 +142,120 @@ class FoldedLead:
         return sancho_both(Aeff, z * self.S01 - self.H01, z * self.S01.conj().T - self.H01.conj().T)
 
 
-class Device:
-    """Slabs = device blocks; bL, bR = device orbitals (device order) coupled to the left / right lead."""
+_QTT = None
 
-    def __init__(self, inp, sigma_cache=None):
+
+def qttools_obc():
+    """(Spectral, Full) from qttools (QuaTrEx), or None when it does not import or runs on cupy."""
+    global _QTT
+    if _QTT is None:
+        _QTT = False
+        src = os.environ.get("QTTOOLS_SRC")
+        for path in (None, src) if src else (None,):
+            if path and path not in sys.path:
+                sys.path.append(path)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    from qttools import xp
+                    from qttools.boundary_conditions.obc.spectral import Spectral
+                    from qttools.nevp import Full
+            except ImportError:
+                continue
+            _QTT = (Spectral, Full) if xp is np else False
+            break
+    return _QTT or None
+
+
+class QttLead:
+    """Lead cell (H00, S00, coupling H01, S01 to the next cell along +x) through qttools' spectral OBC at real E.
+    sections = primitive cells per lead cell (the NEVP runs on one primitive cell). Per side: g = surface Green's
+    function of the semi-infinite lead (cell next to the device included), u = lead-cell amplitudes of the
+    flux-normalized incoming modes (device source A_dl u, B B^H = Gamma on the device face). perm: lead-cell orbital
+    order with the primitive cells contiguous along +x and in the same internal order; qttools reads the periodic
+    layer from the outermost primitive cell, cells numbered inwards (+x for the left lead, reversed for the right)."""
+
+    def __init__(self, H00, H01, S00, S01, sections=1, perm=None, **opts):
+        Spectral, Full = qttools_obc()
+        n = H00.shape[0]
+        assert n % sections == 0, f"lead cell {n} not divisible into {sections}"
+        m = n // sections
+        p = np.arange(n) if perm is None else np.asarray(perm)
+        self.p = {"L": p, "R": p.reshape(sections, m)[::-1].ravel()}
+        self.H00, self.H01, self.S00, self.S01 = (np.asarray(sp.csr_matrix(M)[p][:, p].toarray(), complex)
+                                                  for M in (H00, H01, S00, S01))
+        blk = lambda M, i, j: M[i * m:(i + 1) * m, j * m:(j + 1) * m]
+        for nm, M in (("H", self.H00), ("S", self.S00)):
+            d = max([abs(blk(M, i, i) - blk(M, 0, 0)).max() for i in range(sections)] +
+                    [abs(blk(M, i, i + 1) - blk(M, 0, 1)).max() for i in range(sections - 1)])
+            if d > 1e-2 * max(abs(M).max(), 1):
+                raise RuntimeError(f"lead cell is not {sections} identical primitive cells (max |d{nm}| {d:.2e})")
+            if d > 1e-8:
+                log(f"  qttools lead: primitive cells of the lead cell differ by up to {d:.1e} in {nm}; "
+                    f"the OBC uses the outermost cell (as QuaTrEx)")
+        kw = dict(num_ref_iterations=4)
+        kw.update(opts)
+        self.sections = sections
+        self.solver = Spectral(Full(), block_sections=sections, **kw)
+
+    def modes(self, E, side):
+        a00 = E * self.S00 - self.H00
+        a01 = E * self.S01 - self.H01
+        a10 = E * self.S01.conj().T - self.H01.conj().T
+        a_ji, a_ij = (a10, a01) if side == "L" else (a01, a10)
+        r = np.argsort(self.p["L"])[self.p[side]]
+        a_xx = tuple(M[np.ix_(r, r)][None] for M in (a_ji, a00, a_ij))
+        if self.sections > 1:          # exactly periodic lead from the outermost primitive cell (as QuaTrEx)
+            from qttools.toeplitz.toeplitz import periodize_layer
+            a_xx = tuple(np.ascontiguousarray(x) for x in periodize_layer(a_xx, self.sections))
+        a_ji = a_xx[0][0]
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            g, b = self.solver(a_xx, "", return_injected=True)
+        bad = [str(x.message) for x in w if "recursion error" in str(x.message)]
+        if bad:
+            raise RuntimeError(f"qttools OBC {side} at E = {E}: {bad[0]}")
+        g = g[0]
+        u = g @ (a_ji @ b[0])
+        ip = np.argsort(self.p[side])
+        return g[np.ix_(ip, ip)], u[ip]
+
+
+def lead_cell_perm(inp, orbs, sections):
+    """Orbital order of a lead cell (read_quatrex orbitals orbs, in lead-matrix order) with its `sections` primitive
+    cells contiguous along transport and every cell's atoms in the order of the first cell (matched by translation)."""
+    if sections <= 1:
+        return None
+    from scipy.spatial import cKDTree
+    norb, ax = inp["norb"], inp["meta"]["axis"]
+    off = np.concatenate([[0], np.cumsum(norb)])
+    atom_of = np.repeat(np.arange(len(norb)), norb)
+    atoms = np.unique(atom_of[orbs])
+    x = inp["xyz"][atoms]
+    a = inp["meta"]["block_length"] / sections
+    cell = np.floor((x[:, ax] - x[:, ax].min() + 0.25 * a) / a).astype(int)
+    assert cell.min() == 0 and cell.max() == sections - 1, f"lead cell atoms span cells {cell.min()}..{cell.max()}"
+    first = np.where(cell == 0)[0]
+    tree = cKDTree(x[first])
+    order = []
+    for c in range(sections):
+        shift = np.zeros(3); shift[ax] = c * a
+        mine = np.where(cell == c)[0]
+        d, j = tree.query(x[mine] - shift)
+        assert d.max() < 1e-2 and len(np.unique(j)) == len(first) == len(mine), f"lead cell {c} does not match cell 0"
+        order.extend(mine[np.argsort(j)])
+    pos = {o: i for i, o in enumerate(orbs)}
+    return np.array([pos[o] for k in order for o in range(off[atoms[k]], off[atoms[k] + 1])])
+
+
+class Device:
+    """Slabs = device blocks; bL, bR = device orbitals (device order) coupled to the left / right lead; dev = the
+    read_quatrex orbital of each device orbital."""
+
+    qtt_eta = 1e-5                  # |Im z| up to which Sigma(z) is the qttools OBC at E = Re z
+    fallback_eta = 1e-6             # folded lead on the real axis (no qttools): Sigma at E + i fallback_eta
+
+    def __init__(self, inp, sigma_cache=None, obc="auto"):
         self.inp, self.meta = inp, inp["meta"]
         norb, blocks = inp["norb"], inp["blocks"]
         ob = np.repeat(blocks, norb)
@@ -149,7 +265,7 @@ class Device:
         self.ns = [len(o) for o in self.slab_orbs]
         self.sb = np.concatenate([[0], np.cumsum(self.ns)])
         dev = np.concatenate(self.slab_orbs)
-        self.n = len(dev)
+        self.dev, self.n = dev, len(dev)                               # device orbital -> read_quatrex orbital
         H, S = inp["H"], inp["S"]
         self.H, self.S = H[dev][:, dev].tocsr(), S[dev][:, dev].tocsr()
         self.loc = -np.ones(H.shape[0], int)                           # orbital -> slab-local index
@@ -174,10 +290,75 @@ class Device:
         self.cL = [cut(M, oL, dev[self.bL]) for M in (H, S)] + [cut(M, dev[self.bL], oL) for M in (H, S)]
         self.cR = [cut(M, oR, dev[self.bR]) for M in (H, S)] + [cut(M, dev[self.bR], oR) for M in (H, S)]
         self.sigma_cache = sigma_cache
+        assert obc in ("auto", "qttools", "folded"), obc
+        self.obc, self.qtt, self._inj = obc, None, {}
+        if obc != "folded" and qttools_obc() is not None:
+            sec = int(self.meta.get("cells_per_block", 1))
+            OL, ORr = O[tr["lead_left_block"]], O[tr["lead_right_block"]]
+            try:
+                self.qtt = QttLead(ld["H00"], ld["H01"], ld["S00"], ld["S01"], sec, lead_cell_perm(inp, OL, sec))
+                self.qttR = self.qtt if lr is None else QttLead(lr["H00"], lr["H01"], lr["S00"], lr["S01"], sec,
+                                                                 lead_cell_perm(inp, OL, sec))
+            except RuntimeError as e:
+                if obc == "qttools":
+                    raise
+                log(f"  qttools OBC not used: {e}")
+                self.qtt = None
+            self.qL = [cut(M, OL, dev[self.bL]) for M in (H, S)] + [cut(M, dev[self.bL], OL) for M in (H, S)]
+            self.qR = [cut(M, ORr, dev[self.bR]) for M in (H, S)] + [cut(M, dev[self.bR], ORr) for M in (H, S)]
+        elif obc == "qttools":
+            raise RuntimeError("obc 'qttools': qttools does not import (install it or set QTTOOLS_SRC)")
+        log(f"  lead OBC on the real axis: {'qttools spectral OBC' if self.qtt is not None else 'folded lead (decimation) at E + %g i' % self.fallback_eta}")
+
+    def uses_qttools(self, z):
+        return self.qtt is not None and abs(complex(z).imag) <= self.qtt_eta
 
     def sigma(self, z):
-        """Sigma_L on bL, Sigma_R on bR at complex z (cached as sig_<Re z>_<Im z>.npz in sigma_cache)."""
+        """Sigma_L on bL, Sigma_R on bR at z. Real axis (|Im z| <= qtt_eta): qttools at E = Re z (the injected modes
+        are kept for inject(); cached as qsig_<E>_<Im z>.npz, any such file at the same E is reused), or the folded
+        lead at E + i fallback_eta without qttools. Complex z: folded lead (sig_<Re z>_<Im z>.npz)."""
         z = complex(z)
+        if self.uses_qttools(z):
+            try:
+                return self._sigma_qtt_cached(z.real)
+            except RuntimeError as e:
+                if self.obc == "qttools":
+                    raise
+                log(f"  {e}; folded-lead Sigma instead")
+        if abs(z.imag) < self.fallback_eta:
+            z = complex(z.real, self.fallback_eta)
+        self._inj = {}
+        return self._sigma_folded(z)
+
+    def inject(self, Sg, tol=1e-4):
+        """Injection columns for the Sigma_L Sg of the last sigma(): the qttools incoming modes when they came with
+        it, else the Gamma_L eigenchannels above tol (injection())."""
+        B = self._inj.get(id(Sg))
+        return injection(Sg, tol) if B is None else B
+
+    def _sigma_qtt_cached(self, E):
+        d = self.sigma_cache
+        hit = sorted(glob.glob(os.path.join(d, f"qsig_{E:+.8f}_*.npz"))) if d else []
+        hit = [f for f in hit if abs(float(f.rsplit("_", 1)[1][:-4])) <= self.qtt_eta]
+        if hit:
+            c = np.load(hit[0])
+            out = c["SL"], c["SR"]
+            self._inj = {id(out[0]): c["BL"], id(out[1]): c["BR"]}
+            return out
+        out, inj = [], []
+        for side, lead, (Hld, Sld, Hdl, Sdl) in (("L", self.qtt, self.qL), ("R", self.qttR, self.qR)):
+            g, u = lead.modes(E, side)
+            Adl = E * Sdl - Hdl
+            out.append(Adl @ g @ (E * Sld - Hld))
+            inj.append(Adl @ u)
+        out = tuple(out)
+        self._inj = {id(out[0]): inj[0], id(out[1]): inj[1]}
+        if d:
+            os.makedirs(d, exist_ok=True)
+            np.savez(os.path.join(d, f"qsig_{E:+.8f}_{0.0:.8e}.npz"), SL=out[0], SR=out[1], BL=inj[0], BR=inj[1])
+        return out
+
+    def _sigma_folded(self, z):
         f = None
         if self.sigma_cache:
             f = os.path.join(self.sigma_cache, f"sig_{z.real:+.8f}_{z.imag:.8e}.npz")

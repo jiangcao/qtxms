@@ -284,6 +284,40 @@ Per energy E:
   level 2 rho eigendecomposition 122 s with the contour Sigma cache shared (same leads). => the basis must follow the
   potential (bias / Poisson loop: rebuild or update per iteration); spurious states are harmless when they sit where
   the basis was built.
+  Two-level block FGMRES in the OFF state (results_ms/gate_off/fgmres/run_mg_gate.sh; CAP-Schwarz 16,2,2, 7 windows,
+  dense64, 4 workers; fig14 windows but ramp 2 Å instead of 3; coarse = Galerkin MS in slab level 1; tol 1e-10; its min..max over columns at
+  Ec+0.05 / 0.20 / 0.45 (19 / 24 / 36 columns)): flat-band 1e-6 (N 1305, x0 T err +7.1 / +17 / +0.55) 23-27 / 30-35 /
+  44-49; flat-band 1e-8 (N 2373) 22-26 / 26-31 / 40-44; gate 1e-8 (N 2250, x0 T err 3e-4 / 6e-3 / 7e-6) 24-28 /
+  37..150 (stall 1e-7…1e-10: spurious MS resonance at Ec+0.20, MS residual 12.6, cf. 0.04 at Ec+0.21) / 41-47. All
+  others reach err 3-5e-11, T 1e-9. => the FGMRES correction removes the OFF-state MS failure at flat-band iteration
+  counts (no bias-aware basis needed); a coarse level sitting on a narrow spurious resonance is what hurts.
+  Cost: factor 26 s + iterations 115-420 s (Python, 1 thread per window) vs exact sparse LU 390-470 s.
+  Follow-up (run_mg_gate2.sh, report fig15): one-level FGMRES (cap smoother only, x0 = 0, qtx_ms.cap_fgmres) converges
+  too: 30-40 / 41-54 / 60-75 its, 112 / 172 / 451 s, i.e. ~1.5x the two-level its but the same or less wall time (a
+  two-level iteration = pre + post smoothing + coarse + 3 matvecs, a one-level one = 1 smoothing + 1 matvec): in this
+  short device the mode-space coarse level buys little. Coarse shift (schwarz --coarse-eta, A_c at E + i eta_c, fine A at
+  E): gate 1e-8 at Ec+0.20 stall -> 32-37 (1e-3) / 34-37 (1e-2), elsewhere unchanged (±1-4 its) although x0 gets worse
+  (T err 3e-4 -> 6e-2 / 0.46): cheap fix for spurious coarse resonances. Window LU reused off-energy (--cap-dE0, flat
+  1e-8): −0.05 eV +4 / +2 / −4 its, +0.05 eV +4 / +3 / +14, +0.10 eV +10 / +23 / +36 (factor below E is better: the
+  barrier region is less resonant).
+  Energy sweep Ec + 0:0.5:0.05 (run_mg_gate3.sh, report fig16; its max over columns, wall time 6 jobs x 4 workers):
+  one-level 40-61 below the barrier top, 69 / 75 / 97 at 0.40 / 0.45 / 0.50, 110-330 s; two-level (flat 1e-8, pre +
+  post) 26-38, 41 / 44 / 55, 140-370 s; two-level pre-smoothing only 50-60, 61 / 63 / 69 (≈ one-level its, more time).
+  The coarse level saves ~40% of the iterations at every E but costs more per iteration, so one-level is faster below
+  the barrier top and two-level only at Ec+0.45 / 0.50 (more channels, longer Krylov). Post-smoothing is essential.
+- FEAST probes for the level-1 local ρ (`qtx_ms/feast_bench.py`, results_ms/feast_bench/, report fig17; slab 0, 3483
+  orbitals, CAP+OBC embedding 9744, 24-pt arc, one dense LU per point): Q = Σ w_e G(z_e) R, S-orthonormalized
+  (Cholesky S_PP + SVD; the Gram eigh squares the condition number and lost half the columns), R = S_e Y (feast),
+  S_e Y_P (feastP), S_e^1/2 Y (feastL; S_e is indefinite, λ_min −1.9e-2, 10 eigenvalues clipped) vs density matrix
+  (identity RHS on P, eigh ρ_PP; k 319 / 550 at cut 1e-6 / 1e-8) vs range finder (Ω on P, Nyström). Missed exact
+  occupation at cut 1e-8: range finder M 550 6e-7, M 900 1e-11 (k 550/550); all FEAST variants saturate in M
+  (M 3000: own cut keeps 175–264 of 550, miss 6e-4–3e-3; top-550 by count 3e-7–6e-6). Weighting S Y vs S^1/2 Y
+  makes no difference: any probe spread over the embedding ranks P directions by their environment coupling, not by
+  ρ_PP. FEAST equals the range finder only for R = Y on P without S, which is the range finder itself. MS T (slab 0
+  replaced, rest slab level 1 1e-8): all 550-column sets median 3–7e-6, max 0.5–4e-4 (dm 5.9e-6 / 3.4e-4); at cut
+  1e-6 feast M400 2.2e-4 / 2.5e-2 vs rf M400 7.5e-5 / 3.3e-4. Cost: 24 LUs 5.9e13 flops (332 s summed), solves
+  1.8e10 flops per column (dm 3483 columns 6.3e13, 296 s; M 3000 257–286 s); the range finder at M 900 saves ~75%
+  of the solves (≈ 40% of the pass). Keep the range finder (Ω on P); FEAST probes bring nothing.
 ## Code state (package `qtx_ms/`; Python 3, numpy, scipy only)
 All modules live in `qtx_ms/`; drivers are run from the repo root as `python -m qtx_ms.<name>`
 (outputs written to the current directory). Package `mgms` renamed `qtx_ms` (distribution `qtx-ms`) on 2026-11-02;
@@ -345,10 +379,24 @@ QuaTrEx / MoS2-HfO2 track (see README section "QuaTrEx devices")
   Mulliken charge per atom / region; workers share the grid; `summary` → summary.png, span.png.
 - `tile_oracle.py` (tile bases from the exact slab ρ vs CAP tiles), `tile_scf.py` (lead-Σ tile embedding +
   self-consistent tile update via level-1 RGF; negative result, see Decisions).
+- `feast_bench.py` — level-1 local ρ of one block: density matrix vs range finder vs FEAST probes (accuracy, flops,
+  time, optional mode files for ms_scan).
 - `schwarz.py` — overlapping Schwarz smoother along x (local closed eigensolves, states within delta of E deflated
   to the coarse level, open LU windows at the leads) + multiplicative two-level cycle vs exact psi.
 - `release/qtx_modespace/obc_eig.py` (0.2.0.dev0) — full-size OBC eigenmodes (continued Σ, Beyn, span vs --modes, --plot);
   tests/test_obc_eig.py (1D chain: closed-form Σ, winding number); MoS2 c1 reproduces qtx_ms (λ, vector identical).
+- `release/qtx_modespace/` 0.2.0 (2026-11-05, in preparation): + `level1.py` (slab / tile partition with --tile-orbs,
+  --tile-xsplit; local ρ per block, CAP or CAP + lead Σ embedding, Schur G_PP, forked contour points, block cache;
+  `--basis l1`), `schwarz.py` (CAP-Schwarz x-windows ± transverse split, block FGMRES, two-level cycle; `--fgmres`,
+  `--fgmres-coarse ms|none`), `read_quatrex` detects meta["periodic"]; tests/test_level1.py (slab OBC with a
+  whole-device embedding = global ρ_ss to 1e-10). No FEAST / range finder (user, 2026-11-05). Real-axis OBC =
+  qttools by default at real E (`--eta 0`, 2 channels at Ec+0.05), folded lead at E + 1e-6 i only as fallback
+  (user, 2026-11-05). `--system closed` (A0 = zS − H, no Σ on fine and coarse level, unit RHS on the contact-slab
+  orbitals, chunks). `schwarz.FastOp` (real split + row threads: 64-col matvec 2.8 → 0.5 s). CapSchwarz workers limit
+  BLAS to 1 thread (threaded MKL + concurrent LU segfaulted). Example: release/qtx_modespace/examples/
+  mos2_hfo2_workflow.sh (A slab CAP+OBC 1e-8, B slab CAP 1e-8, C tile CAP+OBC 1e-6, D FGMRES 2/1-level, E closed);
+  run results_ms/release020/wf: T err A ≤ 2.5e-4, B ≤ 4e-5, C ≤ 2.4e-4 (Ec+0.05/0.15/0.2); FGMRES two-level 25/35/41 its,
+  one-level 55/61/84, T 1e-12–2e-11; closed 128 cols two-level 30–52 its, one 46–87, err ≤ 6e-11.
 - `release/qtx_modespace/` — self-contained package (numpy/scipy/h5py, optional pypardiso): QuaTrEx folder →
   contour ρ → basis npy (+ QuaTrEx orbital indices) → optional T_MS / T_exact. Checked bit-equivalent to qtx_ms
   (results_ms/release_check/). `obc_eig.py` (0.2.0.dev0): full-size OBC eigenmodes (continued Σ, Beyn, span vs

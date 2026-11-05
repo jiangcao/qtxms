@@ -295,7 +295,7 @@ def main(argv=None):
     cache = None if a.sigma_cache == "none" else (a.sigma_cache or os.path.join(a.out, "sigma"))
     inp = read_quatrex(a.folder, cells=a.cells, trim=a.trim, potential=a.potential, cache_dir=cache, log=log)
     Ec = inp["meta"]["edges"]["Ec_lead"]
-    dev = Device(inp, sigma_cache=cache)
+    dev = Device(inp, sigma_cache=cache, obc="folded")      # continued Sigma: the folded lead
     c = Ec + a.center
     fch = os.path.join(a.out, f"channels_{c:+.8f}.json")
     if os.path.exists(fch):

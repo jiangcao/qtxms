@@ -1,11 +1,23 @@
 # qtx_modespace
 
 Mode-space basis for QuaTrEx / deviceBuilder devices. It reads a QuaTrEx device folder, builds a per-slab mode-space
-basis from the slab density matrices of the open device, and saves the basis as `.npy` files. Optionally it computes
-the mode-space transmission and checks it against the exact transmission.
+basis and saves it as `.npy` files. There are two kinds of basis, both density-matrix mode space:
+- **level 2** (global density matrix, the default; `--basis l2`): the slab density matrices of the whole open device;
+- **level 1** (local density matrix, `--basis l1`, new in 0.2.0): one density matrix per block, where a block is a
+  slab or a tile of a slab, embedded in its surroundings and closed by a CAP, or by a CAP plus the exact lead
+  self-energy on the lead faces.
 
-Dependencies: numpy, scipy, h5py. Optional: pypardiso (fast sparse LU for the lead interior and the exact solve,
-x86-64), matplotlib (transmission plot).
+Optionally it computes the mode-space transmission and checks it against the exact transmission. It can also solve
+the full QTBM system iteratively (`--fgmres`, new in 0.2.0), using flexible GMRES with a CAP-Schwarz smoother and the
+mode space as the coarse level.
+
+Dependencies: numpy, scipy, h5py. Optional: qttools from QuaTrEx (real-axis lead OBC, the default when it imports:
+on sys.path or `QTTOOLS_SRC=<quatrex>/src`; needs mpi4py and numba), pypardiso (fast sparse LU for the lead interior
+and the exact solve, x86-64), threadpoolctl (`--l1-workers` and `--workers`: BLAS threads per process / window),
+matplotlib (transmission plot).
+
+Example workflow with every 0.2.0 feature on the MoS2/HfO2 device below: `examples/mos2_hfo2_workflow.sh
+DEVICE_FOLDER [OUT]` (results in "Tested" below).
 
 ```
 pip install .                 # or: pip install ".[fast,plot]"
@@ -14,6 +26,12 @@ python -m qtx_modespace DEVICE_FOLDER --out ms_out --transmission --exact --dE 0
 python -m qtx_modespace DEVICE_FOLDER --out ms_out --cells 3 --trim --nmodes 200     # smaller slabs, see below
 python -m qtx_modespace DEVICE_FOLDER --out t_out --cells 3 --trim \
        --modes data/mos2_hfo2_trim_c3_n200/modes --transmission --dE 0:0.5:0.05      # T from a saved basis
+python -m qtx_modespace DEVICE_FOLDER --out l1_out --basis l1 --l1-cut 1e-8 \
+       --l1-workers 4 --l1-threads 6 --transmission --dE 0:0.5:0.01                 # slab level 1, CAP + OBC
+python -m qtx_modespace DEVICE_FOLDER --out l1t_out --basis l1 --l1-partition tile --tile-orbs 2500 \
+       --l1-boundary cap --l1-cut 1e-6                                              # tile level 1, CAP only
+python -m qtx_modespace DEVICE_FOLDER --out mg_out --modes l1_out/modes --fgmres --dE 0.05,0.2 \
+       --exact --psi-dir psi                                                       # FGMRES + CAP-Schwarz to 1e-10
 ```
 `qtx-modespace` is installed as a console script with the same arguments. Set `OMP_NUM_THREADS` / `MKL_NUM_THREADS`.
 
@@ -53,8 +71,21 @@ Only the R = [0, 0, 0] block is used (no transverse k). Triangle-only storage is
    `--trim` drops the H, S entries that couple non-neighbouring blocks, which allows fewer cells per block (smaller
    slabs, cheaper basis); the largest dropped |H|, |S| are printed. The first and last blocks are the leads (the
    QuaTrEx contacts are the device's own end cells); the device slabs are the blocks in between.
-2. **Leads.** Exact self-energies Sigma_L, Sigma_R(z): the lead-cell interior is folded onto the orbitals coupled to
-   the neighbouring cells, then Lopez-Sancho decimation (complex Hermitian H, non-orthogonal S).
+2. **Leads.** Exact self-energies Sigma_L, Sigma_R(z).
+   - **Real energies.** Transmission, FGMRES and the exact solves run at real E (`--eta 0`, the default). There the
+     self-energies and the injected modes come from qttools' spectral OBC, the QuaTrEx one (`--obc auto`, the
+     default; `--obc qttools` fails instead of falling back). Sigma is evaluated at E itself, with no imaginary
+     part. The injection uses the flux-normalized incoming Bloch modes, one column per propagating channel, so
+     there are 2 channels at Ec + 0.05 eV on MoS2/HfO2. qttools reads the lead cell as `cells_per_block` primitive
+     cells, periodized from the outermost one.
+   - **Fallback.** Without qttools, or with `--obc folded`, the folded lead is used at E + 1e-6 i, with the Gamma_L
+     eigenchannels above 1e-4 eV as injection. That gives 19 channels at Ec + 0.05: 17 of them are
+     eta-broadened evanescent modes that carry no current, so T is the same.
+   - **Complex z.** The contour points of the level-1 and level-2 density matrices always use the folded lead: the
+     lead-cell interior is folded onto the orbitals coupled to the neighbouring cells, then Lopez-Sancho decimation
+     (complex Hermitian H, non-orthogonal S).
+   - **Cache.** Results are cached in `--sigma-cache`: `qsig_<E>_*.npz` (qttools, with the injected modes) and
+     `sig_<Re z>_<Im z>.npz` (folded lead).
 3. **Slab modes (level 2).** Slab density matrices of the open device,
    rho_ss = -(1/pi) Im ∫ G_ss(z) dz, G = (zS - H - Sigma(z))^-1, over the upper half circle from Ec + mu1 to Ec + mu2
    (`--mu`, default -0.15,0.6 eV; `--npts` Gauss-Legendre points), by a left-connected block recursion.
@@ -66,9 +97,81 @@ Only the R = [0, 0, 0] block is used (no transverse k). Triangle-only storage is
    [Ec + win1, Ec + win2] (`--win`, default -0.6,0.45 eV) are spurious; they are removed by appending optimized
    vectors one at a time (RMS method: Huang et al., JAP 123, 044303 (2018), generalized to non-orthogonal S).
    T does not need it (see the table), and its convergence varies between runs (below).
+3'. **Level-1 basis (`--basis l1`, instead of 3).** See "Level-1 basis" below.
 5. **Transmission (optional).** At E = Ec + dE: QTBM injection b from Gamma_L, mode-space solution
    x = U A_c^-1 U^H b with the Galerkin A_c = U^H (E S - H - Sigma) U (block tridiagonal, exact Sigma projected),
    T = x_N^H Gamma_R x_N. With `--exact` also the exact T from a sparse direct solve of the full device.
+
+6. **Iterative solve (optional, `--fgmres`).** See "Iterative solve" below.
+
+### Level-1 basis (`--basis l1`)
+
+Partition and boundary are chosen independently:
+- **Partition** (`--l1-partition`). `slab` makes each device slab one block; the slab size is set by `--cells`
+  (and `--trim`). `tile` cuts each slab transversely by recursive bisection into round(n_slab / `--tile-orbs`)
+  tiles. `--tile-xsplit k` then cuts every block, slab or tile, into k pieces of equal orbital weight along
+  transport. The basis is block diagonal over the blocks: U_s = diag(blocks of slab s).
+- **Embedding** (`--l1-emb`, default 12 A). The block plus every atom within that distance. Distances use the
+  minimum image across the periodic transverse faces, which `read_quatrex` detects from the couplings of the
+  Gamma-point supercell. The embedding is closed by a CAP eta ((d - (d_emb - d_cap)) / d_cap)^2 on its outer
+  d_cap shell (`--l1-cap d_cap,eta`, default 3 A, 0.3 eV).
+- **Boundary** (`--l1-boundary`). `obc` (CAP + OBC, the default) drops the lead-block atoms from the embedding and
+  adds the exact lead self-energy -Sigma_L/R(z) on the lead-face orbitals inside it. Only blocks whose embedding
+  reaches a lead face are affected. `cap` keeps the lead atoms and closes the embedding with the CAP only.
+- **Local rho.** rho_PP = -(1/pi) Im ∫ G_PP(z) dz over the upper half circle of `--l1-mu` (default: the `--mu`
+  window) with `--l1-npts` points. These are the same points as the level-2 contour, so the Sigma cache is shared.
+  G_PP is the inverse of the Schur complement of the environment, (A_PP - A_PE A_EE^-1 A_EP)^-1, with a dense LU
+  when the embedding is more than 2% filled. `--l1-gpp full` uses one LU of the whole embedding instead, and
+  `--l1-env-prec single` a complex64 environment LU plus one refinement step (not faster for slabs). The contour
+  points of a block can run in parallel: `--l1-workers k --l1-threads t` uses k forked processes with t BLAS
+  threads each.
+- **Basis.** Per block, the eigenvectors of rho_PP with occupation > `--l1-cut`, largest first. Blocks are cached
+  in `<out>/level1/<partition>_<boundary>_<hash>/block<i>.npz` (or `--l1-cache`) with vectors down to
+  `--l1-store-cut` (1e-10), so a rerun with any cut >= that reuses them. `--l1-only K,N` builds only the blocks
+  i % N == K and exits, for building blocks in parallel jobs. The end-slab cleanup (`--clean-slabs 0,-1`) works on
+  level-1 bases too. It is recommended there, because the raw end slabs carry spurious lead bands; it lowered the
+  largest T error, see below.
+
+### Iterative solve (`--fgmres`)
+
+The QTBM system A x = b (all injected channels) is solved to `--fgmres-tol` (relative residual per channel,
+default 1e-10) by right-preconditioned flexible GMRES. A block of channels is iterated together: each channel has
+its own Krylov space, but the preconditioner acts on all active channels at once.
+- **CAP-Schwarz smoother.** Restricted additive Schwarz along transport. The windows are `--cap w,s,d` (default
+  16 A wide, absorbing strength 2 eV, ramp 2 A), centred on the slab interfaces and between them; `--cap-spacing`
+  sets the largest distance between centres, and `--cap-centres ends` keeps the interfaces plus the two lead-face
+  windows. Each window is solved with an LU of A_jj + i s P S_jj P, where P^2 ramps from 0 to 1 over the outer d A
+  towards each artificial cut. The lead faces keep Sigma. `--cap-split ny,nz` additionally cuts every window into
+  boxes along the periodic transverse axes, with `--cap-tov` A of overlap. Cut only out of the 2D plane: in-plane
+  cuts need boxes of 16 A or more. `--cap-solver dense64` (default) gives the same convergence as complex128 with
+  half the factor time. `--workers` sets how many windows are factored and solved concurrently (threads).
+  `--cap-dE0` factors at E + dE0, so one factorization can be reused over an energy interval (about 0.05 eV costs a
+  few iterations).
+- **Coarse level** (`--fgmres-coarse ms`, the default). The Galerkin mode space of the basis (`--modes`, or the
+  one just built). The preconditioner is one multiplicative cycle: `--pre` smoothing steps, coarse correction,
+  `--post` smoothing steps; keep post-smoothing, without it the iterations double. The start vector is the
+  mode-space solution. `--coarse-eta` moves only the coarse solve to E + i eta_c, which removes the stall of a coarse
+  level that sits on a narrow spurious mode-space resonance. `--fgmres-coarse none` is one-level: the smoother alone
+  with x0 = 0. It needs about 1.5x the iterations of two-level, but each iteration is cheaper.
+- **Output.** `transmission.json` → `E.<dE>.fgmres`: T, iterations and true residual per channel, residual history,
+  factor and iteration time, the settings, and with `--exact` the T and psi errors (`err_T`, `err_psi`).
+
+### Closed system with unit right-hand sides (`--system closed --fgmres`)
+
+This mode builds the system matrix without the lead self-energy, A0 = z S - H with z = E + i `--closed-eta`, on both
+the fine and the coarse level (the Galerkin A_c then carries no projected Sigma). The right-hand sides are the
+identity on the contact slab: one unit vector per orbital of the slabs in `--rhs-slabs` (default 0, the slab next
+to the left lead; `0,-1` for both), or with `--rhs-face` only on their lead-face orbitals. These columns are solved
+by the same FGMRES / CAP-Schwarz / coarse-level cycle, `--rhs-chunk` columns at a time. Krylov memory is about
+maxit x chunk device vectors, so on MoS2/HfO2 64 columns need ~3.5 GB.
+- The result X = A0^-1 I_C holds the columns of the closed-device Green's function on C. The lead self-energies
+  can be added afterwards on the face orbitals (Dyson / Woodbury), so these solves do not depend on Sigma.
+- The closed device has real eigenvalues. At `--closed-eta 0`, A0 (and the coarse A_c) is singular at those
+  energies and the iteration stalls near them; use a small eta, or `--coarse-eta` for the coarse level only.
+- `--exact` adds a sparse direct solve of the same columns and the error of X. `--save-x DIR` writes
+  `closed_<E>_<eta>.npz`, holding X, the device columns and their QuaTrEx orbital indices. `--rhs-max n` keeps only
+  the first n columns, for tests.
+- Output: `<out>/closed.json`, per energy the iterations per column, the largest residual, timings and the errors.
 
 ## Output (`--out`)
 
@@ -77,7 +180,8 @@ Only the R = [0, 0, 0] block is used (no transverse k). Triangle-only storage is
 | `modes/slab<s>.npy` | basis of slab s: complex array (slab orbitals x modes), orthonormal columns |
 | `modes/slab<s>_orbitals.npy` | for each row: the orbital index in the QuaTrEx `hamiltonian.h5` |
 | `modes/slab<s>_occupations.npy` | density-matrix occupations of the level-2 modes (largest first) |
-| `basis.json` | slab sizes, N per slab, window, occupations, cleanup summary per end slab, device info, arguments |
+| `basis.json` | slab sizes, N per slab, window, occupations, cleanup summary per end slab, device info, arguments; `basis` = l2 / l1, `level1` = partition, boundary, embedding, cut, columns per block |
+| `level1/` | `--basis l1`: cached local-rho eigenvectors per block (`block<i>.npz`: U, occupations s, atoms, stored cut) |
 | `eig_mu…_top<neig>.npz` | cached slab eigenpairs; a rerun with the same window and `--neig` skips the contour |
 | `rho_mu….npz` | slab density matrices, only with `--save-rho` (2.2 GB for the device below) |
 | `config.toml` | resolved options of the run (input for `--config`) |
@@ -209,6 +313,48 @@ Cost on this device (4 threads, shared machine): basis 1.5–2 h (contour 24 poi
 self-energies; eigenvectors and cleanup ~10 min); per energy: lead self-energy ~3 min, mode-space solve ~1 s, exact
 solve 4–9 min.
 
+### Release 0.2.0 on this device (`examples/mos2_hfo2_workflow.sh`)
+
+Real-axis OBC = qttools (2 channels at every energy below), default 5-cell slabs [3483, 8383, 7862, 3120], local rho
+window Ec - 0.15 ... Ec + 0.6 eV with 24 points, embedding 12 A, CAP 0.3 eV over 3 A; 4 processes x 6 threads.
+
+Level-1 bases (mode-space T error vs exact; 51-point grid Ec + 0 ... 0.5 eV against the folded-lead exact T, and
+Ec + 0.05 / 0.15 / 0.2 with the qttools OBC):
+
+| basis | N1 per slab | N | 51-pt grid: median / max | Ec + 0.05 / 0.15 / 0.2 (qttools) | build |
+|---|---|---|---|---|---|
+| slab level 1, CAP + OBC, cut 1e-8 | 550 / 702 / 726 / 395 | 2373 | 5.2e-6 / 3.4e-4 | -7e-7 / +1.1e-5 / -2.5e-4 | 40 min |
+| slab level 1, CAP only, cut 1e-8 | 649 / 704 / 728 / 492 | 2573 | 3.3e-6 / 3.5e-4 | -3.1e-5 / -1.0e-5 / -4.0e-5 | 42 min |
+| tile level 1 (8 tiles, 2500 orb), CAP + OBC, cut 1e-6 | 319 / 840 / 839 / 266 | 2264 | 1.9e-4 / 2.9e-2 | -2.4e-4 / -8.6e-5 / +1.9e-4 | 70 min |
+
+CAP only changes only the end slabs (their embedding keeps the lead atoms): more columns there, the same accuracy.
+The slab partition reaches a given accuracy with fewer columns than tiles (no transverse cuts). The mode-space psi
+error is much larger than the T error (3e-3 / 6e-2 / 6e-2 for the slab CAP + OBC basis, while range(U) holds psi to
+2-4e-4): T is second order in the error, psi is not (Galerkin is not optimal for this indefinite A).
+
+FGMRES + CAP-Schwarz (16 A windows, 7 of them, 3186-8762 orbitals, dense64, 4 workers), coarse level = the slab
+CAP + OBC basis, tol 1e-10; times are window factorization + iterations; the exact sparse solve takes 150-180 s:
+
+| E - Ec | two-level its | T / psi error | time | one-level its | T / psi error | time |
+|---|---|---|---|---|---|---|
+| 0.05 | 25 | 1e-12 / 1.1e-11 | 24 + 26 s | 55 | 8e-11 / 7.5e-11 | 24 + 23 s |
+| 0.15 | 35 | 6e-13 / 7.2e-12 | 24 + 37 s | 61 | 1e-11 / 6.2e-11 | 24 + 25 s |
+| 0.20 | 41 | 4e-12 / 5.9e-12 | 23 + 44 s | 84 | 2e-11 / 2.3e-10 | 23 + 37 s |
+
+The coarse level halves the iterations; a two-level iteration (pre + post smoothing, coarse solve, three matvecs)
+costs about twice a one-level one, so on this short device both take the same time.
+These times are with scipy's complex sparse product. The fine matvec now uses `schwarz.FastOp`: real products on
+[Re X, Im X], with the rows split over `--workers` threads. That cut the 64-column product from 2.8 s to 0.5 s, and
+the two-level solve at Ec + 0.2 from 44 to 30 s of iterations (same 41 iterations, T error 5e-12).
+
+Closed system (`--system closed`, no Sigma, unit right-hand sides on the first 128 lead-face orbitals of slab 0,
+z = E real), vs a sparse direct solve of the same columns (~300 s): Ec + 0.05 two-level 30-36 its, one-level 46-59;
+Ec + 0.2 two-level 47-52, one-level 70-87; error of X <= 6e-11 (worst column 3e-9). At real E the closed device is
+close to its own eigenvalues, so the iteration counts are higher than for the open system. One 64-column chunk (two-level, Ec + 0.05)
+took 403 s with scipy's product and 117 s with `FastOp`, against about 300 s for the direct solve of 128 columns.
+The iterative path pays off only when the window factors are reused over energies (`--cap-dE0`), or for more
+columns than one direct factorization serves well.
+
 ## Open-boundary eigenmodes (`qtx_modespace.obc_eig`)
 
 The resonances and bound states of the open device, i.e. the solutions of the nonlinear eigenproblem
@@ -264,9 +410,25 @@ pure Hf/O. Above that they move into the MoS2 channel near the right oxide end (
   between runs that differ only at rounding level, so it is off by default.
 - Only Gamma (no transverse k); no spin handling beyond what is in H, S.
 - The lead self-energy is a dense Python decimation on the lead faces; for large leads it dominates the run time.
-- The coarse system is meant as a stand-alone mode-space solver. Used as the coarse level of a two-level GMRES with a
-  GMRES smoother it converges slowly on this device (residual 3e-3 -> 2e-4 in 60 iterations, independent of the
-  number of smoother steps), so no iterative refinement is included.
+- The mode-space system is also the coarse level of the iterative solve (`--fgmres`). A GMRES(k) smoother does not
+  work on this device (residual 3e-3 -> 2e-4 in 60 iterations, whatever k); the CAP-Schwarz smoother does. Windows
+  narrower than about 16 A stall.
+- `--workers` > 1 factors the Schwarz windows in concurrent threads, with BLAS limited to 1 thread inside them
+  (threadpoolctl). Concurrent LAPACK calls on a multi-threaded MKL crash (segfault). Without threadpoolctl the
+  windows run one after another.
+
+## Release 0.2.0
+
+Tag `qtx_modespace-v0.2.0`. New:
+- Level-1 basis (`--basis l1`): local density matrices per block (slab or tile), embedding closed by CAP + lead Sigma or
+  CAP only; `--l1-partition`, `--tile-orbs`, `--tile-xsplit`, `--l1-emb`, `--l1-cut`, block cache, parallel contour points.
+- Iterative solve (`--fgmres`): flexible GMRES with the CAP-Schwarz smoother, two-level (mode-space coarse level) or
+  one-level; closed system without Sigma with unit right-hand sides on the contact slab (`--system closed`).
+- Real-axis lead OBC from qttools (QuaTrEx spectral OBC) by default, at real E (`--eta 0`), with the folded lead
+  as fallback (`--obc`); injection = the flux-normalized incoming modes.
+- `read_quatrex` detects the periodic transverse faces of Gamma-point supercells (meta["periodic"], minimum image).
+- `examples/mos2_hfo2_workflow.sh`: the whole workflow on the MoS2/HfO2 device; `tests/test_level1.py`.
+Not included: FEAST / range-finder probes for the local rho.
 
 ## Release 0.1.0
 
