@@ -277,6 +277,13 @@ Per energy E:
   η ≥ 1e-2 (up to 1e4x: the nonlocal absorber bridges the barrier). Residual enrichment (`spurious_enrich.py`, slab
   blocks of the resonance residual appended, 3 rounds): flat band unchanged (2e-6 / 4e-5), gated median 5e-2 → 5e-3–2e-2
   (raw) but max stays 1.4–230 (block-Jacobi corrected: up to 4e3): every round leaves 7–40 new spurious resonances.
+  Basis built AT the gate potential (results_ms/run_gate_basis.sh, results_ms/gate_off/gate_basis/, report fig13) works:
+  T err median / max on the 20 meV grid: slab level 1 1e-6 (N 1140) 1.1e-3 / 0.11; 1e-8 (N 2250) 1.4e-4 / 1.1e-2;
+  1e-10 (N 3554) 4.3e-6 / 2.1e-4; slab level 2 n400 + lead RMS (N 1639) 1.3e-6 / 7.8e-2 (max at Ec+0, T 7.7e-9; next
+  1e-3). G at EF = Ec−0.1…+0.2 exact to < 0.1% (1e-8, 1e-10, L2), 1.5% (1e-6). Build: slab level 1 1426 s (4 × 6 threads),
+  level 2 rho eigendecomposition 122 s with the contour Sigma cache shared (same leads). => the basis must follow the
+  potential (bias / Poisson loop: rebuild or update per iteration); spurious states are harmless when they sit where
+  the basis was built.
 ## Code state (package `qtx_ms/`; Python 3, numpy, scipy only)
 All modules live in `qtx_ms/`; drivers are run from the repo root as `python -m qtx_ms.<name>`
 (outputs written to the current directory). Package `mgms` renamed `qtx_ms` (distribution `qtx-ms`) on 2026-11-02;
