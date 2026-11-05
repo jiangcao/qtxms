@@ -1,181 +1,144 @@
-"""Remove the spurious level-1 OBC eigenstates by deflating them out of the coarse space (reduced Beyn on the open
-level-1 system), then MS T on a fine grid inside the contour vs exact.
+"""Remove spurious device states from a mode-space basis by deflating them from the coarse space.
 
-Level-1 open system T1(z) = z S1 - H1 - U1^H Sigma(z) U1 (Sigma on the continued retarded sheet at the contour nodes,
-obc_eig.ContinuedSigma cache). Round k, coarse space span(U1 Z_k) (Z_0 = I):
-  1. reduced Beyn on Z^H T1(z) Z  ->  (lambda, c);  fine vector v = U1 Z c, residual |T(lambda) v| / |v| with Sigma(lambda)
-     interpolated from the nodes (no full-size solve)
-  2. spurious = |r| > --rthr (physical resonances: 0.1-0.4 eV, spurious ~7 eV on mos2_hfo2)
-  3. Q <- [Q, Z c_spurious],  Z_{k+1} = orthonormal complement of span(Q) in the level-1 coordinates
-until no spurious eigenvalue is left inside the contour (or --rounds). The MS solve on the final space is the Galerkin
-x = U1 Z (Z^H A_c Z)^-1 Z^H U1^H b (dense here; for large N1 the same as a bordered block-tridiagonal solve with
-the k constraints Q^H y = 0).
+1. Find: resonances z of the open MS device, A_c(E) y = 0 near every energy of --find (Coarse.ritz, k nearest),
+   fine residual |(z S - H - Sigma) U y| with |U y|_S = 1. Physical resonances: residual 0.2-3 eV; spurious ones
+   (no fine counterpart): ~10 eV. Keep y with residual > --thr and |Re z - E| < step/2 + 1 meV, |Im z| < --imax.
+2. Deflate: Q = basis of {x : x^H S_c Y = 0} (S_c-orthogonal complement of the spurious vectors). Galerkin solve in
+   U Q: x = U Q (Q^H A_c(E) Q)^-1 Q^H U^H b, one fixed Q for all energies (dense, N - n_sp).
+   Deflation fails (gated device: T 100x too large; flat band err 1e-6 -> 1e-3): the spurious vectors overlap the
+   physical space.
+3. Absorb (--absorb eta,...): keep the space, add an absorbing term on the spurious subspace only,
+   A_c + i eta W, W = S_c Y_o Y_o^H S_c (Y_o: S_c-orthonormal basis of span(Y)): the spurious resonances get width
+   ~eta while the physical states orthogonal to them are untouched.
+4. Scan: T_MS raw, deflated and absorbed on --dE vs the exact json.
 
-  python -m qtx_ms.ms_deflate --inputs inputs/mos2_hfo2 --center 0.52135 --a 0.015 --b 0.01 --npts 24 \
-      --U1 results_ms/mos2_hfo2_vcycle/tobc_t1e-6_lc --fine results_ms/obc_eig/c1_Ec+0.017 --out results_ms/obc_eig/deflate/c1_base
+    python -m qtx_ms.ms_deflate --inputs inputs/mos2_hfo2_gate0.4 --modes <prefix> --Ec 0.50435 \\
+        --exact results_ms/exact/mos2_hfo2_gate0.4.json --out results_ms/gate_off/deflate/<tag>.json
 """
-import argparse
-import json
-import os
-import time
+import argparse, json, os, time
+import numpy as np, scipy.linalg as sla
 
-import numpy as np
-import scipy.linalg as sla
-
-from . import msbasis as mb
-from . import obc_eig as oe
-from .obc_eig_l1 import SigmaInterp, project_sigma, fine_vec, apply_T
-from .ms_absorb import _dense_H1, fine_vec_block
+from qtx_ms.prep.inputs import read_inputs
+from qtx_ms import msbasis as mb
+from qtx_ms.run_l2_clean import Coarse, fine_residual
+from qtx_ms.device_spurious import dense_coarse
+from qtx_ms.ms_scan import grid
 
 log = mb.log
 
 
-def dense_S1(blk1, off):
-    n = len(blk1["SD"])
-    S = np.zeros((off[-1], off[-1]), complex)
-    for s in range(n):
-        S[off[s]:off[s + 1], off[s]:off[s + 1]] = blk1["SD"][s]
-        if s < n - 1:
-            S[off[s]:off[s + 1], off[s + 1]:off[s + 2]] = blk1["SU"][s]
-            S[off[s + 1]:off[s + 2], off[s]:off[s + 1]] = blk1["SU"][s].conj().T
-    return S
+def find_spurious(dev, c, Ec, Es, step, k, thr, imax):
+    rows, Y = [], []
+    for dE in Es:
+        E = Ec + dE
+        SL, SR = dev.sigma(E + 1e-6j)
+        z, Yz = c.ritz(E, SL, SR, k)
+        X = c.prolong(Yz)
+        nrm = np.sqrt(np.abs(np.real(np.einsum("ic,ic->c", X.conj(), dev.S @ X))))
+        X /= nrm[None]
+        r = np.linalg.norm(fine_residual(dev, X, z, SL, SR), axis=0)
+        wb = c.block_norms(X) ** 2
+        for j in range(len(z)):
+            near = abs(z[j].real - E) < step / 2 + 1e-3 and abs(z[j].imag) < imax
+            if near:
+                rows.append([dE, z[j].real - Ec, z[j].imag, r[j], *wb[:, j]])
+                if r[j] > thr:
+                    Y.append(Yz[:, j] / nrm[j])
+        nsp = sum(1 for q in rows if q[0] == dE and q[3] > thr)
+        log(f"find Ec{dE:+.3f}: {sum(1 for q in rows if q[0] == dE)} resonances near, {nsp} spurious")
+    return np.array(rows), (np.array(Y).T if Y else np.zeros((c.N, 0), complex))
 
 
-def main(argv=None):
+def complement(Sc, Y, tol=1e-8):
+    """columns Q (orthonormal) with Q^H Sc Y = 0; the span of Y is first reduced to its numerical rank."""
+    if Y.shape[1] == 0:
+        return np.eye(Sc.shape[0], dtype=complex), 0
+    W = Sc @ Y
+    u, s, _ = np.linalg.svd(W, full_matrices=True)
+    r = int((s > tol * s[0]).sum())
+    return u[:, r:], r
+
+
+def sc_orth(Sc, Y, tol=1e-8):
+    """S_c-orthonormal basis of span(Y)"""
+    if Y.shape[1] == 0:
+        return Y
+    w, X = np.linalg.eigh(Y.conj().T @ Sc @ Y)
+    k = w > tol * w[-1]
+    return Y @ (X[:, k] / np.sqrt(w[k]))
+
+
+def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--inputs", required=True)
-    p.add_argument("--center", type=float, required=True)
-    p.add_argument("--a", type=float, required=True)
-    p.add_argument("--b", type=float, required=True)
-    p.add_argument("--npts", type=int, default=24)
-    p.add_argument("--probes", type=int, default=300)
-    p.add_argument("--rank-tol", type=float, default=1e-8)
-    p.add_argument("--U1", required=True)
-    p.add_argument("--fine", help="obc_eig dir of the same contour (channel counts, full-size eigenpairs)")
-    p.add_argument("--rthr", type=float, default=2.0, help="spurious: |T v| / |v| above this [eV]")
-    p.add_argument("--rounds", type=int, default=6)
-    p.add_argument("--grid", default="0.003:0.031:0.001", help="lo:hi:step, E - Ec [eV]")
-    p.add_argument("--exact-cache", default="results_ms/obc_eig/absorb/exact_grid.json")
+    p.add_argument("--modes", required=True)
+    p.add_argument("--Ec", type=float, required=True)
+    p.add_argument("--find", default="-0.1:0.55:0.01", help="lo:hi:step, energies - Ec where resonances are searched")
+    p.add_argument("--k", type=int, default=12)
+    p.add_argument("--thr", type=float, default=5.0, help="fine residual [eV] above which a resonance is spurious")
+    p.add_argument("--imax", type=float, default=0.05)
+    p.add_argument("--dE", default="0:0.5:0.01")
+    p.add_argument("--exact", required=True)
+    p.add_argument("--sigma-cache", default="results_ms/sigma/mos2_hfo2")
     p.add_argument("--out", required=True)
-    a = p.parse_args(argv)
-
-    from .prep.inputs import read_inputs
+    p.add_argument("--absorb", default="", help="eta values [eV] for the absorbing term on the spurious subspace")
+    p.add_argument("--no-defl", action="store_true", help="skip the deflated solve")
+    p.add_argument("--reuse", action="store_true", help="read the spurious vectors from <out>_res.npz of an earlier run")
+    a = p.parse_args()
     inp = read_inputs(a.inputs)
     dev = mb.Device(inp, obc="folded")
-    Ec = inp["meta"]["edges"]["Ec_lead"]
-    name = os.path.basename(os.path.normpath(a.inputs))
-    cache = os.path.join("results_ms", "sigma", name)
-    fch = a.fine and os.path.join(a.fine, f"channels_{a.center:+.8f}.json")
-    if fch and os.path.exists(fch):
-        nprop, nR = (tuple(x) for x in json.load(open(fch)))
+    dev.sigma_cache = a.sigma_cache
+    V = [np.load(f"{a.modes}_slab{s}.npy") for s in range(len(dev.ns))]
+    c = Coarse(dev, V)
+    Hc, Sc = dense_coarse(c)
+    t = time.time()
+    lo, hi, st = (float(x) for x in a.find.split(":"))
+    Es = np.round(np.arange(lo, hi + st / 2, st), 6)
+    fres = a.out.replace(".json", "_res.npz")
+    if a.reuse and os.path.exists(fres):
+        z = np.load(fres); rows, Y = z["rows"], z["Y"]
+        log(f"spurious vectors from {fres}")
     else:
-        nprop = oe.channel_counts(dev.lead, a.center); nR = nprop
-    sig = oe.ContinuedSigma(dev, cache=cache, nprop=nprop, nprop_R=nR)
-    zs, ws = oe.ellipse(a.center, a.a, a.b, a.npts)
-    SLs, SRs = zip(*[sig(z) for z in zs])
-    sint = SigmaInterp(zs, ws, SLs, SRs)
-    fine = None
-    if a.fine and os.path.exists(os.path.join(a.fine, "eigpairs.npz")):
-        f = np.load(os.path.join(a.fine, "eigpairs.npz"))
-        fine = dict(lam=f["lam"], vec=f["vec"] / np.linalg.norm(f["vec"], axis=0))
-
-    Us = oe.load_U1(a.U1, len(dev.ns))
-    N1 = [u.shape[1] for u in Us]
-    blk1 = mb.slab_blocks(dev, Us)
-    off = np.concatenate([[0], np.cumsum(N1)])
-    n1 = off[-1]
-    S1, H1 = dense_S1(blk1, off), _dense_H1(blk1, off)
-
-    def Ac(z, SL, SR):
-        S1L, S1R = project_sigma(dev, Us, SL, SR)
-        A = z * S1 - H1
-        A[:N1[0], :N1[0]] -= S1L
-        A[off[-2]:, off[-2]:] -= S1R
-        return A
-
-    Anodes = [Ac(z, SL, SR) for z, SL, SR in zip(zs, SLs, SRs)]
-    log(f"{a.inputs}: level 1 {a.U1} N1 {N1} = {n1}; contour c {a.center} a {a.a} b {a.b}, {a.npts} pts, channels {nprop}")
-
-    def reduced_beyn(Z, tag):
-        t0 = time.time()
-        V = np.random.default_rng(1).normal(size=(Z.shape[1], a.probes)) + 0j
-        Xs = [sla.lu_solve(sla.lu_factor(Z.conj().T @ A @ Z, check_finite=False), V, check_finite=False) for A in Anodes]
-        lam, C, s, k = oe.beyn(Xs, zs, ws, 1, a.rank_tol, a.center, max(a.a, a.b))
-        ins = ((lam.real - a.center) / a.a) ** 2 + (lam.imag / a.b) ** 2 < 1
-        lam, C = lam[ins], C[:, ins]
-        o = np.argsort(lam.real)
-        lam, C = lam[o], Z @ C[:, o]                                   # level-1 coordinates
-        rows = []
-        for l, c in zip(lam, C.T):
-            v = fine_vec(Us, c)
-            v /= np.linalg.norm(v)
-            row = dict(lam=[float(l.real), float(l.imag)], dE=float(l.real - Ec),
-                       res=float(np.linalg.norm(apply_T(dev, l, *sint(l), v))))
-            if fine is not None and len(fine["lam"]):
-                j = int(np.argmin(np.abs(fine["lam"] - l)))
-                row.update(fine=j, dlam=float(abs(fine["lam"][j] - l)),
-                           sin=float(np.sqrt(max(0.0, 1 - abs(np.vdot(fine["vec"][:, j], v)) ** 2))))
-            rows.append(row)
-        sp_ = np.array([r["res"] > a.rthr for r in rows], bool)
-        log(f"[{tag}] reduced Beyn dim {Z.shape[1]}: rank {k} (s[k-1]/s0 {s[k - 1] / s[0]:.1e}), {len(lam)} inside, "
-            f"{sp_.sum()} spurious, {time.time() - t0:.0f} s")
-        for r, f_ in zip(rows, sp_):
-            log(f"    Ec{r['dE']:+.5f} {r['lam'][1]:+.2e}i  |r| {r['res']:.2e}  {'spurious' if f_ else 'physical'}" +
-                (f"  (fine {r['fine']}: dlam {r['dlam']:.1e} sin {r['sin']:.1e})" if "fine" in r else ""))
-        return rows, C[:, sp_]
-
-    Z = np.eye(n1, dtype=complex)
-    Q = np.zeros((n1, 0), complex)
-    rounds, spaces = [], [("base", Z)]
-    for rnd in range(a.rounds + 1):
-        rows, Csp = reduced_beyn(Z, f"round {rnd}")
-        rounds.append(dict(dim=int(Z.shape[1]), rows=rows))
-        if Csp.shape[1] == 0 or rnd == a.rounds:
-            break
-        Q = np.linalg.qr(np.hstack([Q, Csp]))[0]
-        Z = sla.null_space(Q.conj().T)                                 # orthonormal complement (n1 - k columns)
-        spaces.append((f"defl{rnd + 1}", Z))
-    log(f"deflated {Q.shape[1]} spurious directions in {len(spaces) - 1} rounds")
-
-    # ---- fine grid
-    lo, hi, st = (float(x) for x in a.grid.split(":"))
-    grid = np.round(np.arange(lo, hi + 0.5 * st, st), 6)
-    exact = json.load(open(a.exact_cache)) if os.path.exists(a.exact_cache) else {}
-    tags = [t for t, _ in spaces]
-    out_rows = []
-    for x in grid:
-        E = Ec + x
-        SL, SR = sint(E)
-        B0 = mb.injection(SL)[0]
-        b = np.zeros((dev.n, B0.shape[1]), complex); b[dev.bL] = B0
-        GR = 1j * (SR - SR.conj().T)
-        Tof = lambda X: float(np.real(np.einsum("ic,ij,jc->", X[dev.bR].conj(), GR, X[dev.bR])))
-        A = Ac(E, SL, SR)
-        Ub = np.vstack([Us[s_].conj().T @ b[dev.sb[s_]:dev.sb[s_ + 1]] for s_ in range(len(Us))])
-        row = dict(dE=float(x))
-        key = f"{name}:{a.center:g}:{x:.6f}"
-        if key in exact:
-            row["T_exact"] = exact[key]
-        for t, Zt in spaces:
-            y = Zt @ np.linalg.solve(Zt.conj().T @ A @ Zt, Zt.conj().T @ Ub)
-            row[f"T_{t}"] = Tof(fine_vec_block(Us, y, off))
-        out_rows.append(row)
-        line = f"Ec{x:+.3f}" + (f" exact {row['T_exact']:.6f}" if "T_exact" in row else "")
-        for t in tags:
-            v = row[f"T_{t}"]
-            line += f" | {t}: {v:.6f}" + (f" ({(v - row['T_exact']) / row['T_exact']:+.1e})" if "T_exact" in row else "")
-        log(line)
-    summ = {}
-    if all("T_exact" in r for r in out_rows):
-        for t in tags:
-            e = np.array([abs(r[f"T_{t}"] - r["T_exact"]) / r["T_exact"] for r in out_rows])
-            summ[t] = dict(median=float(np.median(e)), max=float(e.max()), at=float(grid[np.argmax(e)]))
-            log(f"{t}: MS T error median {np.median(e):.1e} max {e.max():.1e} at Ec{grid[np.argmax(e)]:+.3f}")
+        rows, Y = find_spurious(dev, c, a.Ec, Es, st, a.k, a.thr, a.imax)
+    Q, nsp = complement(Sc, Y)
+    log(f"{a.modes}: N {c.N}, {len(rows)} resonances, {Y.shape[1]} spurious vectors, rank {nsp} -> N {Q.shape[1]}; "
+        f"{time.time() - t:.0f} s")
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    json.dump(dict(args=vars(a), N1=N1, ndefl=int(Q.shape[1]), rounds=rounds, rows=out_rows, summary=summ),
-              open(f"{a.out}.json", "w"), indent=1)
-    np.save(f"{a.out}_Q.npy", Q)
-    log(f"-> {a.out}.json")
+    np.savez(fres, rows=rows, Y=Y)
+    Yo = sc_orth(Sc, Y)
+    W = (Sc @ Yo) @ (Sc @ Yo).conj().T
+    etas = [float(x) for x in a.absorb.split(",")] if a.absorb else []
+    ex = json.load(open(a.exact))["E"]
+    n0, n1 = c.off[1], c.off[-2]
+    res = dict(modes=a.modes, inputs=a.inputs, N=c.N, N_defl=int(Q.shape[1]), thr=a.thr, Ec=a.Ec, E={})
+    for dE in grid(a.dE, 0.05):
+        key, E = f"{dE:.4f}", a.Ec + dE
+        SL, SR = dev.sigma(E + 1e-6j)
+        B = dev.inject(SL)
+        GR = 1j * (SR - SR.conj().T)
+        b = np.zeros((dev.n, B.shape[1]), complex); b[dev.bL] = B
+        Tof = lambda x: float(np.real(np.einsum("ic,ij,jc->", x[dev.bR].conj(), GR, x[dev.bR])))
+        Ac = E * Sc - Hc
+        Ac[:n0, :n0] -= c.PL.conj().T @ SL @ c.PL
+        Ac[n1:, n1:] -= c.PR.conj().T @ SR @ c.PR
+        bc = c.restrict(b)
+        x0 = c.prolong(np.linalg.solve(Ac, bc))
+        r = dict(E=E, T_ms=Tof(x0))
+        if not a.no_defl:
+            r["T_defl"] = Tof(c.prolong(Q @ np.linalg.solve(Q.conj().T @ Ac @ Q, Q.conj().T @ bc)))
+        for eta in etas:
+            r[f"T_abs{eta:g}"] = Tof(c.prolong(np.linalg.solve(Ac + 1j * eta * W, bc)))
+        tk = [q for q in r if q.startswith("T_") and q != "T_ms"]
+        if "T_exact" in ex.get(key, {}):
+            Te = ex[key]["T_exact"]; r["T_exact"] = Te
+            r["err"] = r["T_ms"] / Te - 1
+            for q in tk:
+                r["err" + q[1:]] = r[q] / Te - 1
+        log(f"E = Ec{dE:+.3f}: T_exact {r.get('T_exact', float('nan')):.4e}  err MS {r.get('err', float('nan')):+.2e}  "
+            + "  ".join(f"{q[2:]} {r.get('err' + q[1:], r[q]):+.2e}" for q in tk))
+        res["E"][key] = r
+        json.dump(res, open(a.out, "w"), indent=1)
+    log(f"done -> {a.out}")
 
 
 if __name__ == "__main__":

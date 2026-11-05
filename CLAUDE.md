@@ -269,6 +269,14 @@ Per energy E:
   tunnelling paths (user's concern confirmed). Linear-response G at EF = Ec−0.1…+0.1 (kT 25.9 meV) off by +220…+860%
   (best bases) up to 50–300x; above the barrier top errors return to 1e-4–1e-2. Stand-alone MS needs a bias-aware
   basis (or the two-level FGMRES correction) for OFF-state / subthreshold work.
+  Spurious-state fixes on the slab level 2 n400 basis (results_ms/gate_off/{spurious,deflate,enrich}): the OFF-state
+  spikes sit on narrow MS resonances (Ec+0.0598 −5.5e-6i, 0.1694, 0.3599) with fine residual 11–13 eV spread over all
+  slabs; physical resonances 0.2–3 eV (closed MS eigenpairs do not separate: 2–12 eV). Found per 10 meV point with
+  Coarse.ritz (k 12, thr 5 eV): 24–28 (n400), ~50 (slab L1 1e-8). Deflation (`ms_deflate.py`, S_c-complement): gated
+  T 100x too large, flat err 1e-6 → 1e-3. Absorbing iηS_cYY^HS_c: flat err 1e-4…9e-2 (η 1e-3…1e-2), gated worse for
+  η ≥ 1e-2 (up to 1e4x: the nonlocal absorber bridges the barrier). Residual enrichment (`spurious_enrich.py`, slab
+  blocks of the resonance residual appended, 3 rounds): flat band unchanged (2e-6 / 4e-5), gated median 5e-2 → 5e-3–2e-2
+  (raw) but max stays 1.4–230 (block-Jacobi corrected: up to 4e3): every round leaves 7–40 new spurious resonances.
 ## Code state (package `qtx_ms/`; Python 3, numpy, scipy only)
 All modules live in `qtx_ms/`; drivers are run from the repo root as `python -m qtx_ms.<name>`
 (outputs written to the current directory). Package `mgms` renamed `qtx_ms` (distribution `qtx-ms`) on 2026-11-02;
