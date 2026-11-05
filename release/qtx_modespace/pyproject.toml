@@ -1,6 +1,6 @@
 [project]
 name = "qtx-modespace"
-version = "0.2.0"
+version = "0.2.1"
 description = "Mode-space basis for QuaTrEx devices: level-1 (local) and level-2 (global) density-matrix slab or tile modes, spurious lead-band cleanup, transmission check, FGMRES with a CAP-Schwarz smoother"
 readme = "README.md"
 requires-python = ">=3.11"

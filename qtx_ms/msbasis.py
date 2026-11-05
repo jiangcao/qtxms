@@ -118,11 +118,12 @@ def gmres_right(mv, prec, b, x0, tol, maxit):
 
 # ------------------------------------------------------------------ device and leads
 _QTT = None
+QTT_ERROR = ""                      # why qttools_obc() returned None
 
 
 def qttools_obc():
     """(Spectral, Full) from qttools (QuaTrEx), or None when it does not import or runs on cupy."""
-    global _QTT
+    global _QTT, QTT_ERROR
     if _QTT is None:
         _QTT = False
         src = os.environ.get("QTTOOLS_SRC")
@@ -135,9 +136,17 @@ def qttools_obc():
                     from qttools import xp
                     from qttools.boundary_conditions.obc.spectral import Spectral
                     from qttools.nevp import Full
-            except ImportError:
+            except ImportError as e:
+                QTT_ERROR = f"qttools does not import: {e}"
                 continue
+            except SyntaxError as e:     # qttools uses PEP 695 `type X[T] = ...`: Python >= 3.12
+                QTT_ERROR = (f"qttools needs Python >= 3.12 (running {sys.version.split()[0]}): "
+                             f"{e.msg} in {e.filename}:{e.lineno}")
+                break
             _QTT = (Spectral, Full) if xp is np else False
+            QTT_ERROR = "" if _QTT else QTT_ERROR
+            if not _QTT:
+                QTT_ERROR = "qttools runs on cupy (xp is not numpy)"
             break
     return _QTT or None
 
@@ -299,7 +308,7 @@ class Device:
             self.qR = [cut(M, O[tr["lead_right_block"]], dev[self.bR]) for M in (H, S)] + \
                       [cut(M, dev[self.bR], O[tr["lead_right_block"]]) for M in (H, S)]
         elif obc == "qttools":
-            raise RuntimeError("obc='qttools': qttools does not import (install the qtx extra, set QTTOOLS_SRC)")
+            raise RuntimeError(f"obc='qttools': {QTT_ERROR or 'qttools does not import'} (install the qtx extra, set QTTOOLS_SRC)")
 
     sigma_cache = None              # directory: Sigma(z) is read from / written to sig_<Re z>_<Im z>.npz there
                                     # (qsig_... with the injected modes BL, BR for the qttools path)

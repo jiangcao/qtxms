@@ -143,11 +143,12 @@ class FoldedLead:
 
 
 _QTT = None
+QTT_ERROR = ""                      # why qttools_obc() returned None
 
 
 def qttools_obc():
     """(Spectral, Full) from qttools (QuaTrEx), or None when it does not import or runs on cupy."""
-    global _QTT
+    global _QTT, QTT_ERROR
     if _QTT is None:
         _QTT = False
         src = os.environ.get("QTTOOLS_SRC")
@@ -160,9 +161,17 @@ def qttools_obc():
                     from qttools import xp
                     from qttools.boundary_conditions.obc.spectral import Spectral
                     from qttools.nevp import Full
-            except ImportError:
+            except ImportError as e:
+                QTT_ERROR = f"qttools does not import: {e}"
                 continue
+            except SyntaxError as e:     # qttools uses PEP 695 `type X[T] = ...`: Python >= 3.12
+                QTT_ERROR = (f"qttools needs Python >= 3.12 (running {sys.version.split()[0]}): "
+                             f"{e.msg} in {e.filename}:{e.lineno}")
+                break
             _QTT = (Spectral, Full) if xp is np else False
+            QTT_ERROR = "" if _QTT else QTT_ERROR
+            if not _QTT:
+                QTT_ERROR = "qttools runs on cupy (xp is not numpy)"
             break
     return _QTT or None
 
@@ -307,7 +316,9 @@ class Device:
             self.qL = [cut(M, OL, dev[self.bL]) for M in (H, S)] + [cut(M, dev[self.bL], OL) for M in (H, S)]
             self.qR = [cut(M, ORr, dev[self.bR]) for M in (H, S)] + [cut(M, dev[self.bR], ORr) for M in (H, S)]
         elif obc == "qttools":
-            raise RuntimeError("obc 'qttools': qttools does not import (install it or set QTTOOLS_SRC)")
+            raise RuntimeError(f"obc 'qttools': {QTT_ERROR or 'qttools does not import'} (install it or set QTTOOLS_SRC)")
+        elif obc == "auto" and QTT_ERROR and os.environ.get("QTTOOLS_SRC"):
+            log(f"  qttools OBC not used: {QTT_ERROR}")
         log(f"  lead OBC on the real axis: {'qttools spectral OBC' if self.qtt is not None else 'folded lead (decimation) at E + %g i' % self.fallback_eta}")
 
     def uses_qttools(self, z):

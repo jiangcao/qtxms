@@ -12,7 +12,7 @@ the full QTBM system iteratively (`--fgmres`, new in 0.2.0), using flexible GMRE
 mode space as the coarse level.
 
 Dependencies: numpy, scipy, h5py. Optional: qttools from QuaTrEx (real-axis lead OBC, the default when it imports:
-on sys.path or `QTTOOLS_SRC=<quatrex>/src`; needs mpi4py and numba), pypardiso (fast sparse LU for the lead interior
+on sys.path or `QTTOOLS_SRC=<quatrex>/src`; needs Python >= 3.12, mpi4py and numba; without it the folded lead is used), pypardiso (fast sparse LU for the lead interior
 and the exact solve, x86-64), threadpoolctl (`--l1-workers` and `--workers`: BLAS threads per process / window),
 matplotlib (transmission plot).
 
@@ -416,6 +416,13 @@ pure Hf/O. Above that they move into the MoS2 channel near the right oxide end (
 - `--workers` > 1 factors the Schwarz windows in concurrent threads, with BLAS limited to 1 thread inside them
   (threadpoolctl). Concurrent LAPACK calls on a multi-threaded MKL crash (segfault). Without threadpoolctl the
   windows run one after another.
+
+## Release 0.2.1
+
+Tag `qtx_modespace-v0.2.1`. Fix: on Python 3.11 the run stopped with `SyntaxError: invalid syntax` at
+`type NDArray[...]` in `qttools/__init__.py` (qttools uses Python 3.12 syntax, PEP 695), because only `ImportError`
+was caught. `--obc auto` now falls back to the folded lead and logs the reason; `--obc qttools` stops with
+"qttools needs Python >= 3.12". The qttools OBC needs Python >= 3.12; the rest of the package still runs on 3.11.
 
 ## Release 0.2.0
 
