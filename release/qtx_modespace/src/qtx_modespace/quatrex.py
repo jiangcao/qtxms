@@ -7,7 +7,9 @@ Folder layout (as written by deviceBuilder):
     inputs/hamiltonian.h5      group "[0, 0, 0]": coo row / col / data, attrs shape    (eV)
     inputs/overlap.h5          same for S
     inputs/potential.npy       optional, per orbital or per atom (eV); used only with potential=True
-Only the R = [0, 0, 0] block is used (no transverse k).
+All R blocks are summed (Gamma point, kpoint_grid 1 1 1): older deviceBuilder folders fold the transverse images
+into [0, 0, 0], newer ones store them as separate [0, +-1, 0] blocks. Either way H, S couple atoms across the
+transverse faces (detect_periodic, minimum image). No transverse k.
 
 Blocks: the contact lattice vector a (transport axis) defines primitive cells counted from the left contact origin.
 A block is m cells; m defaults to the smallest number with m * a >= the coupling range of H and S. With trim=True,
@@ -39,14 +41,27 @@ def read_lattice(f):
 
 
 def read_h5(f, key="[0, 0, 0]", log=print):
+    """Gamma-point matrix sum_R M_R of all R blocks in the file (QuaTrEx: M(k) = sum_R M_R exp(2 pi i k.R), k = 0 for
+    kpoint_grid 1 1 1). Newer deviceBuilder folders store the transverse images as [0, +-1, 0] blocks instead of
+    folding them into [0, 0, 0]; using [0, 0, 0] alone then gives wrong lead bands."""
     import h5py
     with h5py.File(f) as h:
         keys = list(h.keys())
-        g = h[key]
-        shape = tuple(int(s) for s in g.attrs["shape"])
-        M = sp.coo_matrix((g["data"][()], (g["row"][()], g["col"][()])), shape=shape).tocsr()
-    if keys != [key]:
-        log(f"  {Path(f).name}: blocks {keys}; only {key} used")
+        assert key in keys, f"{f}: no {key} block ({keys})"
+        Ms = {}
+        for k in keys:
+            g = h[k]
+            shape = tuple(int(s) for s in g.attrs["shape"])
+            Ms[k] = sp.coo_matrix((g["data"][()], (g["row"][()], g["col"][()])), shape=shape).tocsr()
+    M = Ms.pop(key)
+    if Ms:
+        pat = M.copy(); pat.data[:] = 1
+        for k, Mk in Ms.items():
+            q = Mk.copy(); q.data[:] = 1
+            log(f"  {Path(f).name}: block {k} nnz {Mk.nnz}, max {abs(Mk).max():.3e}, "
+                f"{pat.multiply(q).nnz} entries shared with {key}; summed (Gamma point)")
+            M = M + Mk
+        M = M.tocsr()
     return M
 
 
@@ -136,7 +151,7 @@ def read_quatrex(folder, cells=None, trim=False, potential=False, nk=41, cache_d
     x0 = float(cL["origin"][ax])
     mid = float(cL.get("mid_gap_energy", 0.0))
     if tuple(dc.get("kpoint_grid", [1, 1, 1])) != (1, 1, 1):
-        log(f"  kpoint_grid {dc['kpoint_grid']}: transverse k not supported, using the [0, 0, 0] block")
+        log(f"  kpoint_grid {dc['kpoint_grid']}: transverse k not supported, using Gamma (sum of all R blocks)")
 
     labels, xyz = read_xyz(root / "inputs" / "structure.xyz")
     lat = read_lattice(root / "inputs" / "structure.xyz")

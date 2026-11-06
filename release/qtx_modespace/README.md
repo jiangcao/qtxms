@@ -408,7 +408,7 @@ pure Hf/O. Above that they move into the MoS2 channel near the right oxide end (
   reproducible: they depend on the eigensolve size and on rounding-level changes of rho. They are harmless for T.
 - Cleanup: on the same 400-mode basis the number of vectors needed varied between 14 and > 150 (not converged)
   between runs that differ only at rounding level, so it is off by default.
-- Only Gamma (no transverse k); no spin handling beyond what is in H, S.
+- Only Gamma (no transverse k; all R blocks of the h5 files are summed); no spin handling beyond what is in H, S.
 - The lead self-energy is a dense Python decimation on the lead faces; for large leads it dominates the run time.
 - The mode-space system is also the coarse level of the iterative solve (`--fgmres`). A GMRES(k) smoother does not
   work on this device (residual 3e-3 -> 2e-4 in 60 iterations, whatever k); the CAP-Schwarz smoother does. Windows
@@ -416,6 +416,16 @@ pure Hf/O. Above that they move into the MoS2 channel near the right oxide end (
 - `--workers` > 1 factors the Schwarz windows in concurrent threads, with BLAS limited to 1 thread inside them
   (threadpoolctl). Concurrent LAPACK calls on a multi-threaded MKL crash (segfault). Without threadpoolctl the
   windows run one after another.
+
+## Release 0.2.2
+
+Tag `qtx_modespace-v0.2.2`. Fix: `read_quatrex` used only the `[0, 0, 0]` block of `hamiltonian.h5` / `overlap.h5`.
+Newer deviceBuilder folders (e.g. the 6 nm MoS2/HfO2 device, 357 120 orbitals) store the transverse periodic images as
+separate `[0, -1, 0]` / `[0, 1, 0]` blocks instead of folding them into `[0, 0, 0]`; dropping them gave wrong lead
+bands and a wrong device H, S. All R blocks are now summed (Gamma point, M = sum_R M_R), as in qtx_ms; each extra block
+is logged with its nnz and overlap with `[0, 0, 0]`. Folders with a single `[0, 0, 0]` block (2808 / 9072 / 21600-atom
+MoS2/HfO2) are unchanged. Caches (`<out>/sigma`, `<out>/level1`, `rho_*.npz`, `eig_*.npz`) are keyed by settings, not by
+H: after an 0.2.1 run on a multi-block folder, use a new `--out` (or delete them).
 
 ## Release 0.2.1
 
