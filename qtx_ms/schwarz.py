@@ -356,6 +356,8 @@ def main():
     p.add_argument("--tol", type=float, default=1e-8, help="block: relative residual per column")
     p.add_argument("--open", default="lu", choices=["lu", "closed"], help="windows at the lead faces: lu (A_jj with "
                    "Sigma, per energy) or closed (deflated eigensolve like the others, Sigma ignored)")
+    p.add_argument("--coarse-eta", type=float, default=0.0, help="coarse solve at E + i eta_c (A_c(z) = z S_c - H_c - "
+                   "U^H Sigma(E) U; the fine A keeps E): damps narrow spurious mode-space resonances; x0 = P_c b with it")
     p.add_argument("--out", help="json (default next to --psi: <psi>_mg.json)")
     a = p.parse_args()
     inp = read_inputs(a.inputs)
@@ -370,8 +372,11 @@ def main():
     n_ex = dens(psi)
     big = n_ex > 1e-3 * n_ex.max()
     SL, SR = dev.sigma(E + 1j * (float(c["eta"]) if "eta" in c else 0.0))
-    Ac = cs.Ac(E, SL, SR)
+    Ac = cs.Ac(E + 1j * a.coarse_eta, SL, SR)
     Pc = lambda r: cs.prolong(Ac.solve(cs.restrict(r)))
+    if a.coarse_eta:
+        x0 = Pc(b)
+        log(f"coarse solve at E + {a.coarse_eta:g} i")
     if a.basis:                                                # tile-built levels instead of the direct basis
         from qtx_ms.vcycle import Levels
         lev = Levels(dev, inp, a.basis)
@@ -484,7 +489,7 @@ def main():
                     for _ in range((a.nu if a.pre is None else a.pre) if St is not None else 0):
                         z = z + a.omega * St(res); res = r - At @ z
                     z = z + Pt(res)
-                    if St is not None:
+                    if St is not None and a.nu > 0:
                         res = r - At @ z
                         for i in range(a.nu):
                             z = z + a.omega * St(res)
@@ -533,7 +538,8 @@ def main():
                 + f"; {time.time() - t:.0f} s")
             runs.append(dict(smoother=tag, nu=a.nu, omega=a.omega, hist=h))
     out = a.out or os.path.splitext(a.psi)[0] + "_mg.json"
-    json.dump(dict(E=E, dE=E - Ec, N=cs.N, width=a.width, overlap=a.overlap, runs=runs), open(out, "w"), indent=1)
+    json.dump(dict(E=E, dE=E - Ec, N=cs.N, width=a.width, overlap=a.overlap, coarse_eta=a.coarse_eta, cap_dE0=a.cap_dE0,
+                   x0=stats(x0, 0), runs=runs), open(out, "w"), indent=1)
     log(f"-> {out}")
 
 
