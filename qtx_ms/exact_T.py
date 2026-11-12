@@ -18,7 +18,12 @@ p.add_argument("--sigma-cache", help="lead self-energy cache (default results_ms
 p.add_argument("--save-psi", metavar="DIR", help="also save psi (device orbitals) per energy to DIR/psi_<E>.npz "
                "(E, psi_m, dev, obc), for qtx_ms.plot_psi --modes")
 p.add_argument("--obc", default="auto", choices=["auto", "qttools", "folded"], help="lead OBC: qttools (QuaTrEx spectral OBC, real E; auto falls back to the folded-lead decimation when it is not available) or mgms")
+p.add_argument("--gpu", action="store_true", help="lead Sigma (folded lead) and the solve on the GPU (cupy; block LU)")
 a = p.parse_args()
+if a.gpu:
+    from qtx_ms import gpu
+    gpu.enable()
+    print(f"backend: {gpu.describe()}", flush=True)
 name = os.path.basename(os.path.normpath(a.inputs))
 scache = a.sigma_cache or os.path.join("results_ms", "sigma", name)
 inp = read_inputs(a.inputs)
@@ -42,20 +47,17 @@ for dE in (float(x) for x in a.dE.split(",")):
     GR = 1j * (SR - SR.conj().T)
     b = np.zeros((dev.n, B.shape[1]), complex)
     b[dev.bL] = B
-    cs = mb.CSolver(dev.A(E, SL, SR))
-    psi = cs.solve(b)
+    psi, res_ex = mb.exact_solve(dev, dev.A(E, SL, SR), b)
     if a.save_psi:
         os.makedirs(a.save_psi, exist_ok=True)
         np.savez(os.path.join(a.save_psi, f"psi_{E:+.8f}.npz"), E=E, psi_m=psi, dev=dev.dev,
                  obc="qttools" if tag.endswith("_qtt") else "folded", eta=1e-6)
     T = float(np.real(np.einsum("ic,ij,jc->", psi[dev.bR].conj(), GR, psi[dev.bR])))
-    print(f"E = Ec {dE:+.3f}: channels L {B.shape[1]} / R {nR}, T = {T:.5f}, residual {cs.res:.1e} "
-          f"(GMRES its {cs.its}, perturbed pivots {cs.npert}); sigma {ts:.0f} s, total {time.time() - t:.0f} s",
+    print(f"E = Ec {dE:+.3f}: channels L {B.shape[1]} / R {nR}, T = {T:.5f}, residual {res_ex:.1e}; sigma {ts:.0f} s, total {time.time() - t:.0f} s",
           flush=True)
     res = json.load(open(fjs)) if os.path.exists(fjs) else {"E": {}}
     if res.get("Ec", Ec) != Ec:
         raise SystemExit(f"{fjs}: written with Ec {res['Ec']}, this run uses {Ec}")
     res["Ec"] = Ec
-    res["E"][f"{dE:.4f}"] = dict(E=E, channels=int(B.shape[1]), T_exact=T, res_exact=cs.res)
+    res["E"][f"{dE:.4f}"] = dict(E=E, channels=int(B.shape[1]), T_exact=T, res_exact=res_ex)
     json.dump(res, open(fjs, "w"), indent=1)
-    cs.free()

@@ -134,7 +134,13 @@ p.add_argument("--exact-from", help="json with T_exact per dE (results_ms/exact/
                "solve at the energies it has (test energies Ec_lead + dE must match its Ec)")
 p.add_argument("--inj-tol", type=float, default=1e-4, help="Gamma_L eigenvalue cut [eV] for injection")
 p.add_argument("--obc", default="auto", choices=["auto", "qttools", "folded"], help="lead OBC on the real axis: qttools (QuaTrEx spectral OBC; auto falls back to the folded lead when it does not import) or mgms (folded lead); --exact-from values must come from the same OBC")
+p.add_argument("--gpu", action="store_true", help="dense parts on the GPU (cupy): folded-lead Sigma, dense tile rho "
+               "(contour points serial, --tile-pts-workers ignored), level-2 contour rho")
 a = p.parse_args()
+if a.gpu:
+    from qtx_ms import gpu
+    gpu.enable()
+    print(f"backend: {gpu.describe()}", flush=True)
 
 name = os.path.basename(os.path.normpath(a.inputs)) + ("_l2direct" if a.direct_l2 else "_nocore" if a.no_cores else "")
 assert not (a.enrich and a.direct_l2), "--enrich needs a level-1 basis"

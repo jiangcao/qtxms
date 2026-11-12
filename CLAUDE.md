@@ -318,6 +318,74 @@ Per energy E:
   1e-6 feast M400 2.2e-4 / 2.5e-2 vs rf M400 7.5e-5 / 3.3e-4. Cost: 24 LUs 5.9e13 flops (332 s summed), solves
   1.8e10 flops per column (dm 3483 columns 6.3e13, 296 s; M 3000 257–286 s); the range finder at M 900 saves ~75%
   of the solves (≈ 40% of the pass). Keep the range finder (Ω on P); FEAST probes bring nothing.
+- GPU backend (cupy; `qtx_modespace.gpu` / `qtx_ms.gpu`, `--gpu` or QTX_MODESPACE_GPU=1; plan sessions/2026-11-06-gpu-cupy-plan.txt):
+  folded-lead Σ + lead edges, level-1 local ρ (blocks assembled on the device, Schur), level-2 recursion, exact solve
+  (block-tridiagonal LU), Schwarz window LUs + block FGMRES. Numpy results out of every module; no fork in GPU mode.
+  Hosts: mont-fort15 x86 P100 16 GB (`.venv`, cupy-cuda12x) and attelas2 aarch64 GH200 96 GB, 72 cores (`.venv-aarch64`
+  built with /usr/local/anaconda3 python, cupy-cuda13x, CUDA_PATH=/usr/local/cuda-13.3, OpenBLAS; no pypardiso / qttools
+  / uv / git there -> folded lead at E + 1e-6 i, 19-24 channels). Release tests on attelas2: 40 pass (CPU + GPU).
+  2808a workflow A + D on the GH200 (results_ms/gpu/run_wf_gpu.sh, wf_gh200/): slab level 1 1e-8 154 s total (local ρ
+  5 / 96 incl. 24 Σ / 15 / 4 s vs CPU 116 / 708 / 612 / 67 s), same N1 2373; Σ real axis 4 s, exact solve 2 s (CPU
+  150-180 s), window factor 2 s (24 s), FGMRES two-level 4 / 5 / 7 s (24-47 its), one-level 4 / 5 / 8 s (46-86 its), T err
+  ≤ 1.5e-10. P100: slab 0 local ρ 92 s incl. Σ (2.4-4.1 s per point), = CPU to 7e-14. "max channel" ψ errors of 3-99
+  with the folded lead are the η channels (norm 1e-4 of the 2 physical ones).
+  9072a (72 672 device orbitals, 10 slabs, wf_gh200_9072a/, before the projection port): slab level 1 1e-8 in 366 s
+  (interior slabs embedding ~20 400, 23-25 s each), N1 8053 (925-968 per interior slab); Σ 4 s, exact 7 s per energy;
+  MS T err 1.2e-4 / 1.7e-5 at Ec+0.05 / 0.15; FGMRES factor 6-7 s (19 windows), two-level 40-46 / 49-57 / 68-75 its,
+  24 / 24 / 34 s, T err 1e-12; one-level 82-93 / 85-100 / 106-128 its, 22 / 22 / 32 s, T err ≤ 1.1e-10 (run totals
+  321 vs 188 s: the two-level run paid ~150 s of CPU projection).
+  CPU leftovers in GPU mode (cProfile, results_ms/gpu/prof/, 2808a; step A 128 s with Σ cached, D 88 s): Coarse
+  projection U^H H U, U^H S U (scipy csr x dense, 1 thread) 32 s per run (9072a, N1 8053: ~150 s), injection eigh of
+  Γ_L 2.6 s per energy, psi_errors 1.9 s per energy, mode / cache file writes ~8 s, level-1 embedding slicing + cache
+  ~9 s. Projection (`core._slab_blocks_gpu`, cupyx SpMM) and injection (core.eigh) moved to the GPU 2026-11-10: D
+  85 → 55 s, same its / T. cProfile's 110 s in matplotlib text metrics is an artifact (wall time unchanged).
+  Rerun 2026-11-10 with prep + GPU projection / injection + plots moved out of the run (`python -m qtx_modespace.plot
+  OUT...`, cli writes numbers only; first-run logs in results_ms/gpu/run1_logs/), everything recomputed, same N1 / its /
+  T: 2808a prep 24 s, A 219 → 162 s, D two-level 85 → 40 s, one-level 83 → 40 s, whole script 4.5 min; 9072a prep 54 s
+  (1.32 GB), A 581 → 400 s, D two-level 321 → 144 s, one-level 188 → 139 s, whole script 12.4 min.
+- Prepared inputs (release `qtx_modespace.prep`, `quatrex.save_inputs / load_inputs`, console script qtx-modespace-prep;
+  user request 2026-11-10): `python -m qtx_modespace.prep DEVICE --out PREP [--cells --trim --potential --gpu
+  --sigma-cache]` writes prep.json (options, source file size / mtime, meta), arrays.npz, H.npz / S.npz (upper
+  triangle, uncompressed), lead.npz; `read_quatrex(PREP)` (so cli, obc_eig) loads it instead of the QuaTrEx folder.
+  2808a: 0.53 GB, load 0.9 s vs 8 s read + lead edges (255 s on the aarch64 OpenBLAS CPU, 15-30 s GPU), H, S, lead,
+  index arrays bit-identical (edges differ 1e-13 GPU vs CPU: cache keys round to 8 digits). Conflicting --cells /
+  --trim / --potential stop the run. to_quatrex still needs the QuaTrEx folder. Workflow scripts prepare into $OUT/prep.
+- 6 nm MoS2/HfO2 (43 200 atoms, 344 640 device orbitals, 22 slabs ≤ 16 858, lead cell 6240; deviceBuilder folder with
+  separate [0,±1,0] blocks -> release 0.2.2 fix), GH200, folded lead at E + 1e-6 i (/scratch/jiacao/mg_modespace/6nm/):
+  prep 177 s (6.86 GB); slab level 1 CAP+OBC 1e-8 N1 38 054 (1843–1897 per interior slab, 110–130 s per slab,
+  embeddings ~40 900), 2670 s; tile level 1 CAP+OBC 1e-6 (4 y strips x 10 Å x pieces, 176 tiles) N1 54 568, 2586 s.
+  Device Ec above the lead Ec: T_exact 1.17e-8 / 0.0994 / 0.907 / 4.40 at Ec+0.02 / 0.05 / 0.15 / 0.3 (37–62 channels).
+  Slab L1 1e-8 MS T err +7.3e-3 / −6.6e-4 / −1.4e-4 / −8.7e-5; best-in-U psi 2.0–2.6e-4. Per energy Σ 9–11 s, MS 17–19 s,
+  exact 137–163 s (residual ≤ 6e-14). The dense GPU block LU needs ~417 GB -> `core.StreamBlockTridiag` (release 0.3.0,
+  automatic when 5 Σn_s² x 16 B > 0.7 x free GPU memory): blocks densified one at a time, couplings sparse on the
+  device, LU factors on the host (~97 GB), matches the dense LU to 2e-12 on 2808a. Memory estimate
+  (results_ms/gpu/6nm/mem_estimate.log): FGMRES 16 Å windows unsplit fail ("window cores must partition the device"),
+  y split 2 / 4: 86 / 172 windows, 59 / 37 GB complex64 LUs; Krylov 10.3 MB per column and iteration.
+- Release 0.3.0 (2026-11-11, built on attelas2, not yet tagged: no git there): GPU backend, streaming exact solve,
+  prep, plot, `scripts/setup_env.sh` (venv + cupy matching the driver's CUDA major + VENV/bin/qtx_env.sh; 46 tests pass
+  on the GH200), `examples/workflow.sh` (generic CPU / GPU steps A-E + plots; mos2_hfo2_workflow.sh calls it; 2808a
+  GPU A + D reproduces N1 2373, FGMRES 24–47 / 46–86 its). dist/ wheel + sdist + SHA256SUMS. Rebuilt 2026-11-12 (still
+  0.3.0, never tagged) with level 2 on level 1 (`--l1-modes`), `--cap-lu-host`, `--fgmres-log`, Alps scripts, atomic
+  caches, clean.py multi-axis minimum image; README notes the 6 nm two-level stall. 48 tests pass (source tree and the
+  installed wheel). Build on attelas2 with /usr/sepp/bin removed from PATH: hatchling calls git, the broken SEPP git
+  wrapper drops a 0-byte garbage-named file into the release folder that ends up in the sdist (it was in the first
+  0.3.0 sdist).
+- 6 nm two-level FGMRES stall (2026-11-11/12, results_ms/gpu/6nm/, scripts run_*_t015*.sh, coarse_*.py, figure
+  figures/coarse_mode_6nm_t015.png): CAP-Schwarz 16 Å + y split 4 (tov 2.5 or 10.7) two-level stalls at Ec+0.02 / 0.15
+  with slab level 2 on tile level 1 (E_L2_c1e-8) and slab level 1 1e-8 (A_slab_obc); one-level converges slowly (43
+  x-windows, T = 0 after 40 its). 2808a with the same splits converges (y split 4 tov 2.5 slow, 150 its). Cause: Galerkin
+  A_c has a dense set of almost real spurious eigenvalues (|mu| 5e-5, Im 1e-7, spacing ~5e-4 eV, fine residual 6.7 eV)
+  = cut states on the slab interfaces (mostly HfO2; tile y cut for E_L2); the MS error is this state. 1/sigma_min(A_c)
+  1.6e4 vs ~200 on 2808a; |(I − A P_c) r|/|r| 100–360 vs 10–17. Coarse shift: 1e-3 still stalls, 1e-2 brings the
+  amplification to 2808a level (12–13) but FGMRES still stalls (median 0.86 → 0.13 in 40 its). Higher occupation cut
+  is non-monotonic (|A_c^-1| 1.6e4 / 1.5e4 / 2.8e3 / 3.4e4 / 634 at 1e-8 … 1e-4): not a low-occupation effect; cut 1e-4
+  (amplification 8–21) also stalls. Next idea (user, 2026-11-12): overlapping / partition-of-unity smoothed basis
+  vectors across the slab faces (GenEO-type), prototype on 2808a first.
+- CSCS Alps (plan sessions/2026-11-11-alps-env-plan.txt; not yet run there): install into the QuaTrEx uenv venv
+  (prgenv-gnu/26.3, cupy-cuda13x, mpi4py on cray-mpich) with scripts/setup_env.sh (reuses the venv's cupy / mpi4py,
+  CUDA from $CUDA_HOME, kernel caches on $SCRATCH); job templates scripts/alps/{gpu_bind.sh,basis,sweep,exact}.sbatch
+  (1 process per GPU, --l1-only split of the basis build, energy split; exact = 1 task per node, --mem=0). Shared cache
+  writes (Sigma, level-1 blocks, lead edges) are atomic (temp file + os.replace).
 ## Code state (package `qtx_ms/`; Python 3, numpy, scipy only)
 All modules live in `qtx_ms/`; drivers are run from the repo root as `python -m qtx_ms.<name>`
 (outputs written to the current directory). Package `mgms` renamed `qtx_ms` (distribution `qtx-ms`) on 2026-11-02;

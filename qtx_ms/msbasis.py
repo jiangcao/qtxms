@@ -36,6 +36,7 @@ except ImportError:          # pragma: no cover
     pypardiso = None
 
 from qtmode.lead_ms import face_surface_gfs_small
+from qtx_ms import gpu
 
 
 def log(*a):
@@ -126,6 +127,9 @@ def qttools_obc():
     global _QTT, QTT_ERROR
     if _QTT is None:
         _QTT = False
+        # qttools picks its array module from QTX_ARRAY_MODULE and defaults to cupy when cupy is installed (the gpu
+        # extra); the OBC wrapper below works on numpy arrays, so ask for numpy unless the user set it explicitly
+        os.environ.setdefault("QTX_ARRAY_MODULE", "numpy")
         src = os.environ.get("QTTOOLS_SRC")
         for path in (None, src) if src else (None,):
             if path and path not in sys.path:
@@ -366,8 +370,9 @@ class Device:
         if self.leadR is not self.lead:
             gR = self.leadR.surface_gfs(z)[1]
         out = []
+        a = gpu.asarray                                       # GPU mode: the dense products on the device too
         for g, (Hld, Sld, Hdl, Sdl) in ((gL, self.cL), (gR, self.cR)):
-            out.append((z * Sdl - Hdl) @ g @ (z * Sld - Hld))
+            out.append(gpu.asnumpy((z * a(Sdl) - a(Hdl)) @ a(g) @ (z * a(Sld) - a(Hld))))
         return tuple(out), None
 
     def A(self, E, SL, SR):
@@ -384,24 +389,25 @@ def sancho_both(A00, A01, A10, tol=1e-11, maxit=300):
     """Lopez-Sancho decimation of the chain with on-site A00 = z S00 - H00 and couplings A01 (cell n ->
     n+1), A10 (n+1 -> n), general (complex, non-Hermitian at complex z). Returns the surface Green's
     functions gR of the right-extending chain (its first cell) and gL of the left-extending chain (its
-    last cell), both from one decimation."""
+    last cell), both from one decimation. numpy or cupy arrays (the result lives where the input does)."""
+    xp = gpu.xp_of(A00)
     e = A00.astype(complex)
     esR, esL = e.copy(), e.copy()
     a, b = A01.astype(complex), A10.astype(complex)
     n = len(e)
     for it in range(maxit):
-        X = sla.solve(e, np.hstack([a, b]), check_finite=False)
+        X = gpu.solve(e, xp.hstack([a, b]))
         ga, gb = X[:, :n], X[:, n:]
         agb, bga = a @ gb, b @ ga
         esR -= agb
         esL -= bga
         e -= agb + bga
         a, b = -a @ ga, -b @ gb
-        if max(np.abs(a).max(), np.abs(b).max()) < tol:
+        if max(float(xp.abs(a).max()), float(xp.abs(b).max())) < tol:
             break
     else:
         log(f"  sancho_both: no convergence after {maxit} steps")
-    return sla.inv(esL, check_finite=False), sla.inv(esR, check_finite=False)
+    return gpu.inv(esL), gpu.inv(esR)
 
 
 class FoldedLead:
@@ -437,6 +443,8 @@ class FoldedLead:
         self.H01, self.S01 = H01[F][:, F].toarray(), S01[F][:, F].toarray()
 
     def surface_gfs(self, z):
+        if gpu.on and not self.fast:
+            return self._surface_gfs_gpu(z)
         Aeff = z * self.SFF - self.HFF
         if len(self.I):                             # no interior when H01 couples the whole cell
             cs = CSolver(z * self.SII - self.HII)
@@ -451,6 +459,22 @@ class FoldedLead:
         A01 = z * self.S01 - self.H01
         A10 = z * self.S01.conj().T - self.H01.conj().T
         return sancho_both(Aeff, A01, A10)
+
+    def _surface_gfs_gpu(self, z):
+        """General path on the GPU: dense LU of the interior, decimation on the device; numpy results."""
+        d = getattr(self, "_dev", None)
+        if d is None:
+            d = self._dev = {k: gpu.asarray(getattr(self, k)) for k in
+                             ("HFF", "SFF", "HFI", "SFI", "HIF", "SIF", "H01", "S01")}
+            d["HII"], d["SII"] = gpu.csr(self.HII, np.complex128), gpu.csr(self.SII, np.complex128)
+        Aeff = z * d["SFF"] - d["HFF"]
+        if len(self.I):
+            lu = gpu.lu_factor((z * d["SII"] - d["HII"]).toarray())
+            X = gpu.lu_solve(lu, (z * d["SIF"] - d["HIF"]).astype(complex))
+            del lu
+            Aeff = Aeff - (z * d["SFI"] - d["HFI"]) @ X
+        gL, gR = sancho_both(Aeff, z * d["S01"] - d["H01"], z * d["S01"].conj().T - d["H01"].conj().T)
+        return gpu.asnumpy(gL), gpu.asnumpy(gR)
 
 
 def injection(SL, tol=1e-4):
@@ -744,13 +768,75 @@ def tile_rho_contour(inp, geo, tree, atoms, contour, d_emb=12.0, d_cap=3.0, eta_
     r = m if rhs is None else rhs.shape[1]
     cdt = np.complex64 if env_prec == "single" else np.complex128
 
+    def gpu_blocks(e):
+        """Device copies of one embedding, made once: E / P blocks of S and K = H - i W as CSR, and where the lead-face
+        orbitals sit in E and P (per point only z S - K is formed on the device and Sigma(z) scattered into the
+        blocks; assembling and slicing the sparse A on the host cost more than the factorization)."""
+        if "_gpu" not in e:
+            n, pidx = e["He"].shape[0], e["pidx"]
+            eidx = np.setdiff1d(np.arange(n), pidx)
+            K, Sc = (e["He"] - 1j * e["W"]).tocsr(), sp.csr_matrix(e["Se"])
+            sub = (("E", eidx), ("P", pidx))
+            gS = {a + b: gpu.csr(Sc[i][:, j], np.complex128) for a, i in sub for b, j in sub}
+            gK = {a + b: gpu.csr(K[i][:, j], np.complex128) for a, i in sub for b, j in sub}
+            faces = []
+            for pos, fi in (e.get("faces") or [] if obc is not None else []):
+                pos, fi = np.asarray(pos, int), np.asarray(fi, int)
+                d = {}
+                for a, i in sub:
+                    loc = np.full(n, -1)
+                    loc[i] = np.arange(len(i))
+                    d[a] = (gpu.cp.asarray(loc[pos][loc[pos] >= 0]), gpu.cp.asarray(fi[loc[pos] >= 0]))
+                faces.append(d)
+            e["_gpu"] = gS, gK, faces, any(len(f[a][0]) for f in faces for a in "EP")
+        return e["_gpu"]
+
+    def point_gpu(k, e, RP):
+        cp, pidx, z = gpu.cp, e["pidx"], zs[k]
+        if gpp == "full":
+            A = (z * e["Se"] - e["He"] + 1j * e["W"] + _sig_emb(obc, e, z)).tocsr()
+            R = cp.zeros((A.shape[0], r), complex)
+            R[cp.asarray(pidx)] = cp.asarray(RP)
+            return gpu.lu_solve(gpu.lu_factor(gpu.csr_dense(A, np.complex128)), R)[cp.asarray(pidx)]
+        gS, gK, faces, has_sigma = gpu_blocks(e)
+        Sg = [cp.asarray(M) for M in obc.sigma(z)] if has_sigma else []
+
+        def block(ab):                                              # dense A_ab = z S - K - Sigma on the device
+            M = (z * gS[ab] - gK[ab]).toarray()
+            for f, G in zip(faces, Sg):
+                (ro, fr), (co, fc) = f[ab[0]], f[ab[1]]
+                if len(ro) and len(co):
+                    ix = cp.ix_(ro, co)
+                    M[ix] = M[ix] - G[cp.ix_(fr, fc)]
+            return M
+
+        AEE, AEP = block("EE"), block("EP")
+        if env_prec == "single":
+            lu = gpu.lu_factor(AEE.astype(cdt))
+            X = gpu.lu_solve(lu, AEP.astype(cdt)).astype(complex)
+            for _ in range(refine):
+                X += gpu.lu_solve(lu, (AEP - AEE @ X).astype(cdt))
+        else:
+            lu = gpu.lu_factor(AEE)
+            X = gpu.lu_solve(lu, AEP)
+        del lu, AEE, AEP
+        Sp = block("PP") - (z * gS["PE"] - gK["PE"]) @ X            # A_PE X: sparse part, then its Sigma part
+        for f, G in zip(faces, Sg):
+            (ro, fr), (co, fc) = f["P"], f["E"]
+            if len(ro) and len(co):
+                Sp[ro] = Sp[ro] + G[cp.ix_(fr, fc)] @ X[co]
+        del X
+        return cp.linalg.inv(Sp) if rhs is None else gpu.solve(Sp, cp.asarray(RP))
+
     def point(k):
         z, e = zs[k], embs[dz[k]]
         He, Se, W, pidx = e["He"], e["Se"], e["W"], e["pidx"]
         n = He.shape[0]
-        A = (z * Se - He + 1j * W + _sig_emb(obc, e, z)).tocsr()
         dense = (He + Se).nnz > dense_fill * n * n and n <= dense_max
         RP = np.eye(m, dtype=complex) if rhs is None else rhs.astype(complex)
+        if gpu.on and dense:
+            return point_gpu(k, e, RP)
+        A = (z * Se - He + 1j * W + _sig_emb(obc, e, z)).tocsr()
         if gpp == "full":
             R = np.zeros((n, r), complex)
             R[pidx] = RP
@@ -783,13 +869,18 @@ def tile_rho_contour(inp, geo, tree, atoms, contour, d_emb=12.0, d_cap=3.0, eta_
         return np.linalg.inv(Sp) if rhs is None else sla.solve(Sp, RP, check_finite=False)
 
     def run(ks):
-        acc = np.zeros((m, r), complex)
+        acc = (gpu.cp if gpu.on else np).zeros((m, r), complex)
         for k in ks:
             acc += point(k) * (-1j * rr * np.exp(1j * th[k]) * wq[k])
-        return acc
+        return gpu.asnumpy(acc)
 
     t0 = time.time()
-    if workers <= 1:
+    if gpu.on:                                    # no fork after CUDA initialization: points one after another
+        acc = run(range(len(zs)))
+        for e_ in embs.values():
+            e_.pop("_gpu", None)
+        gpu.free()
+    elif workers <= 1:
         if threads:
             from threadpoolctl import threadpool_limits
             with threadpool_limits(threads):
@@ -1556,11 +1647,15 @@ def rho_contour(dev, blk, PL, PR, mu1, mu2, npts, log=log):
     x, w = np.polynomial.legendre.leggauss(npts)
     th, w = 0.5 * np.pi * (x + 1), 0.5 * np.pi * w
     acc = [np.zeros(h.shape, complex) for h in blk["HD"]]
+    xp = gpu.cp if gpu.on else np                 # GPU: blocks and recursion on the device, acc on the host
+    if gpu.on:
+        blk = {k: [xp.asarray(M) for M in L] for k, L in blk.items()}
+        PL, PR = xp.asarray(PL), xp.asarray(PR)
     t0 = time.time()
     for ip, (t_, w_) in enumerate(zip(th, w)):
         z = c + r * np.exp(1j * t_)
         dz = -1j * r * np.exp(1j * t_) * w_
-        SL, SR = dev.sigma(z)
+        SL, SR = (xp.asarray(x_) for x_ in dev.sigma(z))
         D = [z * blk["SD"][s] - blk["HD"][s] for s in range(ns)]
         D[0] = D[0] - PL.conj().T @ SL @ PL
         D[-1] = D[-1] - PR.conj().T @ SR @ PR
@@ -1568,14 +1663,18 @@ def rho_contour(dev, blk, PL, PR, mu1, mu2, npts, log=log):
         Lo = [z * blk["SU"][s].conj().T - blk["HU"][s].conj().T for s in range(ns - 1)]
         gl = [None] * ns
         for s in range(ns):
-            gl[s] = np.linalg.inv(D[s] if s == 0 else D[s] - Lo[s - 1] @ gl[s - 1] @ Up[s - 1])
+            gl[s] = xp.linalg.inv(D[s] if s == 0 else D[s] - Lo[s - 1] @ gl[s - 1] @ Up[s - 1])
+            D[s] = None
         G = gl[-1]
-        acc[-1] += G * dz
+        acc[-1] += gpu.asnumpy(G) * dz
         for s in range(ns - 2, -1, -1):
             G = gl[s] + gl[s] @ Up[s] @ G @ Lo[s] @ gl[s]
-            acc[s] += G * dz
+            gl[s + 1] = None
+            acc[s] += gpu.asnumpy(G) * dz
         if ip % 6 == 5:
             log(f"    contour point {ip + 1}/{npts}, {time.time() - t0:.0f} s")
+    del blk
+    gpu.free()
     return [-((a - a.conj().T) / 2j) / np.pi for a in acc]
 
 
@@ -1595,3 +1694,48 @@ def level2_basis(rho, thr=1e-5, S=None):
         X = sla.solve_triangular(Lc.conj().T, Y[:, lam > thr * lam[-1]][:, ::-1], lower=False)
         V.append(np.linalg.qr(X)[0])
     return V
+
+
+# ------------------------------------------------------------------ exact solve on the GPU
+def exact_solve(dev, A, B, n_ref=2, tol=1e-12):
+    """A X = B for the sparse device matrix A (numpy in / out), returns (X, max relative residual).
+    CPU: CSolver. GPU (gpu.on): dense block-tridiagonal LU over the slabs on the device (left-to-right elimination,
+    Dt_{s+1} = D_{s+1} - A_{s+1,s} Dt_s^-1 A_{s,s+1}) + n_ref refinement steps with the sparse A on the device."""
+    if not gpu.on:
+        cs = CSolver(A, n_ref=n_ref, tol=tol)
+        X = cs.solve(B)
+        cs.free()
+        return X, cs.res
+    cp, b, ns = gpu.cp, dev.sb, len(dev.ns)
+    A = sp.csr_matrix(A)
+    blk = lambda i, j: gpu.csr_dense(A[b[i]:b[i + 1], b[j]:b[j + 1]], np.complex128)
+    Up = [blk(s, s + 1) for s in range(ns - 1)]
+    lu, L = [], []
+    Dt = blk(0, 0)
+    for s in range(ns):
+        lu.append(gpu.lu_factor(Dt))
+        if s < ns - 1:
+            Lt = gpu.lu_solve(lu[s], blk(s + 1, s).T, trans=1).T          # A_{s+1,s} Dt_s^-1
+            L.append(Lt)
+            Dt = blk(s + 1, s + 1) - Lt @ Up[s]
+
+    def solve(R):
+        Y = [R[b[s]:b[s + 1]] for s in range(ns)]
+        for s in range(1, ns):
+            Y[s] = Y[s] - L[s - 1] @ Y[s - 1]
+        X = [None] * ns
+        X[-1] = gpu.lu_solve(lu[-1], Y[-1])
+        for s in range(ns - 2, -1, -1):
+            X[s] = gpu.lu_solve(lu[s], Y[s] - Up[s] @ X[s + 1])
+        return cp.concatenate(X)
+    Ad = gpu.csr(A, np.complex128)
+    Bd = cp.asarray(np.asarray(B).reshape(len(B), -1), dtype=complex)
+    X = solve(Bd)
+    for _ in range(n_ref):
+        X += solve(Bd - Ad @ X)
+    bn = cp.maximum(cp.linalg.norm(Bd, axis=0), 1e-300)
+    res = float((cp.linalg.norm(Bd - Ad @ X, axis=0) / bn).max()) if Bd.shape[1] else 0.0
+    X = gpu.asnumpy(X)
+    del lu, L, Up, Ad, Bd, Dt
+    gpu.free()
+    return (X.reshape(np.shape(B)) if np.ndim(B) == 1 else X), res

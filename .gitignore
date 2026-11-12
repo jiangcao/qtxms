@@ -12,3 +12,4 @@ examples/
 !release/qtx_modespace/examples/
 release/qtx_modespace/data/
 envs/quatrex/.venv/
+.venv-aarch64/
