@@ -361,11 +361,11 @@ Per energy E:
   device, LU factors on the host (~97 GB), matches the dense LU to 2e-12 on 2808a. Memory estimate
   (results_ms/gpu/6nm/mem_estimate.log): FGMRES 16 Å windows unsplit fail ("window cores must partition the device"),
   y split 2 / 4: 86 / 172 windows, 59 / 37 GB complex64 LUs; Krylov 10.3 MB per column and iteration.
-- Release 0.3.0 (2026-11-11, built on attelas2, not yet tagged: no git there): GPU backend, streaming exact solve,
+- Release 0.3.0 (2026-11-11, built on attelas2; committed f77cd83 and tagged qtx_modespace-v0.3.0 on 2026-11-12 from mont-fort15): GPU backend, streaming exact solve,
   prep, plot, `scripts/setup_env.sh` (venv + cupy matching the driver's CUDA major + VENV/bin/qtx_env.sh; 46 tests pass
   on the GH200), `examples/workflow.sh` (generic CPU / GPU steps A-E + plots; mos2_hfo2_workflow.sh calls it; 2808a
   GPU A + D reproduces N1 2373, FGMRES 24–47 / 46–86 its). dist/ wheel + sdist + SHA256SUMS. Rebuilt 2026-11-12 (still
-  0.3.0, never tagged) with level 2 on level 1 (`--l1-modes`), `--cap-lu-host`, `--fgmres-log`, Alps scripts, atomic
+  0.3.0) with level 2 on level 1 (`--l1-modes`), `--cap-lu-host`, `--fgmres-log`, Alps scripts, atomic
   caches, clean.py multi-axis minimum image; README notes the 6 nm two-level stall. 48 tests pass (source tree and the
   installed wheel). Build on attelas2 with /usr/sepp/bin removed from PATH: hatchling calls git, the broken SEPP git
   wrapper drops a 0-byte garbage-named file into the release folder that ends up in the sdist (it was in the first
