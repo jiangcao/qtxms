@@ -41,10 +41,11 @@ import argparse, json, os, time, tomllib
 import numpy as np
 
 from .quatrex import read_quatrex, lead_bands
-from .core import Device, Coarse, CSolver, injection, rho_contour, top_modes, log
+from . import gpu
+from .core import Device, Coarse, exact_solve, injection, rho_contour, top_modes, eigh, log
 from .clean import LeadCell, clean_slab
 from .level1 import build_level1, partition
-from .schwarz import CapSchwarz, FastOp, fgmres_block, two_level
+from .schwarz import CapSchwarz, fgmres_block, operator, two_level
 
 
 def energies(spec):
@@ -52,33 +53,6 @@ def energies(spec):
         lo, hi, st = (float(x) for x in spec.split(":"))
         return list(np.round(np.arange(lo, hi + 0.5 * st, st), 6))
     return [float(x) for x in spec.split(",")]
-
-
-def plot(fpng, res, title):
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:          # pragma: no cover
-        return
-    k = sorted(res, key=float)
-    d = np.array([float(x) for x in k])
-    Tms = np.array([res[x]["T_ms"] for x in k])
-    Tex = np.array([res[x].get("T_exact", np.nan) for x in k])
-    ex = np.isfinite(Tex).any()
-    fig, axs = plt.subplots(2 if ex else 1, 1, figsize=(7, 6.5 if ex else 4), sharex=True, squeeze=False)
-    a1 = axs[0, 0]
-    if ex:
-        a1.plot(d, Tex, "k-", lw=1.5, label="exact")
-    a1.plot(d, Tms, "o", ms=3.5, color="#d9622b", label="mode space")
-    a1.set_ylabel("T"); a1.legend(frameon=False); a1.set_title(title, fontsize=10); a1.grid(alpha=0.3)
-    if ex:
-        ok = np.isfinite(Tex) & (Tex > 1e-8)
-        a2 = axs[1, 0]
-        a2.semilogy(d[ok], np.abs(Tms[ok] - Tex[ok]) / Tex[ok], "o-", ms=3, lw=0.8, color="#2b6cd9")
-        a2.set_ylabel("|T_MS - T| / T"); a2.grid(alpha=0.3)
-    axs[-1, 0].set_xlabel("E - Ec (eV)")
-    fig.tight_layout(); fig.savefig(fpng, dpi=130); plt.close(fig)
 
 
 def slab_modes(a, dev, mu, npts, neig, nmodes):
@@ -122,12 +96,14 @@ def level1_basis(a, inp, dev, Ec):
     npts = a.l1_npts or int(str(a.npts).split(",")[0])
     d_cap, eta_cap = (float(x) for x in a.l1_cap.split(","))
     cache = None if a.l1_cache == "none" else (a.l1_cache or os.path.join(a.out, "level1"))
-    kw = dict(kind=a.l1_partition, tile_orbs=a.tile_orbs, xsplit=a.tile_xsplit, boundary=a.l1_boundary,
+    tsplit = [int(x) for x in a.tile_split.split(",")] if a.tile_split else None
+    kw = dict(kind=a.l1_partition, tile_orbs=a.tile_orbs, xsplit=a.tile_xsplit, tsplit=tsplit, xlen=a.tile_xlen,
+              dense_max=a.l1_dense_max, boundary=a.l1_boundary,
               d_emb=a.l1_emb, d_cap=d_cap, eta_cap=eta_cap, cut=a.l1_cut, store_cut=a.l1_store_cut, cache=cache,
               gpp=a.l1_gpp, env_prec=a.l1_env_prec, workers=a.l1_workers, threads=a.l1_threads or None)
     if a.l1_only:
         k, n = (int(x) for x in a.l1_only.split(","))
-        nb = len(partition(inp, dev, a.l1_partition, a.tile_orbs, a.tile_xsplit))
+        nb = len(partition(inp, dev, a.l1_partition, a.tile_orbs, a.tile_xsplit, tsplit, a.tile_xlen))
         mine = {i for i in range(nb) if i % n == k}
         build_level1(inp, dev, (w[0], w[1], npts), only=mine, **kw)
         return None
@@ -146,6 +122,8 @@ def build_basis(a, inp, dev, Ec, t0):
                     occupations={s: dict(first=float(o[0]), last=float(o[-1])) for s, o in enumerate(occ)},
                     clean={}, args=vars(a))
         return finish_basis(a, inp, dev, Ec, t0, V, eig, info)
+    if a.l1_modes:
+        return level2_on_level1(a, inp, dev, Ec, t0)
     nmodes = [int(x) for x in str(a.nmodes).split(",")]
     neig = a.neig or 2 * max(nmodes)
     assert neig >= max(nmodes), "--neig < --nmodes"
@@ -173,6 +151,57 @@ def build_basis(a, inp, dev, Ec, t0):
     # ------------------------------------------------------------------ cleanup of the slabs next to the leads
     info = dict(device=dict(meta, n=dev.n, slabs=dev.ns), basis="l2", mu=wins, npts=npts, nmodes=nmodes,
                 neig=neig, floor=a.floor, merge_thr=a.merge_thr if len(wins) > 1 else None,
+                occupations={s: dict(first=float(lam[0]), last=float(lam[-1])) for s, (lam, _) in enumerate(eig)},
+                clean={}, args=vars(a))
+    return finish_basis(a, inp, dev, Ec, t0, V, eig, info)
+
+
+def load_modes(d, inp, dev):
+    """Saved per-slab basis d/slab<s>.npy, checked against the slab orbitals of this device."""
+    V = []
+    for s in range(len(dev.ns)):
+        orb = np.load(os.path.join(d, f"slab{s}_orbitals.npy"))
+        assert np.array_equal(orb, inp["perm"][dev.slab_orbs[s]]), \
+            f"slab {s} of {d} does not match this device (--cells / --trim?)"
+        V.append(np.load(os.path.join(d, f"slab{s}.npy")))
+    return V
+
+
+def level2_on_level1(a, inp, dev, Ec, t0):
+    """--basis l2 --l1-modes DIR: slab level 2 on a saved level-1 basis U1 (nested, U = U1 V): global rho of the open
+    level-1 system per slab (contour over --mu, --npts; Galerkin blocks, projected lead Sigma), eigenvectors V_s with
+    occupation > --l2-cut (or the top --nmodes without --l2-cut). The eigenpairs are cached in <out>."""
+    assert ";" not in a.mu, "--l1-modes: one contour window"
+    V1 = load_modes(a.l1_modes, inp, dev)
+    N1 = [int(v.shape[1]) for v in V1]
+    mu = [Ec + float(x) for x in a.mu.split(",")]
+    npts = int(str(a.npts).split(",")[0])
+    log(f"level 2 on level 1 ({a.l1_modes}, N1 {sum(N1)}): contour [{mu[0]:.4f}, {mu[1]:.4f}] eV, {npts} points")
+    feig = os.path.join(a.out, f"eig_l2on1_mu{mu[0]:.4f}_{mu[1]:.4f}_n{npts}_N1{sum(N1)}.npz")
+    if os.path.exists(feig):
+        z = np.load(feig)
+        eig = [(z[f"l{s}"], z[f"X{s}"]) for s in range(len(V1))]
+        log(f"level-2 eigenpairs from {feig}")
+    else:
+        t = time.time()
+        rho = rho_contour(dev, mu[0], mu[1], npts, log=log, V=V1)
+        log(f"global rho of the level-1 system: {time.time() - t:.0f} s")
+        eig = []
+        for s in range(len(rho)):
+            eig.append(eigh(0.5 * (rho[s] + rho[s].conj().T)))
+            rho[s] = None
+        np.savez(feig, **{f"l{s}": e[0] for s, e in enumerate(eig)}, **{f"X{s}": e[1] for s, e in enumerate(eig)})
+    if a.l2_cut is not None:
+        sel = [lam > a.l2_cut for lam, _ in eig]
+    else:
+        n = int(str(a.nmodes).split(",")[0])
+        sel = [np.arange(len(lam)) < n for lam, _ in eig]
+    eig = [(lam[m], X[:, m]) for (lam, X), m in zip(eig, sel)]
+    V = [v1 @ X for v1, (_, X) in zip(V1, eig)]
+    log(f"level 2 on level 1: N2 {[v.shape[1] for v in V]}, total {sum(v.shape[1] for v in V)} (N1 {sum(N1)}); "
+        f"occupation range per slab {[f'{lam[0]:.2f}..{lam[-1]:.1e}' for lam, _ in eig]}")
+    info = dict(device=dict(inp["meta"], n=dev.n, slabs=dev.ns), basis="l2 on l1", l1_modes=a.l1_modes, N1=N1,
+                mu=[mu], npts=[npts], l2_cut=a.l2_cut,
                 occupations={s: dict(first=float(lam[0]), last=float(lam[-1])) for s, (lam, _) in enumerate(eig)},
                 clean={}, args=vars(a))
     return finish_basis(a, inp, dev, Ec, t0, V, eig, info)
@@ -208,18 +237,34 @@ def finish_basis(a, inp, dev, Ec, t0, V, eig, info):
 def solve_fgmres(a, dev, c, sw, A, b, E, SL, SR, Xms, Tof):
     """FGMRES + CAP-Schwarz (two-level with the Galerkin coarse level, or one-level) on A x = b at one energy."""
     sw.set_energy(A, a.cap_dE0)
-    coarse, x0 = None, np.zeros_like(b)
+    b = gpu.asarray(b)                               # GPU mode: the whole Krylov loop on the device
+    coarse, x0 = None, gpu.asarray(np.zeros(b.shape, complex))
     if a.fgmres_coarse == "ms":
         Ac = c.Ac(E + 1j * a.coarse_eta, SL, SR) if a.coarse_eta else None
         if Ac is None:
             Ac = c.Ac(E, SL, SR)
         coarse = lambda r: c.prolong(Ac.solve(c.restrict(r)))
-        x0 = coarse(b) if a.coarse_eta else Xms
-    A = FastOp(A, a.workers)
+        x0 = coarse(b) if a.coarse_eta else gpu.asarray(Xms)
+    A = operator(A, a.workers)
     prec = two_level(A, sw, coarse, a.pre, a.post)
     hist = []
     t = time.time()
-    x, its, res = fgmres_block(A, b, x0, prec, a.fgmres_tol, a.fgmres_maxit, cb=lambda i, e: hist.append(float(e.max())))
+    nc = b.shape[1]
+    ch = a.fgmres_chunk if a.fgmres_chunk > 0 else nc     # columns are independent Krylov spaces: chunks = same result
+    xs, its, res = [], [], []
+    for k in range(0, nc, ch):
+        hk = []
+
+        def cb(i, e, k=k, hk=hk):
+            hk.append(float(e.max()))
+            if a.fgmres_log and ((i + 1) % a.fgmres_log == 0 or i == 0):
+                log(f"    FGMRES chunk {k // ch + 1}/{-(-nc // ch)} it {i + 1}: residual est max {e.max():.2e} median "
+                    f"{np.median(e):.2e}, {(e > a.fgmres_tol).sum()}/{len(e)} active, {time.time() - t:.0f} s")
+        xk, ik, rk = fgmres_block(A, b[:, k:k + ch], x0[:, k:k + ch], prec, a.fgmres_tol, a.fgmres_maxit, cb=cb)
+        xs.append(gpu.asnumpy(xk)), its.append(np.asarray(ik)), res.append(np.asarray(gpu.asnumpy(rk)))
+        hist = [max(u, v) for u, v in zip(hist, hk)] + hk[len(hist):] if hist else hk
+        del xk
+    x, its, res = np.concatenate(xs, axis=1), np.concatenate(its), np.concatenate(res)
     tit = time.time() - t
     sw.free()
     return dict(x=x, T=Tof(x), its=its.tolist(), res=res.tolist(), res_hist=hist, t_factor=sw.twall, t_iter=tit,
@@ -265,15 +310,18 @@ def closed_solves(a, dev, c, sw, EcT, info):
         if a.fgmres_coarse == "ms":
             Ac = c.Ac(z + 1j * a.coarse_eta, Z0L, Z0R)
             coarse = lambda q: c.prolong(Ac.solve(c.restrict(q)))
-        Aop = FastOp(A, a.workers)
+        Aop = operator(A, a.workers)
         prec = two_level(Aop, sw, coarse, a.pre, a.post)
         its, rr, t = [], [], time.time()
         for k in range(0, len(cols), a.rhs_chunk):
             cc = cols[k:k + a.rhs_chunk]
             b = np.zeros((dev.n, len(cc)), complex)
             b[cc, np.arange(len(cc))] = 1.0
-            x0 = coarse(b) if coarse is not None else np.zeros_like(b)
-            X[:, k:k + len(cc)], it, rs = fgmres_block(Aop, b, x0, prec, a.fgmres_tol, a.fgmres_maxit)
+            b = gpu.asarray(b)
+            x0 = coarse(b) if coarse is not None else gpu.asarray(np.zeros(b.shape, complex))
+            Xk, it, rs = fgmres_block(Aop, b, x0, prec, a.fgmres_tol, a.fgmres_maxit)
+            X[:, k:k + len(cc)] = gpu.asnumpy(Xk)
+            del Xk, b, x0
             its += it.tolist(); rr += rs.tolist()
             log(f"  columns {k}..{k + len(cc) - 1}: its {it.min()}..{it.max()}, residual {rs.max():.1e}; "
                 f"{time.time() - t:.0f} s")
@@ -282,11 +330,9 @@ def closed_solves(a, dev, c, sw, EcT, info):
                  t_factor=sw.twall, t_iter=time.time() - t, coarse=a.fgmres_coarse, cap=a.cap, tol=a.fgmres_tol)
         if a.exact:
             t = time.time()
-            cs = CSolver(A)
             B = np.zeros((dev.n, len(cols)), complex)
             B[cols, np.arange(len(cols))] = 1.0
-            Xe = cs.solve(B)
-            cs.free()
+            Xe, _ = exact_solve(dev, A, B)
             col = np.linalg.norm(X - Xe, axis=0) / np.linalg.norm(Xe, axis=0)
             r.update(err=float(np.linalg.norm(X - Xe) / np.linalg.norm(Xe)), err_col_max=float(col.max()),
                      t_exact=time.time() - t)
@@ -350,7 +396,8 @@ def save_config(f, a):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="qtx_modespace", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("folder", nargs="?", help="QuaTrEx device folder (quatrex_config.toml, inputs/)")
+    p.add_argument("folder", nargs="?", help="QuaTrEx device folder (quatrex_config.toml, inputs/) or a folder prepared from "
+                   "one with python -m qtx_modespace.prep (read once, loaded in seconds)")
     p.add_argument("--config", help="TOML file of options (command line overrides it)")
     p.add_argument("--out")
     g = p.add_argument_group("device")
@@ -372,6 +419,9 @@ def main(argv=None):
                    help="l2: direct level 2 (slab rho of the open device, default); l1: local density matrices per "
                         "block (level 1, options below)")
     g.add_argument("--modes", help="saved basis directory (slab<s>.npy, slab<s>_orbitals.npy): skip the basis build")
+    g.add_argument("--l1-modes", help="--basis l2 on this saved level-1 basis (nested U = U1 V, slab level 2 on level 1)")
+    g.add_argument("--l2-cut", type=float,
+                   help="--l1-modes: keep level-2 eigenvectors with occupation > cut (default: the top --nmodes)")
     g.add_argument("--clean-slabs", default="", help="slabs cleaned against the lead bands, e.g. 0,-1 (default none)")
     g.add_argument("--win", default="-0.6,0.45", help="spurious-band window - Ec_lead [eV]")
     g.add_argument("--nk", type=int, default=25, help="k points on [0, pi] for the lead bands")
@@ -384,6 +434,12 @@ def main(argv=None):
                    help="blocks: the device slabs (size set by --cells) or tiles of each slab")
     g.add_argument("--tile-orbs", type=int, default=2500, help="tile partition: orbitals per tile (transverse bisection)")
     g.add_argument("--tile-xsplit", type=int, default=1, help="cut every block into this many pieces along transport")
+    g.add_argument("--tile-split", default="", help="tile partition: pieces along the two transverse axes, e.g. 4,1 = 4 "
+                   "strips along y, none along z for transport along x (instead of --tile-orbs)")
+    g.add_argument("--tile-xlen", type=float, help="piece length along transport [A]: round(slab length / xlen) pieces "
+                   "per block (instead of --tile-xsplit)")
+    g.add_argument("--l1-dense-max", type=int, default=30000, help="largest embedding solved densely (LU of the "
+                   "environment block; on the GPU with --gpu); larger ones use the sparse solver")
     g.add_argument("--l1-boundary", default="obc", choices=["obc", "cap"],
                    help="embedding closed by CAP + exact lead Sigma on the lead faces (obc) or by the CAP only (cap)")
     g.add_argument("--l1-emb", type=float, default=12.0, help="embedding radius around the block atoms [A]")
@@ -418,6 +474,10 @@ def main(argv=None):
                    help="ms: two-level with the mode-space coarse level, x0 = mode space; none: one-level, x0 = 0")
     g.add_argument("--fgmres-tol", type=float, default=1e-10, help="relative residual per channel")
     g.add_argument("--fgmres-maxit", type=int, default=150, help="max FGMRES iterations")
+    g.add_argument("--fgmres-chunk", type=int, default=0, help="open system: channels per FGMRES block (0 = all; "
+                   "GPU memory ~ chunk x (2 maxit + 1) x n x 16 B)")
+    g.add_argument("--fgmres-log", type=int, default=0, help="log the FGMRES residual estimates every n iterations "
+                   "(0 = only the per-energy summary)")
     g.add_argument("--pre", type=int, default=1, help="pre-smoothing steps per two-level cycle")
     g.add_argument("--post", type=int, default=1, help="post-smoothing steps per two-level cycle (keep >= 1)")
     g.add_argument("--coarse-eta", type=float, default=0.0,
@@ -430,6 +490,8 @@ def main(argv=None):
     g.add_argument("--cap-split", default="", help="pieces per periodic transverse axis, e.g. 1,2 (default none)")
     g.add_argument("--cap-tov", type=float, default=2.5, help="transverse overlap of the split boxes [A]")
     g.add_argument("--cap-solver", default="dense64", choices=["dense64", "dense", "pardiso"], help="window LU")
+    g.add_argument("--cap-lu-host", action="store_true", help="GPU: keep the window LUs in pinned host memory and "
+                   "stream them to the device per Schwarz sweep (device memory: 2 windows instead of all)")
     g.add_argument("--cap-dE0", type=float, default=0.0, help="factor the windows at E + dE0 [eV]")
     g.add_argument("--system", default="open", choices=["open", "closed"],
                    help="open: QTBM A = E S - H - Sigma, b = injected channels; closed: A0 = z S - H without the lead "
@@ -444,6 +506,10 @@ def main(argv=None):
                    "real eigenvalues: at eta = 0 A0 is singular there)")
     g.add_argument("--save-x", help="closed: save the solutions here (closed_<E>_<eta>.npz: X, columns, orbitals)")
     g.add_argument("--workers", type=int, default=4, help="Schwarz windows factored / solved concurrently (threads)")
+    p.add_argument("--gpu", action="store_true",
+                   help="dense parts on the GPU with cupy (lead Sigma, local / slab rho, eigensolves, exact solve, "
+                        "Schwarz windows and FGMRES; needs the gpu extra; also QTX_MODESPACE_GPU=1)")
+    p.add_argument("--gpu-device", type=int, help="CUDA device number (default: cupy's current device)")
     p.add_argument("--sigma-cache", help="directory for lead self-energies and lead band edges (default <out>/sigma; 'none' = off)")
     c, _ = p.parse_known_args(argv)
     if c.config:
@@ -454,6 +520,11 @@ def main(argv=None):
             p.error(f"{k} is required (command line or --config)")
     if a.system == "closed" and not a.fgmres:
         p.error("--system closed needs --fgmres")
+
+    if a.gpu or os.environ.get("QTX_MODESPACE_GPU", "").lower() in ("1", "true", "yes", "on"):
+        gpu.enable(device=a.gpu_device)
+        a.gpu = True
+    log(f"backend: {gpu.describe()}")
 
     t0 = time.time()
     os.makedirs(os.path.join(a.out, "modes"), exist_ok=True)
@@ -487,11 +558,13 @@ def main(argv=None):
     EcT = Ec if a.Ec is None else a.Ec
     c = Coarse(dev, V)
     sw = None
+    if a.fgmres and gpu.on:
+        c.to_gpu()
     if a.fgmres:
         w_, s_, d_ = (float(x) for x in a.cap.split(","))
         sw = CapSchwarz(dev, inp, w_, s_, d_, spacing=a.cap_spacing, centres=a.cap_centres,
                         split=[int(x) for x in a.cap_split.split(",")] if a.cap_split else None, tov=a.cap_tov,
-                        solver=a.cap_solver, workers=a.workers)
+                        solver=a.cap_solver, workers=a.workers, lu_host=a.cap_lu_host)
     if a.system == "closed":
         closed_solves(a, dev, c, sw, EcT, info)
         log(f"done, {time.time() - t0:.0f} s")
@@ -500,7 +573,7 @@ def main(argv=None):
     tr = json.load(open(ftr)) if os.path.exists(ftr) else {}
     if tr.get("Ec", EcT) != EcT or tr.get("N", info["N"]) != info["N"]:
         tr = {}
-    tr.update(Ec=EcT, N=info["N"])
+    tr.update(Ec=EcT, N=info["N"], name=meta["name"])
     res = tr.setdefault("E", {})
     for dE in energies(a.dE):
         key = f"{dE:.4f}"
@@ -515,7 +588,7 @@ def main(argv=None):
         b[dev.bL] = B
         Tof = lambda x: float(np.real(np.einsum("ic,ij,jc->", x[dev.bR].conj(), GR, x[dev.bR])))
         t = time.time()
-        Xms = c.prolong(c.Ac(E, SL, SR).solve(c.restrict(b)))
+        Xms = gpu.asnumpy(c.prolong(c.Ac(E, SL, SR, device=False).solve(c.restrict(b))))
         r.update(E=E, channels=int(B.shape[1]), T_ms=Tof(Xms), t_ms=time.time() - t, t_sigma=ts)
         A, X = None, None
         if a.exact and ("T_exact" not in r or "err_psi" not in r or a.fgmres):
@@ -527,10 +600,8 @@ def main(argv=None):
                 X = None
             if X is None:
                 t = time.time()
-                cs = CSolver(A)
-                X = cs.solve(b)
-                r.update(res_exact=cs.res, t_exact=time.time() - t)
-                cs.free()
+                X, res_ex = exact_solve(dev, A, b)
+                r.update(res_exact=res_ex, t_exact=time.time() - t, exact_on="gpu" if gpu.on else "cpu")
                 if fpsi:
                     os.makedirs(a.psi_dir, exist_ok=True)
                     np.save(fpsi, X)
@@ -559,7 +630,6 @@ def main(argv=None):
         tr["E"] = dict(sorted(res.items(), key=lambda kv: float(kv[0])))
         res = tr["E"]
         json.dump(tr, open(ftr, "w"), indent=1)
-        plot(ftr.replace(".json", ".png"), res, f"{meta['name']}: mode space N {sum(info['N'])} vs exact")
     errs = [abs(r["err"]) for r in res.values() if "err" in r]
     if errs:
         log(f"max |T_MS - T| / T = {100 * max(errs):.4f}% over {len(errs)} energies")

@@ -14,10 +14,24 @@ mode space as the coarse level.
 Dependencies: numpy, scipy, h5py. Optional: qttools from QuaTrEx (real-axis lead OBC, the default when it imports:
 on sys.path or `QTTOOLS_SRC=<quatrex>/src`; needs Python >= 3.12, mpi4py and numba; without it the folded lead is used), pypardiso (fast sparse LU for the lead interior
 and the exact solve, x86-64), threadpoolctl (`--l1-workers` and `--workers`: BLAS threads per process / window),
-matplotlib (transmission plot).
+matplotlib (only for the post-processing plots, `python -m qtx_modespace.plot`), cupy (`--gpu`, see "GPU" below).
 
-Example workflow with every 0.2.0 feature on the MoS2/HfO2 device below: `examples/mos2_hfo2_workflow.sh
-DEVICE_FOLDER [OUT]` (results in "Tested" below).
+Environment (0.3.0): `scripts/setup_env.sh [VENV]` creates a venv with the package and its optional dependencies,
+detects the GPU driver's CUDA version (nvidia-smi) and installs the matching cupy (cupy-cuda12x / cupy-cuda13x), finds
+the CUDA toolkit (`/usr/local/cuda-<major>.*`, or `CUDA_PATH`, or `CTK=1` for the pip CUDA runtime) and writes
+`VENV/bin/qtx_env.sh` (activate + `CUDA_PATH` + `QTTOOLS_SRC`); `TEST=1` runs the tests. Options in the script header.
+```
+PYTHON=python3.12 TEST=1 scripts/setup_env.sh ~/venvs/qtx      # GPU auto-detected; CUDA=none for CPU only
+source ~/venvs/qtx/bin/qtx_env.sh
+```
+Workflow (0.3.0): `examples/workflow.sh DEVICE_FOLDER [OUT]` runs prep, the level-1 bases (A slab CAP+OBC, B slab
+CAP, C tile CAP+OBC) with T vs exact, FGMRES (D, open) and the closed system (E), then the plots; `GPU=1` for the GPU,
+`STEPS="A D"` to pick steps, `EXACT=0`, `CAP_SPLIT`, cuts and energies by environment variables (script header).
+```
+GPU=1 STEPS="A D" DE=0.02,0.05,0.15,0.3 examples/workflow.sh DEVICE_FOLDER out_gpu
+```
+`examples/mos2_hfo2_workflow.sh DEVICE_FOLDER [OUT]` is the same workflow with the defaults used for the MoS2/HfO2
+device below (results in "Tested").
 
 ```
 pip install .                 # or: pip install ".[fast,plot]"
@@ -33,6 +47,16 @@ python -m qtx_modespace DEVICE_FOLDER --out l1t_out --basis l1 --l1-partition ti
 python -m qtx_modespace DEVICE_FOLDER --out mg_out --modes l1_out/modes --fgmres --dE 0.05,0.2 \
        --exact --psi-dir psi                                                       # FGMRES + CAP-Schwarz to 1e-10
 ```
+Read the device folder once (`qtx_modespace.prep`) and give later steps the prepared folder instead of DEVICE_FOLDER:
+```
+python -m qtx_modespace.prep DEVICE_FOLDER --out PREP [--cells m] [--trim] [--potential] [--gpu]
+python -m qtx_modespace PREP --out ms_out --basis l1 --l1-cut 1e-8 ...               # loads PREP in seconds
+```
+See "Prepared inputs" below.
+
+The run writes numbers only; plots are a separate post-processing step: `python -m qtx_modespace.plot OUT [OUT ...]`
+(or `qtx-modespace-plot`) draws `transmission.png` from each run's `transmission.json`.
+
 `qtx-modespace` is installed as a console script with the same arguments. Set `OMP_NUM_THREADS` / `MKL_NUM_THREADS`.
 
 Options can also come from a TOML file, `--config run.toml`, keyed by the long option names (dashes or underscores;
@@ -63,6 +87,26 @@ inputs/overlap.h5         same for S
 inputs/potential.npy      optional (--potential): added as H += (V S + S V) / 2
 ```
 Only the R = [0, 0, 0] block is used (no transverse k). Triangle-only storage is completed to Hermitian.
+
+## Prepared inputs (`qtx_modespace.prep`)
+
+Reading a QuaTrEx folder (h5 files, sum of the R blocks, Hermitian completion, block partition, reordering, lead cell,
+lead band edges) is repeated by every run; on the 2808-atom MoS2/HfO2 device it takes 8-35 s plus the lead band
+edges (41 dense generalized eigensolves of the lead cell: 20 s - 4 min on the CPU, cached in `--sigma-cache`), and it
+grows with the device. `python -m qtx_modespace.prep DEVICE_FOLDER --out PREP` does it once and writes
+
+    PREP/prep.json     format, options (cells, trim, potential), source folder with size / mtime of its files, meta
+    PREP/arrays.npz    labels, xyz, norb, blocks, perm (orbital -> QuaTrEx orbital)
+    PREP/H.npz, S.npz  device + lead blocks in the internal order, upper triangle (Hermitian), uncompressed
+    PREP/lead.npz      lead cell H00, H01, S00, S01 (and the shifted right lead with a bias)
+
+`PREP` is then accepted wherever DEVICE_FOLDER is (`python -m qtx_modespace PREP ...`, `qtx_modespace.obc_eig`,
+`read_quatrex(PREP)`); it loads in about 1 s here (0.53 GB, about 12 bytes per stored nonzero) and gives bit-identical
+H, S, lead and index arrays. `--cells`, `--trim`, `--potential` are fixed at the prep step: later steps need not
+repeat them and stop if they ask for something else. A warning is logged when the source files changed after the
+prep. `--gpu` computes the lead band edges on the GPU, `--sigma-cache DIR` reuses / stores them in
+`DIR/lead_edges.json`. `qtx_modespace.to_quatrex` still needs the QuaTrEx folder itself. From Python:
+`save_inputs(read_quatrex(folder), "PREP")`, `read_quatrex("PREP")`. Console script: `qtx-modespace-prep`.
 
 ## Method
 
@@ -131,6 +175,12 @@ Partition and boundary are chosen independently:
   i % N == K and exits, for building blocks in parallel jobs. The end-slab cleanup (`--clean-slabs 0,-1`) works on
   level-1 bases too. It is recommended there, because the raw end slabs carry spurious lead bands; it lowered the
   largest T error, see below.
+- **Level 2 on level 1** (`--basis l2 --l1-modes DIR`, 0.3.0). Slab level 2 computed in a saved level-1 basis U1
+  (the `modes/` folder of a `--basis l1` run): the global rho of the open level-1 system (Galerkin blocks
+  U1^H (H, S) U1, lead Sigma projected on the end-slab blocks, contour `--mu`, `--npts`), per slab its eigenvectors
+  V_s with occupation > `--l2-cut` (or the top `--nmodes`), and the nested basis U = U1 V. Much cheaper than direct
+  level 2 (the recursion runs on N1 instead of the device orbitals); it cannot be more accurate than its level 1.
+  The eigenpairs are cached in `<out>/eig_l2on1_*.npz`.
 
 ### Iterative solve (`--fgmres`)
 
@@ -146,7 +196,13 @@ its own Krylov space, but the preconditioner acts on all active channels at once
   cuts need boxes of 16 A or more. `--cap-solver dense64` (default) gives the same convergence as complex128 with
   half the factor time. `--workers` sets how many windows are factored and solved concurrently (threads).
   `--cap-dE0` factors at E + dE0, so one factorization can be reused over an energy interval (about 0.05 eV costs a
-  few iterations).
+  few iterations). `--cap-lu-host` (GPU, 0.3.0) keeps the window LUs in pinned host memory and streams them to the
+  card during each sweep (two windows on the device at a time, the next one copied while the current one is solved):
+  the 6 nm device with 172 windows holds 117 GB of complex64 LUs; the sweep is as fast as with device-resident LUs
+  on the 2808-atom device (identical iterations).
+- **Channels and logging.** `--fgmres-chunk k` iterates the channels k at a time (independent Krylov spaces, so the
+  result is the same; GPU memory ~ k x (2 maxit + 1) x n x 16 B). `--fgmres-log n` (0.3.0) logs the residual
+  estimates (largest / median over the chunk, active channels, time) every n iterations.
 - **Coarse level** (`--fgmres-coarse ms`, the default). The Galerkin mode space of the basis (`--modes`, or the
   one just built). The preconditioner is one multiplicative cycle: `--pre` smoothing steps, coarse correction,
   `--post` smoothing steps; keep post-smoothing, without it the iterations double. The start vector is the
@@ -186,7 +242,7 @@ maxit x chunk device vectors, so on MoS2/HfO2 64 columns need ~3.5 GB.
 | `rho_mu….npz` | slab density matrices, only with `--save-rho` (2.2 GB for the device below) |
 | `config.toml` | resolved options of the run (input for `--config`) |
 | `sigma/` | cached lead self-energies and lead band edges `lead_edges.json` (`--sigma-cache none` to disable) |
-| `transmission.json`, `.png` | per energy: channels, T_MS, T_exact, relative error, timings; with `--exact` also the errors of the QTBM solution vectors (`err_psi`: Frobenius over channels, `err_psi_max`: worst channel, `err_psi_S`: S norm, `err_psi_last` / `err_psi_slab`: right end slab / each slab, `err_psi_best`: best approximation in range(U), `err_res`: residual), all relative to the exact solution |
+| `transmission.json` (`.png` from `python -m qtx_modespace.plot OUT`) | per energy: channels, T_MS, T_exact, relative error, timings; with `--exact` also the errors of the QTBM solution vectors (`err_psi`: Frobenius over channels, `err_psi_max`: worst channel, `err_psi_S`: S norm, `err_psi_last` / `err_psi_slab`: right end slab / each slab, `err_psi_best`: best approximation in range(U), `err_res`: residual), all relative to the exact solution |
 | `--psi-dir` | exact QTBM solutions `psi_<E>_<eta>.npy`, reused by any later run (checked by their residual) |
 
 The full basis is U = diag(U_0, …, U_{S-1}) over the slabs; in QuaTrEx orbital indices,
@@ -400,6 +456,44 @@ eigenvalues found):
 All of them are narrow states (Γ ≤ 5 meV) at the two ends of the HfO2 layer. Below Ec + 0.17 eV they are almost
 pure Hf/O. Above that they move into the MoS2 channel near the right oxide end (57–98 % on Mo/S).
 
+## GPU (`--gpu`)
+
+`--gpu` (or `QTX_MODESPACE_GPU=1`) moves the dense algebra to an NVIDIA GPU with cupy; `--gpu-device n` picks the
+card. Without it nothing changes (numpy / scipy, cupy is never imported). On the GPU:
+- lead Sigma of the folded lead (interior fold and decimation) and the lead band edges;
+- level-1 local density matrices (`--basis l1`, dense embeddings): blocks are built on the device from the sparse
+  H, S, one LU + Schur complement per contour point;
+- level-2 slab recursion, the eigensolves, and the exact QTBM solve (`--exact`, block-tridiagonal LU; when the dense
+  blocks do not fit on the card, a streaming variant keeps the couplings sparse on the device and every LU factor
+  in host memory, one dense slab block each: 6 nm device ~100 GB host, ~2.5 min per energy on the GH200);
+- `--fgmres`: Schwarz window LUs (complex64), sparse matvec and the whole Krylov loop.
+
+Install cupy for the CUDA version of the driver: `pip install ".[gpu]"` (cupy-cuda12x) or `pip install cupy-cuda13x`;
+set `CUDA_PATH` if cupy does not find the toolkit. Results leave every module as numpy arrays; caches and mode files
+are the same as on the CPU. In GPU mode the contour points and Schwarz windows run one after another in one process
+(`--l1-workers`, `--workers` are ignored: no fork after CUDA is initialized). Memory: the largest dense block is the
+embedding of a block (complex128, n = 17 000 here: 4.6 GB, a few copies of it at the peak) or a Schwarz window.
+The qttools OBC is not routed through `--gpu`; sparse (non-dense) embeddings and PARDISO windows stay on the CPU.
+
+Measured on the 2808-atom MoS2/HfO2 device (workflow steps A and D, `examples/mos2_hfo2_workflow.sh`), GH200 96 GB
+(cupy-cuda13x 14.2, folded lead at E + 1e-6 i, 19-24 columns) against the CPU run of "Tested" below (28 cores,
+4 x 6 threads, qttools OBC, 2 columns):
+
+| step | GPU | CPU |
+|---|---|---|
+| slab level 1, cut 1e-8: 4 local rho, 24 points (slabs 0 / 1 / 2 / 3) | 5 / 96 (with the 24 Sigma) / 15 / 4 s | 116 / 708 / 612 / 67 s (Sigma cached) |
+| basis total (Sigma + local rho + eigensolves) | 154 s | ~40 min |
+| real-axis lead Sigma, per energy (folded) | 4 s | 170-300 s |
+| exact solve, per energy | 2 s | 150-180 s |
+| Schwarz window factorization (7 windows <= 8762) | 2 s | 23-24 s |
+| FGMRES two-level, iterations at Ec + 0.05 / 0.15 / 0.2 | 4 / 5 / 7 s (24-47 its) | 26 / 37 / 44 s (25-41 its) |
+| FGMRES one-level | 4 / 5 / 8 s (46-86 its) | - |
+
+Same basis as on the CPU (N1 550 / 702 / 726 / 395), T_MS error 1e-6 / 7e-6 / 3.4e-4, FGMRES T error <= 1.5e-10.
+On a Tesla P100 (16 GB, cupy-cuda12x) the slab-0 local rho takes 92 s including the 24 Sigma (2.4-4.1 s each) and
+agrees with the CPU block to 7e-14 in the occupations. With the folded lead the injection includes the eta-broadened
+channels (norm 1e-4 of the physical ones); "max channel" psi errors refer to those.
+
 ## Notes and limits
 
 - Use enough modes: with too few (100 per slab here) the error is tens of percent and erratic. The smallest kept
@@ -416,6 +510,41 @@ pure Hf/O. Above that they move into the MoS2 channel near the right oxide end (
 - `--workers` > 1 factors the Schwarz windows in concurrent threads, with BLAS limited to 1 thread inside them
   (threadpoolctl). Concurrent LAPACK calls on a multi-threaded MKL crash (segfault). Without threadpoolctl the
   windows run one after another.
+- Two-level FGMRES on long devices: on the 6 nm MoS2/HfO2 device (22 slabs) the two-level iteration stalls at
+  Ec + 0.15 eV with every basis tried (slab level 1 cuts 1e-8 to 1e-4, slab level 2 on tile level 1), also with
+  `--coarse-eta` 1e-3 / 1e-2, while one-level converges (slowly: about one window per iteration along x). Cause:
+  the Galerkin coarse operator has a dense set of almost undamped spurious eigenvalues (Ritz values of the
+  indefinite operator) from basis vectors cut at the slab faces; their fine residual is ~7 eV, they sit on the slab
+  interfaces, mostly in the oxide, and one of them is within ~1e-4 eV of almost any E once N reaches tens of
+  thousands. On the 4- and 10-slab devices (N 2 373 / 8 053) two-level converges. Under investigation; until then
+  use `--fgmres-coarse none` on long devices or check the iteration log (`--fgmres-log`).
+
+## Release 0.3.0
+
+Tag `qtx_modespace-v0.3.0`. New:
+- GPU backend (`--gpu`, `QTX_MODESPACE_GPU=1`, module `gpu`): folded-lead Sigma and lead edges, level-1 local rho,
+  level-2 recursion, eigensolves, exact solve, Galerkin projection U^H H U / U^H S U, injection, Schwarz window LUs
+  and FGMRES on an NVIDIA GPU with cupy (see "GPU"). Extras `gpu` (cupy-cuda12x) and `gpu13` (cupy-cuda13x).
+- Streaming exact solve for devices whose dense slab blocks exceed the GPU memory (`core.StreamBlockTridiag`, chosen
+  automatically): the 6 nm MoS2/HfO2 device (344 640 device orbitals, 22 slabs of up to 16 858) needs ~417 GB for the
+  dense block LU; the streaming one runs on a 95 GB GH200 in ~2.5 min per energy (residual 3e-14).
+- Prepared inputs (`qtx_modespace.prep`, `qtx-modespace-prep`): read the QuaTrEx folder once, every later run loads it
+  in seconds.
+- Plots out of the run (`qtx_modespace.plot`, `qtx-modespace-plot`): the run writes numbers only.
+- `scripts/setup_env.sh` (venv + cupy matching the driver + `qtx_env.sh`) and `examples/workflow.sh` (generic CPU / GPU
+  workflow, steps A-E by environment variables); `examples/mos2_hfo2_workflow.sh` now calls it.
+- Level 2 on a saved level 1 (`--basis l2 --l1-modes DIR`, `--l2-cut`): see "Level-1 basis".
+- FGMRES: window LUs in pinned host memory (`--cap-lu-host`) for devices whose windows do not fit on the card;
+  per-iteration log (`--fgmres-log n`).
+- CSCS Alps: `scripts/setup_env.sh` reuses an existing venv (e.g. the QuaTrEx one in the prgenv-gnu uenv) with its cupy
+  and mpi4py, takes CUDA from `$CUDA_HOME`, puts the kernel caches on `$SCRATCH`; Slurm templates
+  `scripts/alps/{basis,sweep,exact}.sbatch` (one process per GPU; level-1 blocks split with `--l1-only`, energies
+  split over the GPUs; exact solve one task per node) with `gpu_bind.sh` / `common.sh` (usage in the headers).
+  Shared cache files (Sigma, level-1 blocks, lead edges) are written atomically (temporary file + rename), so
+  concurrent ranks never read a partial file.
+- Fix: the lead-band cleanup (`--clean-slabs`) took a single periodic axis; with both transverse axes periodic
+  (`meta["periodic"]` a list) it now uses the minimum image on every one.
+- Extra `test` (pytest). Tested on attelas2 (aarch64, GH200, cupy-cuda13x 14.2, Python 3.12): CPU and GPU tests.
 
 ## Release 0.2.2
 

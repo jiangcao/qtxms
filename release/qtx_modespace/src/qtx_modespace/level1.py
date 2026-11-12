@@ -21,7 +21,8 @@ import scipy.linalg as sla
 import scipy.sparse as sp
 from scipy.spatial import cKDTree
 
-from .core import CSolver, log
+from . import gpu
+from .core import CSolver, eigh, log, savez_atomic, write_text_atomic
 
 
 # ------------------------------------------------------------------ geometry and partition
@@ -71,19 +72,39 @@ def bisect(atoms, pos, w, nt):
     return bisect(o[:cut], pos, w, k1) + bisect(o[cut:], pos, w, nt - k1)
 
 
-def partition(inp, dev, kind="slab", tile_orbs=2500, xsplit=1):
+def strips(atoms, coord, w, n):
+    """atoms in n groups of ~equal weight w, cut along coord only (sorted strips)."""
+    if n <= 1 or len(atoms) <= 1:
+        return [atoms]
+    o = atoms[np.argsort(coord[atoms], kind="stable")]
+    cum = np.cumsum(w[o])
+    cuts = [int(np.searchsorted(cum, cum[-1] * k / n)) + 1 for k in range(1, n)]
+    return [g for g in np.split(o, cuts) if len(g)]
+
+
+def partition(inp, dev, kind="slab", tile_orbs=2500, xsplit=1, tsplit=None, xlen=None):
     """Blocks: [dict(slab, atoms (sorted atom ids), orbs (slab-local orbitals))], slab by slab.
     kind "slab": one block per device slab (then xsplit still cuts it along transport); "tile": the slab cut
-    transversely into round(n_slab / tile_orbs) tiles (at least 1), each cut into xsplit pieces along transport."""
+    transversely into round(n_slab / tile_orbs) tiles (at least 1) by bisection along the longest extent, or, with
+    tsplit = (n1, n2), into n1 x n2 strips of equal orbital count along the two transverse axes (in axis order, e.g.
+    y then z for transport along x). Each tile is cut into xsplit pieces along transport; xlen [A] sets xsplit per
+    slab to round(slab length / xlen) (at least 1) instead."""
     labels, xyz, norb, ax = inp["labels"], inp["xyz"], inp["norb"], inp["meta"]["axis"]
     off = np.concatenate([[0], np.cumsum(norb)])
     tr = [i for i in range(3) if i != ax]
     blocks = []
     for s, b in enumerate(inp["meta"]["transport"]["device_blocks"]):
         a = np.where(inp["blocks"] == b)[0]
-        nt = 1 if kind == "slab" else max(1, int(round(norb[a].sum() / tile_orbs)))
-        for t in bisect(a, xyz[:, tr], norb, nt):
-            for tx in bisect(t, xyz[:, [ax]], norb, xsplit):
+        if kind == "slab":
+            tiles = [a]
+        elif tsplit:
+            tiles = [t2 for t1 in strips(a, xyz[:, tr[0]], norb, int(tsplit[0]))
+                     for t2 in strips(t1, xyz[:, tr[1]], norb, int(tsplit[1]))]
+        else:
+            tiles = bisect(a, xyz[:, tr], norb, max(1, int(round(norb[a].sum() / tile_orbs))))
+        nx = max(1, int(round(inp["meta"]["block_length"] / xlen))) if xlen else xsplit
+        for t in tiles:
+            for tx in bisect(t, xyz[:, [ax]], norb, nx):
                 tx = np.sort(tx)
                 g = np.concatenate([np.arange(off[i], off[i + 1]) for i in tx])
                 blocks.append(dict(slab=s, atoms=tx, orbs=dev.loc[g]))
@@ -158,15 +179,80 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
     """rho_PP of the embedding e over contour = (mu1, mu2, npts) [absolute eV]; returns (rho, seconds).
     gpp "schur": G_PP = (A_PP - A_PE A_EE^-1 A_EP)^-1 (env_prec "single": A_EE LU in complex64 + `refine` steps of
     iterative refinement); "full": one LU of the whole embedding with m right-hand sides.
-    workers > 1: the contour points over forked processes with `threads` BLAS threads each (needs threadpoolctl)."""
+    workers > 1: the contour points over forked processes with `threads` BLAS threads each (needs threadpoolctl).
+    GPU mode (gpu.on, dense embeddings): every point on the GPU (blocks built there from the CSR matrix, LU, solves,
+    Schur complement and its inverse), rho accumulated on the device; points one after another (workers ignored)."""
     zs, dzs = contour_points(*contour)
     He, Se, W, pidx = e["He"], e["Se"], e["W"], e["pidx"]
     n, m = He.shape[0], len(pidx)
     dense = (He + Se).nnz > dense_fill * n * n and n <= dense_max
     cdt = np.complex64 if env_prec == "single" else np.complex128
     eidx = np.setdiff1d(np.arange(n), pidx)
+    on_gpu = gpu.on and dense
+
+    if on_gpu:
+        # device copies, made once: the E / P blocks of S and K = H - i W as CSR, and where the lead-face orbitals sit
+        # in E and P. Per point only A = z S - K is formed (on the device) and Sigma(z) is scattered into the blocks;
+        # assembling and slicing the sparse A on the host cost more than the factorization.
+        K = (He - 1j * W).tocsr()
+        Sc = sp.csr_matrix(Se)
+        gS = {a + b: gpu.csr(Sc[i][:, j], np.complex128) for a, i in (("E", eidx), ("P", pidx))
+              for b, j in (("E", eidx), ("P", pidx))}
+        gK = {a + b: gpu.csr(K[i][:, j], np.complex128) for a, i in (("E", eidx), ("P", pidx))
+              for b, j in (("E", eidx), ("P", pidx))}
+        del K, Sc
+        loc = {}
+        for a, i in (("E", eidx), ("P", pidx)):
+            loc[a] = np.full(n, -1)
+            loc[a][i] = np.arange(len(i))
+        faces = []                                                  # per lead: {E, P: (block rows, Sigma rows)}
+        for pos, fi in (e["faces"] or []):
+            pos, fi = np.asarray(pos, int), np.asarray(fi, int)
+            faces.append({a: (gpu.cp.asarray(loc[a][pos][loc[a][pos] >= 0]), gpu.cp.asarray(fi[loc[a][pos] >= 0]))
+                          for a in "EP"})
+        has_sigma = any(len(f[a][0]) for f in faces for a in "EP")
+
+    def point_gpu(k):
+        cp, z = gpu.cp, zs[k]
+        if gpp == "full":
+            A = (z * Se - He + 1j * W + sigma_emb(e, z)).tocsr()
+            Ad = gpu.csr_dense(A, np.complex128)
+            R = cp.zeros((n, m), complex)
+            R[cp.asarray(pidx), cp.arange(m)] = 1.0
+            X = gpu.lu_solve(gpu.lu_factor(Ad), R)
+            return X[cp.asarray(pidx)]
+        Sg = [cp.asarray(M) for M in e["obc"].sigma(z)] if has_sigma else []
+
+        def block(ab):                                              # dense A_ab = z S - K - Sigma on the device
+            M = (z * gS[ab] - gK[ab]).toarray()
+            for f, G in zip(faces, Sg):
+                (r, fr), (c, fc) = f[ab[0]], f[ab[1]]
+                if len(r) and len(c):
+                    ix = cp.ix_(r, c)
+                    M[ix] = M[ix] - G[cp.ix_(fr, fc)]
+            return M
+
+        AEE, AEP = block("EE"), block("EP")
+        if env_prec == "single":
+            lu = gpu.lu_factor(AEE.astype(cdt))
+            X = gpu.lu_solve(lu, AEP.astype(cdt)).astype(complex)
+            for _ in range(refine):
+                X += gpu.lu_solve(lu, (AEP - AEE @ X).astype(cdt))
+        else:
+            lu = gpu.lu_factor(AEE)                                 # overwrites AEE
+            X = gpu.lu_solve(lu, AEP)
+        del lu, AEE, AEP
+        Sp = block("PP") - (z * gS["PE"] - gK["PE"]) @ X            # A_PE X: sparse part, then its Sigma part
+        for f, G in zip(faces, Sg):
+            (r, fr), (c, fc) = f["P"], f["E"]
+            if len(r) and len(c):
+                Sp[r] = Sp[r] + G[cp.ix_(fr, fc)] @ X[c]
+        del X
+        return cp.linalg.inv(Sp)
 
     def point(k):
+        if on_gpu:
+            return point_gpu(k)
         z = zs[k]
         A = (z * Se - He + 1j * W + sigma_emb(e, z)).tocsr()
         if gpp == "full":
@@ -199,10 +285,10 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
         return np.linalg.inv(Sp)
 
     def run(ks):
-        acc = np.zeros((m, m), complex)
+        acc = (gpu.cp if on_gpu else np).zeros((m, m), complex)
         for k in ks:
             acc += point(k) * dzs[k]
-        return acc
+        return gpu.asnumpy(acc)
 
     def limited(f, nthr):
         if not nthr:
@@ -212,7 +298,10 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
             return f()
 
     t0 = time.time()
-    if workers <= 1:
+    if gpu.on:                                       # no fork after CUDA initialization: one process
+        acc = limited(lambda: run(range(len(zs))), threads)
+        gpu.free()
+    elif workers <= 1:
         acc = limited(lambda: run(range(len(zs))), threads)
     else:
         import multiprocessing as mp
@@ -243,24 +332,28 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
 # ------------------------------------------------------------------ level-1 basis
 def build_level1(inp, dev, contour, kind="slab", tile_orbs=2500, xsplit=1, boundary="obc", d_emb=12.0, d_cap=3.0,
                  eta_cap=0.3, cut=1e-6, store_cut=1e-10, cache=None, gpp="schur", env_prec="double", workers=1,
-                 threads=None, only=None, log=log):
+                 threads=None, only=None, tsplit=None, xlen=None, dense_max=30000, log=log):
     """Level-1 basis per slab, V_s (slab-local orbitals x N1_s), block diagonal over the blocks of the partition, each
     block = eigenvectors of its local rho with occupation > cut (largest first). Returns (V, occupations per slab,
     info). cache: directory of per-block files block<i>.npz (vectors with occupation > min(cut, store_cut), all
     occupations, atoms) under a subdirectory named by a hash of the settings; a later run with a cut >= the stored one
     reuses them. only = set of block indices: build those (if missing) and return None (parallel builds)."""
     assert boundary in ("cap", "obc")
-    blocks = partition(inp, dev, kind, tile_orbs, xsplit)
+    blocks = partition(inp, dev, kind, tile_orbs, xsplit, tsplit, xlen)
     keep_cut = min(cut, store_cut)
     par = dict(kind=kind, tile_orbs=tile_orbs if kind == "tile" else None, xsplit=xsplit, boundary=boundary,
                d_emb=d_emb, d_cap=d_cap, eta_cap=eta_cap, contour=[round(float(c), 8) for c in contour[:2]] +
                [int(contour[2])], ns=list(map(int, dev.ns)))
+    if kind == "tile" and tsplit:                   # only when used: older caches keep their hash
+        par.update(tsplit=[int(x) for x in tsplit], tile_orbs=None)
+    if xlen:
+        par.update(xlen=float(xlen), xsplit=None)
     cdir = None
     if cache:
         h = hashlib.sha1(json.dumps(par, sort_keys=True).encode()).hexdigest()[:10]
         cdir = os.path.join(cache, f"{kind}_{boundary}_{h}")
         os.makedirs(cdir, exist_ok=True)
-        json.dump(par, open(os.path.join(cdir, "settings.json"), "w"), indent=1)
+        write_text_atomic(os.path.join(cdir, "settings.json"), json.dumps(par, indent=1))
     sizes = [len(b["orbs"]) for b in blocks]
     log(f"level 1: {kind} partition, {len(blocks)} blocks of {min(sizes)}..{max(sizes)} orbitals "
         f"(per slab {[sum(b['slab'] == s for b in blocks) for s in range(len(dev.ns))]}); local rho with "
@@ -284,13 +377,12 @@ def build_level1(inp, dev, contour, kind="slab", tile_orbs=2500, xsplit=1, bound
                 continue
         t = time.time()
         e = embedding(inp, geo, tree, b["atoms"], d_emb, d_cap, eta_cap, dev if boundary == "obc" else None)
-        rho, trho = local_rho(e, contour, gpp, env_prec, workers=workers, threads=threads)
-        lam, X = np.linalg.eigh(rho)
-        lam, X = lam[::-1], X[:, ::-1]
+        rho, trho = local_rho(e, contour, gpp, env_prec, workers=workers, threads=threads, dense_max=dense_max)
+        lam, X = eigh(rho)
         k = int((lam > keep_cut).sum())
         res[i] = (X[:, :k], lam)
         if f:
-            np.savez(f, U=X[:, :k], s=lam, atoms=b["atoms"], cut=keep_cut)
+            savez_atomic(f, U=X[:, :k], s=lam, atoms=b["atoms"], cut=keep_cut)
         log(f"  block {i} (slab {b['slab']}): {len(b['orbs'])} orbitals, embedding {len(e['oe'])} "
             f"(CAP {e['ncap']}, lead faces {e['nface']}), trace {lam.sum():.2f}, occupations > {cut:g}: "
             f"{int((lam > cut).sum())}; {trho:.0f} s")
@@ -309,7 +401,8 @@ def build_level1(inp, dev, contour, kind="slab", tile_orbs=2500, xsplit=1, bound
         V.append(X)
         occ.append(o)
         nblk.append([int(c.shape[1]) for c in cols])
-    info = dict(level=1, partition=kind, tile_orbs=par["tile_orbs"], xsplit=xsplit, boundary=boundary, d_emb=d_emb,
+    info = dict(level=1, partition=kind, tile_orbs=par["tile_orbs"], xsplit=par["xsplit"], tsplit=par.get("tsplit"),
+                xlen=par.get("xlen"), boundary=boundary, d_emb=d_emb,
                 d_cap=d_cap, eta_cap=eta_cap, contour=par["contour"], cut=cut, blocks_per_slab=nblk,
                 block_sizes=sizes)
     log(f"level 1: N1 {[v.shape[1] for v in V]}, total {sum(v.shape[1] for v in V)}; columns per block {nblk}")

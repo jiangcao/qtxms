@@ -23,13 +23,14 @@ import scipy.linalg as sla
 import scipy.sparse as sp
 from concurrent.futures import ThreadPoolExecutor
 
+from . import gpu
 from .core import CSolver, log
 from .level1 import periodic_axes
 
 
 class CapSchwarz:
     def __init__(self, dev, inp, width=16.0, s=2.0, d=2.0, spacing=None, centres="all", split=None, tov=2.5,
-                 solver="dense64", workers=1, log=log):
+                 solver="dense64", workers=1, lu_host=False, log=log):
         assert centres in ("all", "ends") and solver in ("dense", "dense64", "pardiso")
         ax = inp["meta"]["axis"]
         atom = np.repeat(np.arange(len(inp["norb"])), inp["norb"])[dev.dev]
@@ -52,11 +53,12 @@ class CapSchwarz:
             u = inp["xyz"][atom, axt]
             idx, core, tcut = [], [], []
             for i, c, tc in zip(self.idx, self.core, self.tcut):
+                strip = np.minimum(np.floor((u[i] % L) / (L / n)).astype(int), n - 1)
                 for j in range(n):
                     du = np.abs((u[i] - (j + 0.5) * L / n + L / 2) % L - L / 2)
                     w = du < L / (2 * n) + tov
                     idx.append(i[w])
-                    core.append(c[w] & ((du[w] < L / (2 * n)) | ((du[w] == L / (2 * n)) & (j == 0))))
+                    core.append(c[w] & (strip[w] == j))             # each orbital in exactly one strip
                     tcut.append([(dv[w], h) for dv, h in tc] + [(du[w], L / (2 * n) + tov)])
             self.idx, self.core, self.tcut = idx, core, tcut
         cov = np.zeros(len(x), int)
@@ -64,6 +66,13 @@ class CapSchwarz:
             cov[i[c]] += 1
         assert (cov == 1).all(), "window cores must partition the device"
         self.s, self.d, self.solver, self.dev = s, d, solver, dev
+        self.gpu = gpu.on and solver != "pardiso"          # GPU: window LUs and solves on the device, serially
+        self.lu_host = lu_host and self.gpu                # GPU: LU factors in pinned host memory, streamed per solve
+        if self.gpu:
+            workers = 1
+            self.didx = [gpu.cp.asarray(i) for i in self.idx]
+            self.dcore = [gpu.cp.asarray(np.where(c)[0]) for c in self.core]
+            self.dout = [gpu.cp.asarray(i[c]) for i, c in zip(self.idx, self.core)]
         if workers > 1:                  # concurrent LAPACK calls crash a multi-threaded MKL: 1 BLAS thread per window
             try:
                 from threadpoolctl import threadpool_limits
@@ -77,7 +86,8 @@ class CapSchwarz:
             f"{', '.join(f'{c:.1f}' for c in self.centres)} A, width {width} A"
             + (f", transverse split {split} +{tov} A" if split and max(split) > 1 else "")
             + f"), {min(map(len, self.idx))}..{max(map(len, self.idx))} orbitals, absorbing {s} eV over {d} A, "
-            f"{solver} LU, {workers} workers")
+            f"{solver} LU" + ((" on the GPU" + (", host-resident, streamed" if self.lu_host else "")) if self.gpu
+                              else f", {workers} workers"))
 
     def set_energy(self, A, dE0=0.0, log=log):
         """Factor the windows of A (at E + dE0 if dE0: A_jj + dE0 S_jj, for reuse over an energy interval)."""
@@ -102,6 +112,15 @@ class CapSchwarz:
             if self.solver == "pardiso":
                 return CSolver(Ajj, n_ref=0).factor_solve
             dt = np.complex64 if self.solver == "dense64" else complex
+            if self.gpu:
+                lu = gpu.lu_factor(gpu.csr_dense(Ajj, dt))
+                if self.lu_host:                         # (pinned host LU in Fortran order, device pivots)
+                    import cupyx
+                    h = cupyx.empty_pinned(lu[0].shape, dt, order="F")
+                    lu[0].get(out=h)
+                    gpu.sync()
+                    return (h, lu[1])
+                return lambda rj: gpu.lu_solve(lu, rj.astype(dt)).astype(complex)
             lu = sla.lu_factor(Ajj.toarray().astype(dt), check_finite=False, overwrite_a=True)
             return lambda rj: sla.lu_solve(lu, rj.astype(dt), check_finite=False).astype(complex)
         t = time.time()
@@ -111,10 +130,62 @@ class CapSchwarz:
                 self.ops = list(self.pool.map(factor, ks))
         else:
             self.ops = list(map(factor, ks))
+        if self.lu_host:
+            gpu.free()
+            nmax = max(h.shape[0] for h, _ in self.ops)
+            dt = self.ops[0][0].dtype
+            cp = gpu.cp
+            self.buf = [cp.empty(nmax * nmax, dt) for _ in range(2)]   # double buffer for the streamed LUs
+            self.cstream = cp.cuda.Stream(non_blocking=True)
         self.twall = time.time() - t
-        log(f"  CAP-Schwarz factor: {self.twall:.1f} s")
+        log(f"  CAP-Schwarz factor: {self.twall:.1f} s"
+            + (f" (LUs on the host, {sum(h.nbytes for h, _ in self.ops) / 2**30:.1f} GB pinned, streamed)"
+               if self.lu_host else ""))
+
+    def _streamed(self, r, z):
+        """Window solves with the LUs copied host -> device, window k + 1 prefetched while window k is solved."""
+        cp = gpu.cp
+        import cupyx.scipy.linalg as cla
+        cur = cp.cuda.get_current_stream()
+        nw = len(self.ops)
+        loaded = [None] * nw                               # event: LU k is in its buffer
+        freed = [cp.cuda.Event(), cp.cuda.Event()]         # event: the solve that used buffer i is done
+        freed[0].record(cur), freed[1].record(cur)
+
+        def load(k):
+            h, _ = self.ops[k]
+            n = h.shape[0]
+            d = cp.ndarray((n, n), h.dtype, memptr=self.buf[k % 2].data, order="F")
+            self.cstream.wait_event(freed[k % 2])
+            d.set(h, stream=self.cstream)
+            ev = cp.cuda.Event()
+            ev.record(self.cstream)
+            loaded[k] = ev
+            return d
+        views = [None] * nw
+        views[0] = load(0)
+        for k in range(nw):
+            cur.wait_event(loaded[k])
+            dt = views[k].dtype
+            zk = cla.lu_solve((views[k], self.ops[k][1]), r[self.didx[k]].astype(dt), check_finite=False)
+            freed[k % 2] = cp.cuda.Event()
+            freed[k % 2].record(cur)
+            if k + 1 < nw:
+                views[k + 1] = load(k + 1)                # buffer (k + 1) % 2 is free once solve k - 1 finished
+            z[self.dout[k]] = zk.astype(complex)[self.dcore[k]]
+            views[k] = None
+        cur.synchronize()
+        return z
 
     def __call__(self, r):
+        if self.gpu:                                     # r: cupy (host arrays are moved, the result is cupy)
+            r = gpu.cp.asarray(r)
+            z = gpu.cp.zeros_like(r)
+            if self.lu_host:
+                return self._streamed(r, z)
+            for k in range(len(self.idx)):
+                z[self.dout[k]] = self.ops[k](r[self.didx[k]])[self.dcore[k]]
+            return z
         z = np.zeros_like(r)
         solve = lambda k: self.ops[k](r[self.idx[k]])[self.core[k]]
         ks = range(len(self.idx))
@@ -128,7 +199,24 @@ class CapSchwarz:
         return z
 
     def free(self):
-        self.ops = None
+        self.ops, self.buf = None, None
+        gpu.free()
+
+
+class GpuOp:
+    """A @ X on the GPU: the sparse device matrix as a cupyx CSR (complex128); X numpy or cupy, result cupy."""
+
+    def __init__(self, A):
+        self.A = gpu.csr(A, np.complex128)
+        self.shape = self.A.shape
+
+    def __matmul__(self, X):
+        return self.A @ gpu.cp.asarray(X, dtype=complex)
+
+
+def operator(A, threads=4):
+    """FastOp on the CPU, GpuOp in GPU mode."""
+    return GpuOp(A) if gpu.on else FastOp(A, threads)
 
 
 class FastOp:
@@ -174,14 +262,16 @@ def fgmres_block(A, b, x0, prec, tol=1e-10, m=150, cb=None):
     block of the active columns. A column stops when its GMRES residual estimate is <= tol |b_j|. Returns x,
     iterations per column, true relative residuals. cb(i, est) after iteration i (estimates of all columns).
     Storage per column (V[j], Z[j]: (m + 1) x n, rows = basis vectors): the Gram-Schmidt step is one GEMV pair per
-    column on contiguous memory (no gather of the whole Krylov basis)."""
+    column on contiguous memory (no gather of the whole Krylov basis). b, x0, A @ and prec: numpy or cupy arrays
+    (Hessenberg and least-squares on the host); x, the residuals: arrays of b's kind."""
+    xp = gpu.xp_of(b)
     n, nc = b.shape
     r0 = b - A @ x0
-    beta, bn = np.linalg.norm(r0, axis=0), np.linalg.norm(b, axis=0)
-    V = np.zeros((nc, m + 1, n), complex)
-    Z = np.zeros((nc, m, n), complex)
+    beta, bn = gpu.asnumpy(xp.linalg.norm(r0, axis=0)), gpu.asnumpy(xp.linalg.norm(b, axis=0))
+    V = xp.zeros((nc, m + 1, n), complex)
+    Z = xp.zeros((nc, m, n), complex)
     Hh = np.zeros((nc, m + 1, m), complex)
-    V[:, 0] = (r0 / np.where(beta > 0, beta, 1)).T
+    V[:, 0] = (r0 / xp.asarray(np.where(beta > 0, beta, 1))).T
     its = np.zeros(nc, int)
     est = beta / bn
     act = np.where(beta > tol * bn)[0]
@@ -189,9 +279,9 @@ def fgmres_block(A, b, x0, prec, tol=1e-10, m=150, cb=None):
     for i in range(m):
         if len(act) == 0:
             break
-        zb = prec(np.ascontiguousarray(V[act, i].T))
+        zb = prec(xp.ascontiguousarray(V[act, i].T))
         Z[act, i] = zb.T
-        w = np.asarray(A @ zb)
+        w = xp.asarray(A @ zb)
         keep = []
         for jj, j in enumerate(act):
             wj = w[:, jj].copy()
@@ -199,8 +289,8 @@ def fgmres_block(A, b, x0, prec, tol=1e-10, m=150, cb=None):
             for _ in range(2):                                  # classical Gram-Schmidt, twice
                 h = Vj.conj() @ wj
                 wj -= h @ Vj
-                Hh[j, :i + 1, i] += h
-            hn = np.linalg.norm(wj)
+                Hh[j, :i + 1, i] += gpu.asnumpy(h)
+            hn = float(xp.linalg.norm(wj))
             Hh[j, i + 1, i] = hn
             if hn > 0:
                 V[j, i + 1] = wj / hn
@@ -217,8 +307,9 @@ def fgmres_block(A, b, x0, prec, tol=1e-10, m=150, cb=None):
     x = x0.copy()
     for j in range(nc):
         if its[j]:
-            x[:, j] += Y[j] @ Z[j, :its[j]]
-    return x, its, np.linalg.norm(b - A @ x, axis=0) / bn
+            x[:, j] += xp.asarray(Y[j]) @ Z[j, :its[j]]
+    del V, Z
+    return x, its, gpu.asnumpy(xp.linalg.norm(b - A @ x, axis=0)) / bn
 
 
 def two_level(A, smoother, coarse=None, pre=1, post=1):
@@ -228,7 +319,7 @@ def two_level(A, smoother, coarse=None, pre=1, post=1):
         return smoother
 
     def prec(r):
-        z = smoother(r) if pre else np.zeros_like(r)
+        z = smoother(r) if pre else gpu.xp_of(r).zeros_like(r)
         for _ in range(pre - 1):
             z = z + smoother(r - A @ z)
         z = z + coarse(r - A @ z if pre else r)

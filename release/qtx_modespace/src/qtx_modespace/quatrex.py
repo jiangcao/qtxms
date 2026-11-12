@@ -78,12 +78,34 @@ def hermitian(M, name, log=print):
 
 
 def lead_bands(lead, ks):
+    from . import gpu
+    if gpu.on:
+        return _lead_bands_gpu(lead, ks)
     H0, H1, S0, S1 = (lead[k].toarray() for k in ("H00", "H01", "S00", "S01"))
     out = []
     for k in ks:
         ph = np.exp(1j * k)
         H, S = H0 + H1 * ph + H1.conj().T / ph, S0 + S1 * ph + S1.conj().T / ph
         out.append(sla.eigvalsh(0.5 * (H + H.conj().T), 0.5 * (S + S.conj().T)))
+    return np.array(out)
+
+
+def _lead_bands_gpu(lead, ks):
+    """lead_bands on the GPU: S(k) = L L^H, eigenvalues of L^-1 H(k) L^-H."""
+    from . import gpu
+    import cupyx.scipy.linalg as cla
+    cp = gpu.cp
+    H0, H1, S0, S1 = (cp.asarray(lead[k].toarray(), dtype=complex) for k in ("H00", "H01", "S00", "S01"))
+    out = []
+    for k in ks:
+        ph = np.exp(1j * k)
+        H, S = H0 + H1 * ph + H1.conj().T / ph, S0 + S1 * ph + S1.conj().T / ph
+        L = cp.linalg.cholesky(0.5 * (S + S.conj().T))
+        X = cla.solve_triangular(L, 0.5 * (H + H.conj().T), lower=True)
+        C = cla.solve_triangular(L, X.conj().T, lower=True)
+        out.append(cp.asnumpy(cp.linalg.eigvalsh(0.5 * (C + C.conj().T))))
+    del H0, H1, S0, S1
+    gpu.free()
     return np.array(out)
 
 
@@ -108,7 +130,8 @@ def lead_edges(lead, mid, nk, cache_dir=None, log=print):
         f.parent.mkdir(parents=True, exist_ok=True)
         db = json.loads(f.read_text()) if f.exists() else {}
         db[key] = dict(Ev=Ev, Ec=Ec, mid=mid, nk=nk)
-        f.write_text(json.dumps(db, indent=1))
+        from .core import write_text_atomic
+        write_text_atomic(f, json.dumps(db, indent=1))
     return Ev, Ec
 
 
@@ -137,12 +160,108 @@ def detect_periodic(xyz, norb, H, S, lat, ax, tol=1e-3):
     return per, info
 
 
+PREP_FORMAT = 1
+_PREP_SPARSE = ("H", "S", "lead_H00", "lead_H01", "lead_S00", "lead_S01",
+                "lead_right_H00", "lead_right_H01", "lead_right_S00", "lead_right_S01")
+
+
+def is_prepared(folder):
+    """True for a folder written by save_inputs (python -m qtx_modespace.prep)."""
+    return (Path(folder) / "prep.json").exists()
+
+
+def _source_files(root):
+    """Size and modification time of the QuaTrEx files a prepared set was made from."""
+    out = {}
+    for nm in ("quatrex_config.toml", "inputs/structure.xyz", "inputs/hamiltonian.h5", "inputs/overlap.h5",
+               "inputs/potential.npy"):
+        p = Path(root) / nm
+        if p.exists():
+            st = p.stat()
+            out[nm] = [int(st.st_size), int(st.st_mtime)]
+    return out
+
+
+def save_inputs(inp, out, options=None, source=None, log=print):
+    """Write a read_quatrex dict to `out` (the prepared folder read back by load_inputs / read_quatrex):
+        prep.json      format, options (cells, trim, potential), source folder + size / mtime of its files, meta
+        arrays.npz     labels, xyz, norb, blocks, perm
+        H.npz, S.npz   device + lead blocks in read_quatrex order, upper triangle only (Hermitian)
+        lead.npz       H00, H01, S00, S01 of the lead cell (+ lead_right_* with a bias)
+    Not compressed (speed); the size is about 12 bytes per stored nonzero."""
+    t0 = time.time()
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "prep.json").unlink(missing_ok=True)                  # written last: a partial folder is not "prepared"
+    np.savez(out / "arrays.npz", labels=np.asarray(inp["labels"]).astype(str), xyz=inp["xyz"], norb=inp["norb"],
+             blocks=inp["blocks"], perm=inp["perm"])
+    for nm in ("H", "S"):
+        sp.save_npz(out / f"{nm}.npz", sp.triu(inp[nm], format="csr"), compressed=False)
+    lead = {}
+    for pre in ("lead", "lead_right"):
+        for k, M in (inp.get(pre) or {}).items():
+            c = sp.csr_matrix(M)
+            lead.update({f"{pre}_{k}_data": c.data, f"{pre}_{k}_indices": c.indices, f"{pre}_{k}_indptr": c.indptr,
+                         f"{pre}_{k}_shape": np.array(c.shape)})
+    np.savez(out / "lead.npz", **lead)
+    info = dict(format=PREP_FORMAT, options=options or {}, source=str(Path(source).resolve()) if source else None,
+                source_files=_source_files(source) if source else {}, meta=inp["meta"])
+    (out / "prep.json").write_text(json.dumps(info, indent=1))
+    size = sum(p.stat().st_size for p in out.iterdir() if p.is_file())
+    log(f"  prepared inputs -> {out} ({size / 2**30:.2f} GB); {time.time() - t0:.0f} s")
+    return info
+
+
+def load_inputs(folder, cells=None, trim=False, potential=False, log=print):
+    """read_quatrex dict from a prepared folder (save_inputs). cells / trim / potential, when given, must agree with
+    the options the folder was prepared with. Warns when the source QuaTrEx files changed since."""
+    t0 = time.time()
+    root = Path(folder)
+    info = json.loads((root / "prep.json").read_text())
+    if info.get("format") != PREP_FORMAT:
+        raise ValueError(f"{root}: prepared-input format {info.get('format')}, this version reads {PREP_FORMAT}; "
+                         f"run python -m qtx_modespace.prep again")
+    meta, opt = info["meta"], info.get("options", {})
+    bad = []
+    if cells and cells != meta["cells_per_block"]:
+        bad.append(f"--cells {cells} (prepared with {meta['cells_per_block']} cells per block)")
+    if trim and not opt.get("trim"):
+        bad.append("--trim (prepared without)")
+    if potential and not opt.get("potential"):
+        bad.append("--potential (prepared without)")
+    if bad:
+        raise ValueError(f"{root}: prepared inputs do not match {', '.join(bad)}; prepare them again with these options")
+    src = info.get("source")
+    if src and Path(src).exists() and _source_files(src) != {k: list(v) for k, v in info["source_files"].items()}:
+        log(f"  WARNING: files in {src} changed since {root} was prepared")
+    A = np.load(root / "arrays.npz")
+    out = {k: A[k] for k in ("labels", "xyz", "norb", "blocks", "perm")}
+    for nm in ("H", "S"):
+        U = sp.load_npz(root / f"{nm}.npz")
+        out[nm] = (U + sp.triu(U, 1).conj().T).tocsr()
+    L = np.load(root / "lead.npz")
+    for pre in ("lead", "lead_right"):
+        ks = [k for k in ("H00", "H01", "S00", "S01") if f"{pre}_{k}_data" in L]
+        out[pre] = {k: sp.csr_matrix((L[f"{pre}_{k}_data"], L[f"{pre}_{k}_indices"], L[f"{pre}_{k}_indptr"]),
+                                     shape=tuple(L[f"{pre}_{k}_shape"])) for k in ks} or None
+    out["meta"] = meta
+    e = meta["edges"]
+    log(f"{meta['name']}: prepared inputs from {root} (cells per block {meta['cells_per_block']}, trim "
+        f"{bool(opt.get('trim'))}, potential {bool(opt.get('potential'))}): {len(out['labels'])} atoms, "
+        f"{out['H'].shape[0]} orbitals, {meta['nblocks']} blocks; lead Ev {e['Ev_lead']:.4f}, Ec {e['Ec_lead']:.4f} eV; "
+        f"{time.time() - t0:.0f} s")
+    return out
+
+
 def read_quatrex(folder, cells=None, trim=False, potential=False, nk=41, cache_dir=None, log=print):
     """Device dict: labels, xyz, norb, blocks, H, S, lead, lead_right, perm, meta (axis, periodic, block_length,
     transport = device / lead blocks, edges = lead band edges Ev_lead, Ec_lead; cached in cache_dir, see
-    lead_edges)."""
+    lead_edges). `folder` is a QuaTrEx device folder or a prepared folder (save_inputs, python -m qtx_modespace.prep),
+    which is loaded as it is."""
     t0 = time.time()
     root = Path(folder)
+    if is_prepared(root):
+        return load_inputs(root, cells=cells, trim=trim, potential=potential, log=log)
     dc = tomllib.loads((root / "quatrex_config.toml").read_text())["device"]
     ax = {"a": 0, "b": 1, "c": 2, "x": 0, "y": 1, "z": 2}[dc["transport_direction"]]   # deviceBuilder writes a|b|c or x|y|z
     norb_sp = dc["num_orbitals_per_atom"]

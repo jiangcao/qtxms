@@ -18,6 +18,8 @@ import numpy as np
 import scipy.linalg as sla
 from scipy.optimize import minimize
 
+from .level1 import periodic_axes
+
 
 def log(*a):
     print(*a, flush=True)
@@ -56,13 +58,13 @@ def slab_cell_map(inp, dev, s, tol=0.6, return_info=False):
     xyz, blocks, norb, lab = inp["xyz"], inp["blocks"], inp["norb"], inp["labels"]
     off = np.concatenate([[0], np.cumsum(norb)])
     ax, L = meta["axis"], meta["block_length"]
-    per = meta.get("periodic")
+    per = periodic_axes(meta.get("periodic"))               # dict or list of {axis, length}
     cb, sb = tr["lead_left_block"], tr["device_blocks"][s]
     ca, sa = np.where(blocks == cb)[0], np.where(blocks == sb)[0]
     d = xyz[sa][None] - xyz[ca][:, None]
     d[..., ax] -= (sb - cb) * L
-    if per:
-        d[..., per["axis"]] -= per["length"] * np.round(d[..., per["axis"]] / per["length"])
+    for pa, pl in per:                                       # minimum image on every periodic transverse axis
+        d[..., pa] -= pl * np.round(d[..., pa] / pl)
     dist = np.linalg.norm(d, axis=2)
     dist[lab[ca][:, None] != lab[sa][None]] = np.inf
     pi, pj = np.unravel_index(np.argsort(dist, axis=None), dist.shape)

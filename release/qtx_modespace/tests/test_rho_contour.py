@@ -87,3 +87,17 @@ def test_rho_contour(cplx):
     for p, q in zip(rho, ref):
         assert np.abs(p - q).max() < 1e-11 * scale
         assert np.abs(p - p.conj().T).max() < 1e-14 * scale
+
+
+@pytest.mark.parametrize("cplx", [False, True])
+def test_rho_contour_level1(cplx):
+    """Level 2 on level 1: with square unitary V_s the global rho of the level-1 system is V_s^H rho_ss V_s."""
+    d = device(cplx, seed=5)
+    rng = np.random.default_rng(1)
+    V = [np.linalg.qr(rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n)))[0] for n in d.ns]
+    mu1, mu2, npts = -1.0, 1.5, 12
+    rho = core.rho_contour(d, mu1, mu2, npts, log=lambda *a: None)
+    rho1 = core.rho_contour(d, mu1, mu2, npts, log=lambda *a: None, V=V)
+    scale = max(np.abs(a).max() for a in rho)
+    for p, q, v in zip(rho1, rho, V):
+        assert np.abs(p - v.conj().T @ q @ v).max() < 1e-11 * scale
