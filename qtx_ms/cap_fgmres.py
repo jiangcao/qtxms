@@ -1,6 +1,8 @@
 """One-level solve: flexible GMRES on the QTBM system A psi = b, right-preconditioned by the cap-Schwarz smoother
 alone (schwarz.CapSchwarz: restricted additive Schwarz, windows along x with absorbing ramps on the artificial cuts,
-lead faces keep Sigma). No mode-space coarse level, x0 = 0.
+lead faces keep Sigma). No mode-space coarse level, x0 = 0. With --coarse slow: two-level with the coarse level from
+the slow error modes of the smoother / cycle, built at every energy (schwarz.SlowCoarse; --slow-m vectors per round,
+--slow-q subspace steps, --slow-rounds), x0 = P_c b.
 
 Per energy: lead Sigma (cached), injection b, window factorization, block FGMRES (schwarz.fgmres_block, all channels
 at once, residual estimate logged every iteration); T from the iterate. With --exact also a sparse direct solve
@@ -13,7 +15,7 @@ import numpy as np
 
 from qtx_ms.prep.inputs import read_inputs
 from qtx_ms import msbasis as mb
-from qtx_ms.schwarz import CapSchwarz, fgmres_block, fgmres_restart
+from qtx_ms.schwarz import CapSchwarz, SlowCoarse, fgmres_block, fgmres_restart
 
 log = mb.log
 
@@ -35,6 +37,13 @@ def main():
     p.add_argument("--restart", type=int, default=0, help="> 0: restarted FGMRES(m), columns converged at a restart are "
                    "frozen (0: one unrestarted cycle of --maxit)")
     p.add_argument("--tol", type=float, default=1e-8, help="relative residual per column")
+    p.add_argument("--coarse", default="none", choices=["none", "slow"], help="none: one-level, x0 = 0; slow: two-level "
+                   "with the slow-mode coarse level built at each energy (schwarz.SlowCoarse), x0 = P_c b")
+    p.add_argument("--slow-m", type=int, default=64, help="slow: vectors per round")
+    p.add_argument("--slow-q", type=int, default=3, help="slow: subspace-iteration steps per round")
+    p.add_argument("--slow-rounds", type=int, default=3, help="slow: rounds (coarse size m x rounds)")
+    p.add_argument("--pre", type=int, default=1, help="slow: pre-smoothing steps")
+    p.add_argument("--post", type=int, default=1, help="slow: post-smoothing steps")
     p.add_argument("--exact", action="store_true", help="also the sparse direct solution: error in psi and T")
     p.add_argument("--psi-dir", help="save / reuse the exact psi here (psi_<E>.npz)")
     p.add_argument("--psi-wait", type=float, default=0, help="with --exact: wait up to this many hours for psi_<E>.npz "
@@ -51,7 +60,8 @@ def main():
     os.makedirs(os.path.dirname(fjs) or ".", exist_ok=True)
     w, s, d = (float(v) for v in a.cap.split(","))
     log(f"{name}: device {dev.n} orbitals, slabs {dev.ns}; cap-Schwarz {a.cap} {a.cap_centres} {a.cap_solver}, "
-        f"{a.workers} workers, no coarse level, x0 = 0; MKL threads {os.environ.get('MKL_NUM_THREADS')} -> {fjs}")
+        f"{a.workers} workers, " + ("no coarse level, x0 = 0" if a.coarse == "none" else
+        f"slow-mode coarse level (m {a.slow_m}, q {a.slow_q}, {a.slow_rounds} rounds), x0 = P_c b") + f"; MKL threads {os.environ.get('MKL_NUM_THREADS')} -> {fjs}")
     S = CapSchwarz(dev, inp, w, s, d, spacing=a.cap_spacing, solver=a.cap_solver, centres=a.cap_centres,
                    workers=a.workers)
     for dE in (float(x) for x in a.dE.split(",")):
@@ -74,18 +84,22 @@ def main():
                 log(f"  it {i + 1}: residual estimate max {est.max():.2e}, median {np.median(est):.2e}, "
                     f"active {(est > a.tol).sum()}")
         clock = {}
+        prec, x0, slow = S, np.zeros_like(b), None
+        if a.coarse == "slow":
+            slow = SlowCoarse(A, S, a.slow_m, a.slow_q, a.slow_rounds, a.pre, a.post, log=log)
+            prec, x0 = slow.cycle, slow(b)
         t = time.time()
         if a.restart > 0:
-            x, its, rres, ncyc = fgmres_restart(A, b, np.zeros_like(b), S, a.tol, a.restart, a.maxit, clock, cb, log)
+            x, its, rres, ncyc = fgmres_restart(A, b, x0, prec, a.tol, a.restart, a.maxit, clock, cb, log)
         else:
-            x, its, rres = fgmres_block(A, b, np.zeros_like(b), S, a.tol, a.maxit, clock, cb)
+            x, its, rres = fgmres_block(A, b, x0, prec, a.tol, a.maxit, clock, cb)
             ncyc = 1
         tit = time.time() - t
         Tx = T(x)
         r = dict(E=E, channels=int(B.shape[1]), its=its.tolist(), res=rres.tolist(), res_hist=hist, T=Tx,
-                 restart=a.restart, cycles=ncyc, t_sigma=tsig, t_factor=S.twall, t_iter=tit, clock=clock, n_windows=len(S.idx),
+                 restart=a.restart, cycles=ncyc, coarse=a.coarse, slow=None if slow is None else slow.info, t_sigma=tsig, t_factor=S.twall, t_iter=tit, clock=clock, n_windows=len(S.idx),
                  window_sizes=[len(i) for i in S.idx], cap=a.cap, centres=a.cap_centres, solver=a.cap_solver)
-        log(f"  FGMRES: its {its.min()}..{its.max()}, true residual max {rres.max():.1e}, T {Tx:.6f}; factor "
+        log(f"  FGMRES ({a.coarse}" + (f", N {slow.N}, build {slow.info['t_build']:.0f} s" if slow else "") + f"): its {its.min()}..{its.max()}, true residual max {rres.max():.1e}, T {Tx:.6f}; factor "
             f"{S.twall:.0f} s + iterations {tit:.0f} s (" + ", ".join(f"{k} {v:.0f}" for k, v in clock.items()) + ")")
         if a.exact:
             fpsi = os.path.join(a.psi_dir, f"psi_{E:+.8f}.npz") if a.psi_dir else None
@@ -120,6 +134,8 @@ def main():
                      t_exact=tex)
             log(f"  exact: T {Tex:.6f}, FGMRES T err {r['T_err']:+.1e}, psi err {r['err_psi']:.1e}; direct {tex:.0f} s")
         S.ops = None                                              # free the window factors
+        if slow is not None:
+            slow.free()
         res = json.load(open(fjs)) if os.path.exists(fjs) else {"E": {}}
         res["Ec"] = Ec
         res["E"][f"{dE:.4f}"] = r
