@@ -381,6 +381,186 @@ Per energy E:
   is non-monotonic (|A_c^-1| 1.6e4 / 1.5e4 / 2.8e3 / 3.4e4 / 634 at 1e-8 … 1e-4): not a low-occupation effect; cut 1e-4
   (amplification 8–21) also stalls. Next idea (user, 2026-11-12): overlapping / partition-of-unity smoothed basis
   vectors across the slab faces (GenEO-type), prototype on 2808a first.
+- SA-style smoothing of the coarse basis (2026-11-12, results_ms/gpu/pou/sa_smooth.py, run_sa_2808a.sh, sa_2808a*.log;
+  literature notes sessions/2026-11-12-pou-basis-literature.txt): U = (I − M A)^k U0, U0 = slab level 1 1e-8 (N 2373),
+  QR, dense Galerkin A_c, 2808a, two-level FGMRES its (max over columns) at Ec+0.05 / 0.15 / 0.2: U0 29 / 38 / 47;
+  M = damped Jacobi 33 / 36 / 41 (diag(A) ~ 0, ω 0.002–0.04: useless); M = CAP-Schwarz 16 Å at the solve energy, k = 1
+  20 / 21 / 22, k = 2 9 / 9 / 10. The smoothed span is no mode space (MS psi err 2–4, T err up to −50%, exact psi in
+  span only to 0.2) and σ_min(A_c) is not better (4e-4…1.3e-3 vs 1.4e-4…4.8e-3; near-zero eigenvalues get Im
+  1e-4…2e-3 instead of 1e-7): the gain is in the cycle, not in the spurious eigenvalues. Smoothed once at Ec+0.10 and
+  reused: k = 1 25 / 26 / 42, k = 2 18 / 22 / 36 (gain mostly lost 0.1 eV away). Cost N smoother applications per
+  smoothing step: does not pay per energy. Not yet tried on 6 nm (needs block-local storage of U instead of dense).
+- Partition-of-unity level-1 basis (2026-11-12, results_ms/gpu/pou/pou_basis.py, run_pou_2808a.sh, pou_2808a_d*.log;
+  rho cache /scratch/jiacao/mg_modespace/pou): slab extended by delta into its neighbours, local rho of the extended
+  block (CAP + lead Sigma, 12 A), smoothstep ramp over 2 delta across each slab face (sum chi = 1), vectors chi v
+  ("chiv") or eigenvectors of chi rho chi ("chirho"), QR, dense Galerkin. 2808a, delta 4 A, cut 1e-8, Ec+0.05 / 0.15 /
+  0.2, two-level FGMRES its (max): U0 (N 2373) 29 / 38 / 47; chiv (N 2805) 49 / 54 / 63; chirho (N 1827) 45 / 53 / 60.
+  Negative: the near-zero eigenvalues of A_c stay (sigma_min 2e-4…3e-3, same count, almost real, fine residual 6–7 eV,
+  70–80% of |w|^2 within 3 A of a slab face = 32% of the device). MS T err 5e-8…5e-5 (U0 1e-6…3e-4), best psi in span
+  the same or 3–6x better (chiv). Control "hard" (rho of the extended block cut back to the slab, i.e. only the
+  embedding is larger: 16 A on the interior sides): N 1666 instead of 2373 at the same cut with the same its (30 / 37 /
+  48), T err 1e-6…4e-5 and best-in-span: a larger embedding gives a more compact level 1.
+  delta 7.5 A (ramp = almost the whole slab): chiv (N 2448) 43 / 48 / 53, chirho (N 1459) 38 / 44 / 51, still above U0;
+  smallest eigenvalues still almost real with residual 6.5–7 eV at Ec+0.05 / 0.15 (face weight 0.42–0.46 instead of
+  0.7): the ramp width is not the cause. MS T err chiv 5e-8…1e-7, chirho 2e-7…4e-6. "hard" N 1249 with 30 / 38 / 48
+  its and T err 2e-7…2e-6, but here the embeddings (20 000 of 22 848 orbitals, both lead faces) are nearly the whole
+  device, i.e. this is close to direct level 2: 2808a is too short to separate embedding size from global rho.
+- Coarse-level tests on 2808a, 2026-11-12/13 (GH200; two-level FGMRES, CAP-Schwarz 16,2,2, tol 1e-10, its = max over
+  columns at Ec + 0.02 / 0.05 / 0.1 / 0.15 / 0.2 / 0.3 / 0.4; one-level 57 / 56 / 57 / 62 / 86 / 126 / 150 (3e-6)):
+  * Contour points of the slab level-1 local rho 24 -> 48 (results_ms/gpu/npts/): N1 the same to one column at cuts
+    1e-8 / 1e-6 / 1e-4 (2373 / 1305 / 705), best-in-span the same, its the same: the 24-point filter is sharp enough,
+    the cut removes weakly occupied in-window directions, not out-of-window leakage. 96 points not run (the contour
+    Sigma files, 149 MB per point, filled /usr/scratch/mont-fort15; deleted). Keep big caches on /scratch/jiacao.
+  * Its barely depend on the cut: slab level 1 1e-8 (N 2373) 30 / 29 / 31 / 38 / 46 / 150 (stall, 9e-9) / 94; 1e-6
+    (1305) 32 / 31 / 31 / 36 / 44 / 65 / 97; 1e-4 (705) 37 / 38 / 39 / 44 / 50 / 76 / 113; 1e-2 (454, MS T err 4%)
+    32 / 30 / 35 / 38 / 49 / 79 / 119. The 1e-8 stall at Ec+0.3: sigma_min(A_c) 4e-5, amplification 680-1570.
+  * PoU at cuts 1e-2 / 1e-4 / 1e-6, ramp 4 and 7.5 A (run_pou_cuts_2808a.sh, pou_2808a_d*_c*.log): chiv / chirho
+    never below the block-diagonal basis (+0…+16 its), sigma_min(A_c) unchanged; "hard" = same its with fewer
+    columns (1e-6: 985 / 899 vs 1305).
+  * Residual-minimising coarse correction P_c = U (C^H C)^-1 C^H, C = A U (results_ms/gpu/pou/mr_coarse.py,
+    mr_2808a.log): amplification 0.94-0.99 by construction, but ~2x the its of Galerkin at every cut (1e-8: 62 / 62 /
+    70 / 86 / 109), no convergence at Ec+0.3, true residual O(1) after 150 its at Ec+0.4 (FGMRES breakdown, cause
+    not found). The MR start has a 30-400x smaller residual and T err 0.2-0.8% (Galerkin 1e-6…3e-4). Reading (not
+    tested): |A e| weights error by distance from E, so MR spends U on far-from-E components the smoother removes
+    anyway and leaves the near-E states. Keep Galerkin; large amplification alone is not what stalls 2808a.
+  * End-slab lead-band cleanup of slab level 1 (--clean-slabs 0,-1, results_ms/gpu/clean/): 1e-8 184 / 221 spurious
+    -> 0 with 9 / 14 vectors (N 2396), MS T err max 3.4e-4 -> 1.5e-5, its 32 / 31 / 33 / 38 / 44 / 65 / 96 (Ec+0.3
+    stall gone); 1e-6 (N 1334) 34 / 35 / 35 / 38 / 46 / 70 / 100, T err unchanged (max 1.6e-3).
+  * Lead-CMS basis as the Galerkin coarse level (user, 2026-11-13; bases of results_ms/mos2_hfo2_leadcms_sweep linked
+    in results_ms/gpu/leadcms/, same H / atom order as the release prep): cut 1e-9 (N 980) 34 / 33 / 32 / 38 / 50 /
+    80 / 119; + RMS (1012) 33 / 31 / 29 / 32 / 44 / 75 / 121; 1e-11 + RMS (1204) 36 / 34 / 33 / 37 / 49 / 71 / 117,
+    with stand-alone MS T err 1-79%. Same its as slab level 1 up to Ec+0.2 at 40% of the columns and no device
+    contour; worse at Ec+0.3 / 0.4. Not yet tried on 6 nm (the case that matters).
+  GenEO family (papers/GenEO/, 11 PDFs; read from abstracts / arXiv HTML summaries only): GenEO selects what the
+  one-level method fails on, chi v is part of the definition; H_k-GenEO needs all negative local eigenvalues (half
+  the orbitals in TB) and subdomains < wavelength; MS-GFEM = local solutions at the solve energy on an oversampled
+  patch (our level 1 is its window-integrated, hard-cut analogue); Nataf-Parolin extended GenEO (non-symmetric, RAS):
+  dominant singular vectors of the local error operator, coarse-projector norm sigma left uncontrolled (= our
+  amplification). Open: Nataf-Parolin vectors from the CAP windows (per energy), MS-GFEM space at E.
+- Coarse level from the smoother's slow error modes (user, 2026-11-13; results_ms/gpu/slow/slow_modes.py,
+  run_slow_2808a.sh, slow_2808a.log; hypothesis note sessions/2026-11-13-coarse-level-hypothesis.txt; 2808a, CAP-Schwarz
+  16,2,2, modes built at the solve energy, Ec+0.05 / 0.2 / 0.3). Smoother alone T = I − M A (64 Ritz values, block
+  subspace iteration q 8): |θ| > 1: 4 / 12 / 42, > 0.5: 35 / 53 / 57 (the smoother diverges on more modes as channels
+  open). Part of the slow modes (|θ| > 0.7) outside span(U), median: slab level 1 1e-2 (N 454) 0.48 / 0.54 / 0.41, 1e-8
+  (N 2373) 0.36 / 0.36 / 0.30, lead CMS (N 980) 0.52 / 0.51 / 0.42: every mode-space basis holds only half to two
+  thirds of each slow mode, almost independent of N (hypothesis right in direction; predicted "close to 1").
+  Enrichment U_r = [U_{r−1}, 64 dominant vectors of the cycle error operator T(I − P_c A)T], global vectors, FGMRES its
+  (min..max over columns) at round 0 / 1 / 2 / 3:
+    none (round 0 = 2 smoothing steps): Ec+0.05 34-41 / 11-15 / 11-14 / 10-13; Ec+0.2 60-69 / 18-23 / 13-17 / 11-15;
+      Ec+0.3 98-107 / 29-37 / 18-23 / 14-18 (N 64 / 128 / 192; cycle |θ|max 0.24-0.75 after round 1).
+    slab level 1 1e-2: 24-30 → 13-16; 43-49 → 17-21; 72-79 → 26-31.   slab level 1 1e-8: 24-29 → 17-20; 40-47 → 20-25;
+      63-150 (stall) → 32-38.   lead CMS: 27-33 → 19-23; 44-50 → 27-32; 73-80 → 42-46.
+  => 64-192 slow modes alone beat every mode-space basis (N 454-2373) by 2-4x, and a mode-space base makes the
+  enriched level worse (isolated cycle factors 1-30 remain = its spurious Galerkin eigenvalues). Modes cut into slab
+  blocks (block-diagonal U, 4x the columns): none 16-20 / 24-30 / 34-41 after round 1, 20-24 / 23-27 / 25-30 after
+  round 3 (worse than global at Ec+0.05 / 0.2, not monotonic). Build cost per round: m (q + 1) = 576 cycle applications
+  ≈ one two-level solve of 19 columns x 30 its, so per energy it does not pay unless the modes are reused in energy or
+  built with fewer steps.
+  Follow-up (run_slow_reuse_2808a.sh, slow_2808a_reuse0.10.log, _m32q3.log, _m64q3.log; its = max over columns, rounds
+  0 / 1 / 2 / 3). Cheaper build at the solve energy, base none: m 64 q 3 (256 cycle applications per round) Ec+0.05
+  41 / 16 / 16 / 14, Ec+0.2 69 / 35 / 23 / 19, Ec+0.3 107 / 44 / 29 / 22 (q 8: 15 / 14 / 13, 23 / 17 / 15, 37 / 23 /
+  18); m 32 q 3 (128 per round) 41 / 21 / 16 / 16, 69 / 40 / 32 / 25, 107 / 69 / 44 / 34. Build in its-equivalents
+  (cycle applications / columns): 64 x 4 = 13.5 / 10.7 / 8.5 per round, so solve + build ≈ 16 + 13.5, 23 + 21 (2
+  rounds), 29 + 17 (2 rounds) vs slab level 1 1e-2 30 / 49 / 79 and none 41 / 69 / 107: break-even at Ec+0.05, ahead
+  where the smoother is weak, and no basis build. Reuse of modes built at Ec+0.10 (m 64 q 8): base none Ec+0.05
+  41 / 27 / 24 / 22, Ec+0.10 41 / 17 / 15 / 14, Ec+0.15 46 / 25 / 27 / 28, Ec+0.2 69 / 43 / 42 / 45 (0.05 eV away half
+  the gain is lost, 0.1 eV away 2/3, extra rounds do not help); base slab level 1 1e-2 Ec+0.05 30 / 21 / 19 / 17 (= built
+  at E), Ec+0.10 35 / 21 / 17 / 18, Ec+0.15 38 / 25 / 21 / 21, Ec+0.2 49 / 34 / 30 / 27 (at E: 28 / 22 / 21). => slow
+  modes alone are energy specific; mode-space base + reused slow modes is robust over ±0.05–0.1 eV (the mode space
+  supplies the energy-independent part).
+  6 nm, Ec+0.15, slow modes only (run_slow_6nm_t015.sh, slow_6nm_t015.log; windows 16 A, y split 4, tov 10.7: 172
+  windows of 3792..10083 orbitals, factor 78 s, 117 GB complex64 LUs on the host; m 64, q 3, 4 rounds; FGMRES on the 12
+  strongest of 40 channels, maxit 60): smoother T: 18 of 64 |θ| > 1 (max 1.58), cycle without coarse level 22 of 24
+  > 1 (max 2.79). Largest cycle |θ| / FGMRES residual estimate (max over columns) after 60 its, N 64 / 128 / 192 /
+  256: 1.94 / 1.34 / 1.07 / 5.21 (σ_min(A_c) 4.6e-2 → 5.3e-4, 9 of 24 > 1); 0.60 / 0.22 / 0.12 / 6.0e-4 (psi err 0.73 /
+  0.56 / 0.20 / 1.3e-3; N 256 falls ×0.77 per it over the last 20 its). First coarse level that makes FGMRES converge
+  with these windows (mode-space levels stall at 14 / 1.5), but 256 modes are not yet enough (2808a: 64): the count
+  grows with the device (172 vs 7 windows). Wall time: a smoother pass streams all LUs and barely depends on the
+  number of columns, so a round of 64 vectors costs 17–19 s vs 7.1 s per FGMRES iteration (427 s per 60 its): the
+  build is cheap here, use more / larger rounds.
+  m 128 per round, 8 rounds, maxit 100 (slow_6nm_t015_m128.log; smoother T: 40 of 128 |θ| > 1): N 256 100 its,
+  residual 2.5e-6 (not converged); N 512 24–30 its to 1e-10 (psi err 7.8e-10, cycle |θ|max 1.00, 6 of 24 > 0.5);
+  N 768 23–29; N 1024 26–31 (saturated at 512; σ_min(A_c) 5e-4…9e-4 from N 384 on, isolated factors 1–2 remain).
+  Wall time for N 512: factor 79 s + build 4 x 21–25 s + FGMRES 203 s (12 columns, 6.8 s per it) ≈ 380 s vs exact
+  streamed block LU 137–163 s per energy for all channels: converges, not yet faster (pass time = streaming 117 GB of
+  host LUs).
+  Transverse window shell 10.7 -> 6 A (--cap-tov 6, slow_6nm_t015_tov6.log; windows 2952..7690 orbitals, LUs 68 GB,
+  factor 55 s; smoother T: 21 of 128 |θ| > 1): N 512 28–36 its (182 s, 5.1 s per it), N 768 27–33, N 1024 27–33, all
+  to 1e-10. +4–6 its for 42% less LU memory; ≈ 310 s in total, still above the exact solve.
+  Energy sweep with a recycled coarse space (previous solutions, Ritz vectors of the FGMRES Hessenberg with the largest
+  |1 − θ| as Z g; sweep_recycle.py, run_sweep_recycle_2808a.sh, sweep_recycle_2808a.log; 2808a Ec+0…0.3 in 10 meV steps, 31 energies,
+  19–30 channels, maxit 100, 128 slow modes (2 x 64, q 3), recycled part capped at 256 columns). Its (max over
+  columns) at Ec+0 / 0.05 / 0.1 / 0.15 / 0.2 / 0.25 / 0.3, total over the sweep, solve time:
+    no coarse level                      43 / 41 / 41 / 46 / 69 / 100* / 100*   1935   211 s   (* = not converged)
+    slow modes fixed at Ec+0             14 / 21 / 25 / 31 / 45 / 82 / 88       1330   154 s
+    fixed + previous solutions           14 / 14 / 19 / 24 / 35 / 62 / 69        988   118 s
+    fixed + recycled Ritz vectors        14 / 36 / 39 / 47 / 69 / 100* / 100*   1801   211 s
+    fixed + both                         14 / 32 / 34 / 45 / 66 / 100* / 100*   1770   211 s
+    Ritz only / both, no slow modes      43 / 57 / 56 / 67 / 88 / 100* (worse than no coarse level)   2271 / 2211
+    slow modes rebuilt at every energy   14 / 16 / 17 / 19 / 22 / 23 / 29        618    99 s incl. ~1 s build per energy
+  => rebuild per energy wins everywhere and its build is cheap (512 cycle applications ≈ 1 s on 2808a, 17–27 s on
+  6 nm): no reason to carry the space. Previous solutions help while the fixed modes are fresh (≤ fixed − 7 its up to
+  Ec+0.13; median start residual 1e-3…1e-5, max still O(1)) but do not replace energy-specific slow modes. The Ritz
+  vectors as selected (largest |1 − θ| of non-converged per-column Krylov spaces) damage the coarse level (start
+  residual 10–20); σ_min(A_c) not logged, cause not verified.
+  Report with method write-up (how the slow modes / coarse solver are built) and figures: reports/2026-11-13-coarse-level-
+  findings/ (summary.md, fig1–6, make_figures.py). Reading (user, 2026-11-13): mode space is a separate single-shot
+  product; the solver's coarse level = slow modes rebuilt per energy. 6 nm open item: cost (factor 79 + build ~90 +
+  FGMRES 203 s vs exact 150 s; tov 6 Å ~310 s).
+  Spectrum check (slow_modes.py --spec, run_slow_spec_2808a.sh, slow_spec_2808a.log): the slow-mode A_c has as many
+  small singular values as mode space (σ < 3e-2: 23–29 at N 192) but no spurious states: eigenvalues next to 0 have
+  Im ≈ Re (1e-4…1e-2, damped) and fine residual 0.07–3 eV; the 0.02–0.17 eV state at Ec+0.2 (4.3e-4 + 1.4e-4i) is a
+  physical resonance present in every basis. Mode space keeps its almost real (Im 1e-7) 6.5–7.3 eV states after 3
+  rounds of slow-mode enrichment. Related methods: adaptive / bootstrap AMG, Lüscher inexact deflation, DD-αAMG
+  (papers/AMG/, note in the report): same setup, but they aggregate the test vectors into a sparse block-local P
+  (local coherence); our "slab" cut of the slow modes was worse on 2808a.
+  Implemented 2026-11-13 (`SlowCoarse` in release schwarz.py and qtx_ms/schwarz.py, identical): release cli
+  `--fgmres-coarse slow --slow-m 64 --slow-q 3 --slow-rounds 3` (open and closed system), `--basis none` (no mode
+  space; only with --fgmres coarse slow|none); qtx_ms.cap_fgmres `--coarse slow`. Tests: release
+  tests/test_slow_coarse.py (2D strip + RAS; a 1D chain is degenerate: RAS error rank 2 per cut), test_level1
+  (wire, closed cli), test_gpu (GPU = CPU); repo tests/test_slow_coarse.py. End-to-end check on attelas2 pending:
+  results_ms/gpu/slow/run_release_slow.sh (2808a; SIXNM=1 adds 6 nm Ec+0.15 m 128 x 4, tov 6).
+  2808a done (release_slow_2808a.log): 11-15 / 14-17 / 16-20 its at Ec+0.05 / 0.15 / 0.2 (MS coarse 24-29 / 32-38 /
+  40-48), T err ≤ 1.2e-11, factor 2 + build 3 + iterations 3-5 s. 6 nm Ec+0.15 (release_slow_6nm_t015.log, all 40
+  channels in 4 chunks of 12, m 128 x 4, tov 6, LUs on the host 68 GB): 28-36 its, T err +1.3e-11, psi err 3.5e-11;
+  factor 60 + build 96 + iterations 1025 s (~8.5 s per it per chunk; GPU shared with another job) vs exact ~150 s:
+  converges on every channel, cost per channel chunk is the problem. Release 0.4.0 (2026-11-14, commit a659d0d, tag
+  qtx_modespace-v0.4.0, built with uv on zijin x86; dist/ wheel + sdist + SHA256SUMS; 53 tests pass from source incl.
+  GPU (P100), wheel 39 pass / 14 GPU-skipped).
+- Multilevel method (user, 2026-11-13; next task: O(N), less FGMRES / window LU / solve time) = additive Schwarz with
+  CAP (RAS smoother on every level) + GenEO for indefinite problems (coarse vectors from the smoother's own local
+  window operators A_j = R_j A R_j^T − iW_j: local contour ρ over the energy window, or the eigenvectors of A_j next to
+  0 by inverse iteration with the already factored window LUs; partition of unity) + bootstrap AMG (algebraic recursion
+  A_k = P_k^H A_{k−1} P_k with the CAP projected by the composite prolongation; slow modes of the current cycle as
+  correction). Consistency (user): the prolongation must come from the same embedding / CAP as the smoother. Level k+1
+  only has to hold the slow modes of the level-k smoother, so the "missing complement" failure of tile_iter (target =
+  the true fine ρ) does not apply. Risks: Galerkin spurious states on every level; indefinite GenEO needs many local
+  vectors. Plan: (1) two-level test on 2808a with the 16 Å smoother windows (fraction of global slow modes in span,
+  its, A_c spectrum), (2) three-level V-cycle, (3) 6 nm. Session: sessions/2026-11-13-slow-coarse-release040-multilevel.txt.
+- PoU slab basis on 6 nm, stand-alone MS (results_ms/gpu/pou/pou_ms_6nm_d4.log, delta 4 Å, 6690 s), T err at Ec + 0.02 /
+  0.05 / 0.15 / 0.3: block-diagonal slab level 1 1e-8 (N 38 054) +7.3e-3 / −6.6e-4 / −1.4e-4 / −8.7e-5; chiv 1e-8 (N
+  41 225) −6.6e-2 / −3.9e-5 / +9.8e-5 / +1.1e-5; "hard" 1e-8 (N 22 648) −1.1e-1 / +1.2e-3 / +2.2e-3 / −4.0e-6; chiv 1e-6
+  (N 18 633) +5.5 / +4.2e-4 / +2.6e-4 / +7.9e-5; "hard" 1e-6 (N 10 592) +176 / +0.49 / −1.2e-2 / +4.8e-6. chiv 10–20x
+  better at Ec+0.05 / 0.3, equal at 0.15, worse at 0.02 (T 1e-8); best-in-span 3–4x better but the Galerkin psi error of
+  the strong channels stays 1e-2…1.8. "hard" is not more compact at equal accuracy on 6 nm (unlike 2808a). Mixed gain.
+- Iterated tile level 1 (user, 2026-11-13; results_ms/gpu/pou/tile_iter.py, run_tile_iter_2808a.sh, tile_iter_2808a_*.log;
+  2808a, cut 1e-6, iteration 0 = 6 Å CAP shell (N 6400), then each tile re-solved with its neighbour tiles as the
+  environment, all tiles updated together; reference = 12 Å CAP shell, 8 tiles N 2264, T err ≤ 2.5e-4, missed exact
+  occupation 6.3e-4). All negative:
+  * env = neighbours in their basis: diverges (local / exact trace up to 4.4, missed occupation 1.1e-2 → 7e-2, T err
+    1.7e-2 → 7.9e-2), same mechanism as tile_scf.py (environment seen only through span(U) lets cut states into the window).
+  * "hybrid" (fine 6 Å shell + neighbour bases beyond): trace right, N 1692–1803, missed occupation 3e-3–1.2e-2, no
+    settling (30–50% of new vectors outside the previous span; iteration 3 −21% at Ec+0.05, σ_min 2.8e-5).
+  * neighbours' CAP projected into their basis (`--env-cap outer`): N 2262 → 2686 → 3273, trace up to 3.9, T err 2.8e-4 →
+    3.7e-3 → 3.2e-3. With tiles y split 2, x = the 4 slabs (`--tsplit 2,1`; reference N 2055, T err ≤ 1.8e-3):
+    iteration 2 N 2382 T err ≤ 1.1e-4 (best tile variant), but N keeps growing 250–400 per iteration.
+  * cluster ρ (centre tile + neighbours in their basis) restricted by a PoU ramp (8 / 15 Å): chiv N 7874 / 8300 (no
+    better T, one energy 5e-3), chirho N 2279 / 2640 (≈ reference at 8 Å, −5% at Ec+0.05 for 15 Å); cluster ρ
+    over-occupies the centre tile by 1–11% in trace.
+  * spurious coarse states never reduced: σ(A_c) < 3e-2 count 15–21 (reference) → 23–38, all almost real, fine residual
+    6–7 eV; a wider ramp is worse. "spurious vectors" metric (exact occupation < cut/10) = 0 for every basis: useless.
+  => stop iterating tile bases with neighbours represented by their basis vectors; the fine extended embedding (slab
+  PoU) is better (inference across different cuts / partitions, not a controlled test).
 - CSCS Alps (plan sessions/2026-11-11-alps-env-plan.txt; not yet run there): install into the QuaTrEx uenv venv
   (prgenv-gnu/26.3, cupy-cuda13x, mpi4py on cray-mpich) with scripts/setup_env.sh (reuses the venv's cupy / mpi4py,
   CUDA from $CUDA_HOME, kernel caches on $SCRATCH); job templates scripts/alps/{gpu_bind.sh,basis,sweep,exact}.sbatch
