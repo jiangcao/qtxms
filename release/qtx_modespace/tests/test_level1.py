@@ -145,7 +145,30 @@ def test_fgmres_cap_schwarz_converges(coarse):
     assert np.linalg.norm(xs - x) < 1e-8 * np.linalg.norm(x)
 
 
-@pytest.mark.parametrize("coarse,eta,face", [("ms", 0.0, False), ("none", 0.0, False), ("ms", 0.01, True)])
+def test_fgmres_cap_schwarz_slow_coarse():
+    """Two-level FGMRES with the slow-mode coarse level (schwarz.SlowCoarse, no basis) on the wire: converges to the
+    direct solution, Galerkin coarse level."""
+    inp = wire(nb=8)
+    dev = core.Device(inp)
+    E = -0.4
+    SL, SR = dev.sigma(E + 1e-6j)
+    B = core.injection(SL)
+    b = np.zeros((dev.n, B.shape[1]), complex)
+    b[dev.bL] = B
+    A = dev.A(E, SL, SR)
+    x = core.CSolver(A).solve(b)
+    sw = schwarz.CapSchwarz(dev, inp, width=4.0, s=2.0, d=1.0, solver="dense", log=lambda *a: None)
+    sw.set_energy(A, log=lambda *a: None)
+    sc = schwarz.SlowCoarse(A, sw, m=8, q=3, rounds=2, log=lambda *a: None)
+    assert sc.N == 16 and np.allclose(sc.Q.conj().T @ sc.Q, np.eye(16), atol=1e-10)
+    assert np.linalg.norm(sc.Q.conj().T @ (A @ sc(b) - b)) < 1e-10 * np.linalg.norm(b)
+    xs, its, res = schwarz.fgmres_block(A, b, sc(b), schwarz.two_level(A, sw, sc), tol=1e-11, m=200)
+    assert res.max() < 1e-10
+    assert np.linalg.norm(xs - x) < 1e-8 * np.linalg.norm(x)
+
+
+@pytest.mark.parametrize("coarse,eta,face", [("ms", 0.0, False), ("none", 0.0, False), ("ms", 0.01, True),
+                                             ("slow", 0.0, False)])
 def test_closed_system_unit_rhs(tmp_path, coarse, eta, face):
     """--system closed: A0 = z S - H (no Sigma), unit right-hand sides on the left contact slab, FGMRES + CAP-Schwarz
     (two- and one-level) agrees with the direct solve."""
@@ -159,6 +182,7 @@ def test_closed_system_unit_rhs(tmp_path, coarse, eta, face):
     sw = schwarz.CapSchwarz(dev, inp, width=4.0, s=2.0, d=1.0, solver="dense", log=lambda *a: None)
     a = types.SimpleNamespace(out=str(tmp_path), dE="-0.4", rhs_slabs="0", rhs_face=face, rhs_chunk=5, rhs_max=0,
                               closed_eta=eta, cap_dE0=0.0, fgmres_coarse=coarse, coarse_eta=0.0, pre=1, post=1,
+                              slow_m=8, slow_q=3, slow_rounds=2,
                               fgmres_tol=1e-11, fgmres_maxit=200, cap="4,2,1", exact=True, workers=2, save_x=str(tmp_path / "x"))
     cli.closed_solves(a, dev, c, sw, 0.0, dict(N=[v.shape[1] for v in V]))
     r = json.load(open(tmp_path / "closed.json"))["E"]["-0.4000"]

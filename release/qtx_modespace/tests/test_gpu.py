@@ -147,6 +147,39 @@ def test_fgmres_cap_schwarz_gpu(coarse):
     assert np.abs(its - out["cpu"][1]).max() <= 1
 
 
+def test_slow_coarse_gpu():
+    """schwarz.SlowCoarse on the GPU (Q, A_c, LU on the device): FGMRES converges to the direct solution like on the
+    CPU (the random start vectors are the same; iteration counts within 2)."""
+    inp = wire(nb=8)
+    dev = core.Device(inp)
+    E = -0.4
+    SL, SR = dev.sigma(E + 1e-6j)
+    B = core.injection(SL)
+    b = np.zeros((dev.n, B.shape[1]), complex)
+    b[dev.bL] = B
+    A = dev.A(E, SL, SR)
+    x = core.CSolver(A).solve(b)
+    out = {}
+    for mode in ("cpu", "gpu"):
+        gpu.enable(mode == "gpu")
+        try:
+            sw = schwarz.CapSchwarz(dev, inp, width=4.0, s=2.0, d=1.0, solver="dense", log=lambda *a: None)
+            sw.set_energy(A, log=lambda *a: None)
+            op = schwarz.operator(A)
+            sc = schwarz.SlowCoarse(op, sw, m=8, q=3, rounds=2, log=lambda *a: None)
+            if mode == "gpu":
+                assert isinstance(sc.Q, gpu.cp.ndarray)
+            bg = gpu.asarray(b)
+            xs, its, res = schwarz.fgmres_block(op, bg, sc(bg), schwarz.two_level(op, sw, sc), tol=1e-11, m=200)
+            out[mode] = (gpu.asnumpy(xs), its, res)
+        finally:
+            gpu.enable(False)
+    xs, its, res = out["gpu"]
+    assert res.max() < 1e-10
+    assert np.linalg.norm(xs - x) < 1e-8 * np.linalg.norm(x)
+    assert np.abs(its - out["cpu"][1]).max() <= 2
+
+
 def test_cli_gpu_transmission(tmp_path):
     """cli pieces in GPU mode: closed solves (exact by the GPU block LU) agree with the direct solve."""
     import json

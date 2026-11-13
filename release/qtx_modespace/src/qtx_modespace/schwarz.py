@@ -16,6 +16,7 @@ Two-level preconditioner (one multiplicative cycle from z = 0):
 Outer: right-preconditioned flexible GMRES on all injected channels at once (one Krylov space per column, the
 smoother and coarse solve act on the block of active columns), x0 = P_c b (the mode-space solution) or 0 without
 coarse level (one-level: preconditioner = the smoother alone).
+Coarse level from the slow error modes instead of mode space: SlowCoarse (adaptive setup per energy, global vectors).
 """
 import time
 import numpy as np
@@ -327,3 +328,92 @@ def two_level(A, smoother, coarse=None, pre=1, post=1):
             z = z + smoother(r - A @ z)
         return z
     return prec
+
+
+class SlowCoarse:
+    """Coarse level from the slow error modes of the smoother and of the two-level cycle (adaptive AMG-type setup, as
+    in Luescher's inexact deflation / DD-alphaAMG, but with global vectors: no aggregation).
+
+    One application of a preconditioner B changes the error by E_B = I - B A. Round 1 (no coarse level yet): B = pre +
+    post multiplicative smoothing steps, E_B = T^(pre + post), T = I - M A. Round r > 1: B = the two-level cycle with
+    the coarse space of round r - 1, E_B = T^post (I - P_c A) T^pre. Per round, block subspace iteration on E_B from
+    m random vectors (q steps, QR after each) gives W ~ the dominant m-dimensional invariant subspace of E_B (the
+    error components the current method damps worst); W is orthogonalized against Q (twice) and appended, Q = [Q, W].
+    Coarse level: Galerkin A_c = Q^H A Q (dense, LU), P_c r = Q A_c^-1 Q^H r (call the object).
+    info["rounds"][r]: N after the round, Ritz |theta| (damping factors) of the operator iterated on in that round (the
+    smoother, then the cycle with the previous coarse space), sigma_min(A_c), time.
+    Cost per round: m q applications of E_B, each = (pre + post) smoother passes (+ coarse solve) + matvecs, on m
+    columns at once. The modes depend on the energy (A and the smoother): build them at every energy (2808a: ~1 s,
+    6 nm: ~20-25 s per round of 128 vectors on a GH200); carried across energies they lose half the gain within
+    0.05 eV. Q is dense (n x m rounds), numpy or cupy (GPU mode).
+    Measured (two-level block FGMRES, CAP-Schwarz 16 A, tol 1e-10, its = max over columns): 2808a Ec+0.05 / 0.2 / 0.3
+    with m 64, q 8, 3 rounds 13 / 15 / 18 its vs mode space (slab level 1 1e-8, N 2373) 29 / 47 / 150; 6 nm Ec+0.15
+    (y split 4) m 128, q 3, 4 rounds (N 512): 24-30 its, where every mode-space coarse level stalls."""
+
+    def __init__(self, A, smoother, m=64, q=3, rounds=4, pre=1, post=1, seed=0, log=log):
+        t0 = time.time()
+        self.A, self.S, self.pre, self.post = A, smoother, int(pre), int(post)
+        assert self.pre + self.post >= 1 and q >= 1 and m >= 1
+        n = A.shape[0]
+        xp = gpu.cp if gpu.on else np
+        rng = np.random.default_rng(seed)
+        self.Q, self.lu = xp.zeros((n, 0), complex), None
+        self.info = dict(m=int(m), q=int(q), pre=self.pre, post=self.post, rounds=[])
+        for r in range(rounds):
+            t = time.time()
+            B = self.cycle if self.lu is not None else self._smooth
+            Y = xp.linalg.qr(xp.asarray(rng.standard_normal((n, m)) + 1j * rng.standard_normal((n, m))))[0]
+            for k in range(q):
+                Z = Y - B(A @ Y)
+                if k == q - 1:                                 # Ritz values of E_B on span(Y): damping factors
+                    th = np.abs(np.linalg.eigvals(gpu.asnumpy(Y.conj().T @ Z)))
+                Y = xp.linalg.qr(Z)[0]
+            del Z
+            for _ in range(2):
+                Y = Y - self.Q @ (self.Q.conj().T @ Y)
+            self.Q = xp.hstack([self.Q, xp.linalg.qr(Y)[0]])
+            del Y
+            smin = self._galerkin()
+            d = dict(N=int(self.Q.shape[1]), theta_max=float(th.max()), n_theta_gt1=int((th > 1).sum()),
+                     sigma_min=smin, t=time.time() - t)
+            self.info["rounds"].append(d)
+            log(f"  slow modes round {r + 1}: Ritz |theta| of the " + (f"cycle with N {d['N'] - m}" if r else
+                "smoother") + f": max {d['theta_max']:.2f}, {d['n_theta_gt1']} of {m} > 1 -> N {d['N']}, "
+                f"sigma_min(A_c) {smin:.1e}; {d['t']:.0f} s")
+        self.N = int(self.Q.shape[1])
+        self.info.update(N=self.N, t_build=time.time() - t0)
+
+    def _galerkin(self):
+        Ac = self.Q.conj().T @ gpu.xp_of(self.Q).asarray(self.A @ self.Q)
+        smin = float(gpu.asnumpy(gpu.xp_of(Ac).linalg.svd(Ac, compute_uv=False))[-1]) if Ac.shape[0] <= 4096 else np.nan
+        self.lu = gpu.lu_factor(Ac)
+        return smin
+
+    def _smooth(self, r):
+        """pre + post multiplicative smoothing steps from z = 0 (round 1)."""
+        z = self.S(r)
+        for _ in range(self.pre + self.post - 1):
+            z = z + self.S(r - self.A @ z)
+        return z
+
+    def __call__(self, r):
+        """Coarse correction P_c r = Q A_c^-1 Q^H r."""
+        Q = self.Q
+        return Q @ gpu.lu_solve(self.lu, Q.conj().T @ gpu.xp_of(Q).asarray(r))
+
+    def cycle(self, r):
+        """One two-level cycle from z = 0 (pre smoothing, coarse correction, post smoothing)."""
+        if self.pre:
+            z = self.S(r)
+            for _ in range(self.pre - 1):
+                z = z + self.S(r - self.A @ z)
+            z = z + self(r - self.A @ z)
+        else:
+            z = self(r)
+        for _ in range(self.post):
+            z = z + self.S(r - self.A @ z)
+        return z
+
+    def free(self):
+        self.Q, self.lu = None, None
+        gpu.free()

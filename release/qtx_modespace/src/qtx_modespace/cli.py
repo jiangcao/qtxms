@@ -25,8 +25,10 @@
      and the error of the solution vectors x_MS - x (see psi_errors); --psi-dir keeps the exact x for reuse
   6. --fgmres: iterative solve to --fgmres-tol by flexible GMRES with the CAP-Schwarz smoother (schwarz.CapSchwarz,
      windows --cap along transport, absorbing layers on the artificial cuts) and the mode-space coarse level
-     (--fgmres-coarse ms: x0 = mode-space solution, two-level cycle with --pre / --post smoothing) or without it
-     (none: one-level, x0 = 0); T_fgmres, iterations and timings per energy
+     (--fgmres-coarse ms: x0 = mode-space solution, two-level cycle with --pre / --post smoothing), the coarse level
+     from the slow error modes built at each energy (slow: schwarz.SlowCoarse, --slow-m vectors per round, --slow-q
+     subspace steps, --slow-rounds; x0 = P_c b; needs no basis) or without it (none: one-level, x0 = 0); T_fgmres,
+     iterations and timings per energy
   7. --system closed --fgmres: A0 = z S - H without the lead self-energy, right-hand sides = unit vectors on the
      contact-slab orbitals (--rhs-slabs, --rhs-face), same FGMRES / smoother / coarse level (without Sigma) -> closed.json
 
@@ -45,7 +47,7 @@ from . import gpu
 from .core import Device, Coarse, exact_solve, injection, rho_contour, top_modes, eigh, log
 from .clean import LeadCell, clean_slab
 from .level1 import build_level1, partition
-from .schwarz import CapSchwarz, fgmres_block, operator, two_level
+from .schwarz import CapSchwarz, SlowCoarse, fgmres_block, operator, two_level
 
 
 def energies(spec):
@@ -235,17 +237,21 @@ def finish_basis(a, inp, dev, Ec, t0, V, eig, info):
 
 
 def solve_fgmres(a, dev, c, sw, A, b, E, SL, SR, Xms, Tof):
-    """FGMRES + CAP-Schwarz (two-level with the Galerkin coarse level, or one-level) on A x = b at one energy."""
+    """FGMRES + CAP-Schwarz (two-level with the Galerkin mode-space or slow-mode coarse level, or one-level) on
+    A x = b at one energy."""
     sw.set_energy(A, a.cap_dE0)
     b = gpu.asarray(b)                               # GPU mode: the whole Krylov loop on the device
-    coarse, x0 = None, gpu.asarray(np.zeros(b.shape, complex))
+    coarse, x0, slow = None, gpu.asarray(np.zeros(b.shape, complex)), None
+    A = operator(A, a.workers)
     if a.fgmres_coarse == "ms":
         Ac = c.Ac(E + 1j * a.coarse_eta, SL, SR) if a.coarse_eta else None
         if Ac is None:
             Ac = c.Ac(E, SL, SR)
         coarse = lambda r: c.prolong(Ac.solve(c.restrict(r)))
         x0 = coarse(b) if a.coarse_eta else gpu.asarray(Xms)
-    A = operator(A, a.workers)
+    elif a.fgmres_coarse == "slow":
+        slow = coarse = SlowCoarse(A, sw, a.slow_m, a.slow_q, a.slow_rounds, a.pre, a.post)
+        x0 = gpu.xp_of(b).asarray(coarse(b))
     prec = two_level(A, sw, coarse, a.pre, a.post)
     hist = []
     t = time.time()
@@ -267,8 +273,10 @@ def solve_fgmres(a, dev, c, sw, A, b, E, SL, SR, Xms, Tof):
     x, its, res = np.concatenate(xs, axis=1), np.concatenate(its), np.concatenate(res)
     tit = time.time() - t
     sw.free()
+    if slow is not None:
+        slow.free()
     return dict(x=x, T=Tof(x), its=its.tolist(), res=res.tolist(), res_hist=hist, t_factor=sw.twall, t_iter=tit,
-                coarse=a.fgmres_coarse, tol=a.fgmres_tol, cap=a.cap, centres=a.cap_centres, split=a.cap_split,
+                slow=None if slow is None else slow.info, coarse=a.fgmres_coarse, tol=a.fgmres_tol, cap=a.cap, centres=a.cap_centres, split=a.cap_split,
                 solver=a.cap_solver, pre=a.pre, post=a.post, coarse_eta=a.coarse_eta, n_windows=len(sw.idx),
                 window_sizes=[len(i) for i in sw.idx])
 
@@ -306,11 +314,13 @@ def closed_solves(a, dev, c, sw, EcT, info):
         log(f"E = Ec {dE:+.3f} (+ {a.closed_eta:g} i), closed system, {len(cols)} unit right-hand sides")
         X = np.zeros((dev.n, len(cols)), complex)
         sw.set_energy(A, a.cap_dE0)
-        coarse = None
+        coarse, slow = None, None
+        Aop = operator(A, a.workers)
         if a.fgmres_coarse == "ms":
             Ac = c.Ac(z + 1j * a.coarse_eta, Z0L, Z0R)
             coarse = lambda q: c.prolong(Ac.solve(c.restrict(q)))
-        Aop = operator(A, a.workers)
+        elif a.fgmres_coarse == "slow":
+            slow = coarse = SlowCoarse(Aop, sw, a.slow_m, a.slow_q, a.slow_rounds, a.pre, a.post)
         prec = two_level(Aop, sw, coarse, a.pre, a.post)
         its, rr, t = [], [], time.time()
         for k in range(0, len(cols), a.rhs_chunk):
@@ -318,7 +328,7 @@ def closed_solves(a, dev, c, sw, EcT, info):
             b = np.zeros((dev.n, len(cc)), complex)
             b[cc, np.arange(len(cc))] = 1.0
             b = gpu.asarray(b)
-            x0 = coarse(b) if coarse is not None else gpu.asarray(np.zeros(b.shape, complex))
+            x0 = gpu.xp_of(b).asarray(coarse(b)) if coarse is not None else gpu.asarray(np.zeros(b.shape, complex))
             Xk, it, rs = fgmres_block(Aop, b, x0, prec, a.fgmres_tol, a.fgmres_maxit)
             X[:, k:k + len(cc)] = gpu.asnumpy(Xk)
             del Xk, b, x0
@@ -326,8 +336,10 @@ def closed_solves(a, dev, c, sw, EcT, info):
             log(f"  columns {k}..{k + len(cc) - 1}: its {it.min()}..{it.max()}, residual {rs.max():.1e}; "
                 f"{time.time() - t:.0f} s")
         sw.free()
+        if slow is not None:
+            slow.free()
         r.update(its=its, res_max=float(max(rr)), its_max=int(max(its)), its_mean=float(np.mean(its)),
-                 t_factor=sw.twall, t_iter=time.time() - t, coarse=a.fgmres_coarse, cap=a.cap, tol=a.fgmres_tol)
+                 t_factor=sw.twall, t_iter=time.time() - t, slow=None if slow is None else slow.info, coarse=a.fgmres_coarse, cap=a.cap, tol=a.fgmres_tol)
         if a.exact:
             t = time.time()
             B = np.zeros((dev.n, len(cols)), complex)
@@ -415,9 +427,10 @@ def main(argv=None):
     g.add_argument("--neig", type=int, help="eigenpairs computed per slab (default 2 * largest nmodes)")
     g.add_argument("--floor", type=float, default=0.0, help="drop modes with occupation < floor * largest")
     g.add_argument("--save-rho", action="store_true", help="keep the slab density matrices (<out>/rho_*.npz, large)")
-    g.add_argument("--basis", default="l2", choices=["l2", "l1"],
+    g.add_argument("--basis", default="l2", choices=["l2", "l1", "none"],
                    help="l2: direct level 2 (slab rho of the open device, default); l1: local density matrices per "
-                        "block (level 1, options below)")
+                        "block (level 1, options below); none: no mode space (only with --fgmres --fgmres-coarse "
+                        "slow|none: the slow-mode coarse level needs no basis)")
     g.add_argument("--modes", help="saved basis directory (slab<s>.npy, slab<s>_orbitals.npy): skip the basis build")
     g.add_argument("--l1-modes", help="--basis l2 on this saved level-1 basis (nested U = U1 V, slab level 2 on level 1)")
     g.add_argument("--l2-cut", type=float,
@@ -470,8 +483,13 @@ def main(argv=None):
     g.add_argument("--psi-dir", help="--exact: store / reuse the exact solutions here (psi_<E>.npy, any basis)")
     g = p.add_argument_group("iterative solve (--fgmres)")
     g.add_argument("--fgmres", action="store_true", help="also solve A x = b to --fgmres-tol by FGMRES + CAP-Schwarz")
-    g.add_argument("--fgmres-coarse", default="ms", choices=["ms", "none"],
-                   help="ms: two-level with the mode-space coarse level, x0 = mode space; none: one-level, x0 = 0")
+    g.add_argument("--fgmres-coarse", default="ms", choices=["ms", "slow", "none"],
+                   help="ms: two-level with the mode-space coarse level, x0 = mode space; slow: two-level with the slow "
+                   "error modes of the smoother / cycle built at each energy (schwarz.SlowCoarse), x0 = P_c b; none: "
+                   "one-level, x0 = 0")
+    g.add_argument("--slow-m", type=int, default=64, help="slow: vectors per round (6 nm: 128)")
+    g.add_argument("--slow-q", type=int, default=3, help="slow: subspace-iteration steps per round")
+    g.add_argument("--slow-rounds", type=int, default=3, help="slow: rounds (coarse size N = m x rounds; 6 nm: 4 x 128)")
     g.add_argument("--fgmres-tol", type=float, default=1e-10, help="relative residual per channel")
     g.add_argument("--fgmres-maxit", type=int, default=150, help="max FGMRES iterations")
     g.add_argument("--fgmres-chunk", type=int, default=0, help="open system: channels per FGMRES block (0 = all; "
@@ -520,6 +538,8 @@ def main(argv=None):
             p.error(f"{k} is required (command line or --config)")
     if a.system == "closed" and not a.fgmres:
         p.error("--system closed needs --fgmres")
+    if a.basis == "none" and (a.modes or not a.fgmres or a.fgmres_coarse == "ms"):
+        p.error("--basis none: only with --fgmres --fgmres-coarse slow|none and without --modes")
 
     if a.gpu or os.environ.get("QTX_MODESPACE_GPU", "").lower() in ("1", "true", "yes", "on"):
         gpu.enable(device=a.gpu_device)
@@ -537,7 +557,10 @@ def main(argv=None):
     nsl = len(dev.ns)
     log(f"device {dev.n} orbitals, slabs {dev.ns}; Ec {Ec:.4f}, Ev {Ev:.4f} eV")
 
-    if a.modes:
+    if a.basis == "none":
+        V, info = None, dict(N=[0] * nsl)
+        log("no mode-space basis (--basis none)")
+    elif a.modes:
         V = []
         for s in range(nsl):
             orb = np.load(os.path.join(a.modes, f"slab{s}_orbitals.npy"))
@@ -556,9 +579,9 @@ def main(argv=None):
     if not (a.transmission or a.fgmres):
         return
     EcT = Ec if a.Ec is None else a.Ec
-    c = Coarse(dev, V)
+    c = Coarse(dev, V) if V is not None else None
     sw = None
-    if a.fgmres and gpu.on:
+    if a.fgmres and gpu.on and c is not None:
         c.to_gpu()
     if a.fgmres:
         w_, s_, d_ = (float(x) for x in a.cap.split(","))
@@ -588,8 +611,11 @@ def main(argv=None):
         b[dev.bL] = B
         Tof = lambda x: float(np.real(np.einsum("ic,ij,jc->", x[dev.bR].conj(), GR, x[dev.bR])))
         t = time.time()
-        Xms = gpu.asnumpy(c.prolong(c.Ac(E, SL, SR, device=False).solve(c.restrict(b))))
-        r.update(E=E, channels=int(B.shape[1]), T_ms=Tof(Xms), t_ms=time.time() - t, t_sigma=ts)
+        Xms = None
+        r.update(E=E, channels=int(B.shape[1]), t_sigma=ts)
+        if c is not None:
+            Xms = gpu.asnumpy(c.prolong(c.Ac(E, SL, SR, device=False).solve(c.restrict(b))))
+            r.update(T_ms=Tof(Xms), t_ms=time.time() - t)
         A, X = None, None
         if a.exact and ("T_exact" not in r or "err_psi" not in r or a.fgmres):
             A = dev.A(E, SL, SR)
@@ -606,8 +632,9 @@ def main(argv=None):
                     os.makedirs(a.psi_dir, exist_ok=True)
                     np.save(fpsi, X)
             r["T_exact"] = Tof(X)
-            r.update({"err_" + k: v for k, v in psi_errors(dev, c, A, b, X, Xms).items()})
-        if r.get("T_exact", 0) > 0:
+            if c is not None:
+                r.update({"err_" + k: v for k, v in psi_errors(dev, c, A, b, X, Xms).items()})
+        if r.get("T_exact", 0) > 0 and "T_ms" in r:
             r["err"] = (r["T_ms"] - r["T_exact"]) / r["T_exact"]
         if a.fgmres:
             A = dev.A(E, SL, SR) if A is None else A
@@ -621,12 +648,12 @@ def main(argv=None):
                 f"T {fg['T']:.6f}" + (f" (err {fg['err_T']:+.1e})" if "err_T" in fg else "")
                 + (f", psi err {fg['err_psi']:.1e}" if "err_psi" in fg else "")
                 + f"; factor {fg['t_factor']:.0f} s + iterations {fg['t_iter']:.0f} s")
-        log(f"E = Ec {dE:+.3f}: {r['channels']} channels, T_MS {r['T_ms']:.5f}"
+        log(f"E = Ec {dE:+.3f}: {r['channels']} channels" + (f", T_MS {r['T_ms']:.5f}" if "T_ms" in r else "")
             + (f", T_exact {r['T_exact']:.5f} ({100 * r['err']:+.4f}%)" if "err" in r else "")
             + (f"; psi error {r['err_psi']:.2e} (max channel {r['err_psi_max']:.2e}, S {r['err_psi_S']:.2e}, "
                f"last slab {r['err_psi_last']:.2e}, best in U {r['err_psi_best']:.2e}), residual {r['err_res']:.1e}"
                if "err_psi" in r else "")
-            + f"; sigma {ts:.0f} s, MS {r['t_ms']:.1f} s" + (f", exact {r['t_exact']:.0f} s" if "t_exact" in r else ""))
+            + f"; sigma {ts:.0f} s" + (f", MS {r['t_ms']:.1f} s" if "t_ms" in r else "") + (f", exact {r['t_exact']:.0f} s" if "t_exact" in r else ""))
         tr["E"] = dict(sorted(res.items(), key=lambda kv: float(kv[0])))
         res = tr["E"]
         json.dump(tr, open(ftr, "w"), indent=1)

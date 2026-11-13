@@ -209,6 +209,17 @@ its own Krylov space, but the preconditioner acts on all active channels at once
   mode-space solution. `--coarse-eta` moves only the coarse solve to E + i eta_c, which removes the stall of a coarse
   level that sits on a narrow spurious mode-space resonance. `--fgmres-coarse none` is one-level: the smoother alone
   with x0 = 0. It needs about 1.5x the iterations of two-level, but each iteration is cheaper.
+- **Slow-mode coarse level** (`--fgmres-coarse slow`, 0.4.0). Instead of mode space, the coarse space is built at
+  each energy from the error components the smoother and the cycle damp worst (`schwarz.SlowCoarse`): block subspace
+  iteration (`--slow-q` steps from `--slow-m` random vectors) on the error operator of two smoothing steps, then of
+  the two-level cycle with the coarse space built so far, `--slow-rounds` times; Galerkin A_c = Q^H A Q, x0 = P_c b.
+  No basis is needed: `--basis none --fgmres --fgmres-coarse slow` skips the basis build and the mode-space solve.
+  Prototype numbers (two-level its, max over channels): 2808 atoms, Ec + 0.05 / 0.2 / 0.3, N 192: 13 / 15 / 18 vs
+  29 / 47 / 150 with slab level 1 1e-8 (N 2373); 6 nm Ec + 0.15 (y split 4), m 128 x 4 rounds (N 512): 24-36 its
+  on the 12 strongest channels,
+  where every mode-space coarse level stalls. Its coarse matrix has no spurious mode-space states (almost real
+  eigenvalues with ~7 eV fine residual). The modes are energy specific: build them at every energy (2808 atoms ~1 s,
+  6 nm ~20-25 s per round of 128 on a GH200). Q is dense (n x N).
 - **Output.** `transmission.json` → `E.<dE>.fgmres`: T, iterations and true residual per channel, residual history,
   factor and iteration time, the settings, and with `--exact` the T and psi errors (`err_T`, `err_psi`).
 
@@ -516,8 +527,28 @@ channels (norm 1e-4 of the physical ones); "max channel" psi errors refer to tho
   the Galerkin coarse operator has a dense set of almost undamped spurious eigenvalues (Ritz values of the
   indefinite operator) from basis vectors cut at the slab faces; their fine residual is ~7 eV, they sit on the slab
   interfaces, mostly in the oxide, and one of them is within ~1e-4 eV of almost any E once N reaches tens of
-  thousands. On the 4- and 10-slab devices (N 2 373 / 8 053) two-level converges. Under investigation; until then
-  use `--fgmres-coarse none` on long devices or check the iteration log (`--fgmres-log`).
+  thousands. On the 4- and 10-slab devices (N 2 373 / 8 053) two-level converges. Use `--fgmres-coarse slow` (see
+  above; converges on 6 nm) or `--fgmres-coarse none` on long devices, and check the iteration log (`--fgmres-log`).
+
+## Release 0.4.0
+
+Tag `qtx_modespace-v0.4.0`. New:
+- Slow-mode coarse level for the iterative solve (`--fgmres-coarse slow`, `schwarz.SlowCoarse`; see "Iterative solve"):
+  the coarse space is built at each energy from the error components the CAP-Schwarz smoother and the two-level cycle
+  damp worst (block subspace iteration, `--slow-m` vectors per round, `--slow-q` steps, `--slow-rounds` rounds),
+  Galerkin coarse matrix, x0 = P_c b. It has no spurious mode-space states (almost real eigenvalues with ~7 eV fine
+  residual), which is what made the mode-space coarse level stall on long devices. Open and closed system, CPU and GPU.
+- `--basis none`: no mode-space basis build or mode-space solve (only with `--fgmres --fgmres-coarse slow|none`).
+- 2808 atoms (GH200, `--basis none --fgmres-coarse slow`, m 64 x 3 rounds, N 192): Ec + 0.05 / 0.15 / 0.2 11-15 /
+  14-17 / 16-20 its (slab level 1 1e-8 coarse level: 24-29 / 32-38 / 40-48), T error <= 1.2e-11, per energy factor
+  2 s + build 3 s + iterations 3-5 s.
+- 6 nm MoS2/HfO2 (344 640 device orbitals, 22 slabs; GH200, Ec + 0.15, CAP windows 16 A with y split 4 and 6 A
+  transverse shell, LUs on the host, m 128 x 4 rounds, N 512, all 40 channels in chunks of 12): 28-36 its, T error
+  1.3e-11, psi error 3.5e-11, where every mode-space coarse level stalls. Time: factor 60 s + build 96 s + iterations
+  1025 s, vs ~150 s for the streamed exact solve: it converges, but is not yet faster (each chunk of channels pays
+  ~8.5 s per iteration, mostly streaming 68 GB of window LUs).
+- Tests: tests/test_slow_coarse.py (square-lattice strip, RAS smoother), slow coarse level on the wire (open,
+  closed `cli.closed_solves`, GPU vs CPU).
 
 ## Release 0.3.0
 

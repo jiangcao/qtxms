@@ -1,6 +1,6 @@
 """Mode-space basis for QuaTrEx devices: level-1 (local) and direct level-2 (global) density-matrix modes per slab or
 tile, spurious lead-band cleanup, mode-space transmission and FGMRES with a CAP-Schwarz smoother."""
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .quatrex import read_quatrex
 from .core import Device, Coarse, CSolver, injection, rho_contour, top_modes
