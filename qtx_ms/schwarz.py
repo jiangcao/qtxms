@@ -91,7 +91,11 @@ class CapSchwarz:
     towards each artificial cut (smoother_diag cap<s>/<d>; lead faces keep Sigma).
     Cost options: spacing [Å] = largest distance between neighbouring centres (default: one centre between interfaces,
     i.e. the slab middles); solver dense (complex128 LU) | dense64 (complex64 LU, solves in single precision) |
-    pardiso (sparse, real-equivalent, msbasis.CSolver without refinement); dE0 = factor at E + dE0 instead of E (one
+    pardiso (sparse, real-equivalent, msbasis.CSolver without refinement) | rows / rows64 (only the core rows of each
+    window inverse, complex128 / complex64: n_core x n_window per window instead of the n_window^2 LU, one GEMM per
+    window and pass; the same correction, since RAS keeps nothing else). GPU mode (gpu.on, every solver but pardiso):
+    factors and solves on the device, r and the result are cupy arrays (twin of the release CapSchwarz).
+    dE0 = factor at E + dE0 instead of E (one
     factorization reused over an energy interval: A_jj(E + dE0) = A_jj(E) + dE0 S_jj, Sigma kept);
     centres "iface": windows on the slab interfaces only, no correction outside them (the slab interiors are left to
     the coarse level); "ends": interfaces + the two windows on the lead faces.
@@ -117,11 +121,21 @@ class CapSchwarz:
         for i, c in zip(self.idx, self.core):
             cov[i[c]] += 1
         assert (cov == 1).all(), "window cores must partition the device"
+        assert solver in ("dense", "dense64", "pardiso", "rows", "rows64"), solver
         self.s, self.d, self.solver, self.dE0, self.dev = s, d, solver, dE0, dev
+        self.rows = solver.startswith("rows")
+        self.gpu = gpu.on and solver != "pardiso"          # GPU: window LUs / rows and solves on the device, serially
+        self.ops, self.twall, self.rows_gb = None, 0.0, 0.0
+        if self.gpu:
+            workers = 1
+            self.didx = [gpu.cp.asarray(i) for i in self.idx]
+            self.dcore = [gpu.cp.asarray(np.where(c)[0]) for c in self.core]
+            self.dout = [gpu.cp.asarray(i[c]) for i, c in zip(self.idx, self.core)]
         self.pool = ThreadPoolExecutor(workers) if workers > 1 else None   # windows are independent (additive)
         log(f"CapSchwarz: {len(self.centres)} {centres} windows of {width} Å at x = {', '.join(f'{c:.1f}' for c in self.centres)}, "
             f"{min(map(len, self.idx))}..{max(map(len, self.idx))} orbitals (sum {sum(map(len, self.idx))}), "
-            f"absorbing {s} eV over {d} Å, {solver} LU" + (f" at E {dE0:+g} eV" if dE0 else "")
+            f"absorbing {s} eV over {d} Å, " + ("core rows of the window inverses" if self.rows else f"{solver} LU")
+            + (" on the GPU" if self.gpu else "") + (f" at E {dE0:+g} eV" if dE0 else "")
             + (f", transverse split {split} (+{tov} Å)" if split and max(split) > 1 else ""))
 
     def _tiles(self, dev, inp, atom_d, tov, tile_orbs, xsplit, ax, tile_cut=""):
@@ -164,6 +178,7 @@ class CapSchwarz:
             if n <= 1:
                 continue
             u = inp["xyz"][atom[dev.dev], axt]
+            box = np.minimum((u % L * (n / L)).astype(int), n - 1)   # owner box: one per orbital, also on a box face
             idx, core, tcut = [], [], []
             for i, c, tc in zip(self.idx, self.core, self.tcut):
                 for j in range(n):
@@ -171,56 +186,147 @@ class CapSchwarz:
                     du = np.abs((u[i] - cj + L / 2) % L - L / 2)       # minimum-image distance to the box centre
                     w = du < L / (2 * n) + tov
                     idx.append(i[w])
-                    core.append(c[w] & (du[w] < L / (2 * n)) | c[w] & (du[w] == L / (2 * n)) & (j == 0))
+                    core.append(c[w] & (box[i[w]] == j))
                     tcut.append([(dv[w], h) for dv, h in tc] + [(du[w], L / (2 * n) + tov)])
             self.idx, self.core, self.tcut = idx, core, tcut
 
-    def set_energy(self, E, A, delta=None):
-        S, x = self.dev.S.tocsr(), self.x
-        A = A.tocsr()
+    def ramp(self, k):
+        """Absorbing ramp (0 .. 1) of window k towards its artificial cuts (the lead faces are real boundaries)."""
+        x, idx = self.x, self.idx[k]
         xmin, xmax = x.min(), x.max()
+        xi = x[idx]
+        lo, hi = xi.min(), xi.max()
+        ramp = np.zeros(len(idx))
+        if self.dist is not None:                              # tile window: ramp over the outer d of the shell
+            dt, h = self.dist[k]
+            ramp = np.clip((dt - (h - self.d)) / self.d, 0, 1) ** 2
+        elif lo > xmin + 1e-6:                                 # a cut on the left (not the lead face)
+            ramp = np.maximum(ramp, np.clip((lo + self.d - xi) / self.d, 0, 1) ** 2)
+        if self.dist is None and hi < xmax - 1e-6:
+            ramp = np.maximum(ramp, np.clip((xi - (hi - self.d)) / self.d, 0, 1) ** 2)
+        for du, h in self.tcut[k]:                             # transverse cuts at |du| = h
+            ramp = np.maximum(ramp, np.clip((du - (h - self.d)) / self.d, 0, 1) ** 2)
+        return ramp
+
+    def set_energy(self, E, A, delta=None, log=log):
+        S = self.dev.S.tocsr()
+        A = A.tocsr()
         def factor(k):
             idx = self.idx[k]
             t = time.time()
-            xi = x[idx]
-            lo, hi = xi.min(), xi.max()
-            ramp = np.zeros(len(idx))
-            if self.dist is not None:                              # tile window: ramp over the outer d of the shell
-                dt, h = self.dist[k]
-                ramp = np.clip((dt - (h - self.d)) / self.d, 0, 1) ** 2
-            elif lo > xmin + 1e-6:                                 # a cut on the left (not the lead face)
-                ramp = np.maximum(ramp, np.clip((lo + self.d - xi) / self.d, 0, 1) ** 2)
-            if self.dist is None and hi < xmax - 1e-6:
-                ramp = np.maximum(ramp, np.clip((xi - (hi - self.d)) / self.d, 0, 1) ** 2)
-            for du, h in self.tcut[k]:                             # transverse cuts at |du| = h
-                ramp = np.maximum(ramp, np.clip((du - (h - self.d)) / self.d, 0, 1) ** 2)
-            P = sp.diags(np.sqrt(ramp))
+            P = sp.diags(np.sqrt(self.ramp(k)))
             Sjj = S[idx][:, idx]
             Ajj = A[idx][:, idx] + self.dE0 * Sjj + 1j * self.s * (P @ Sjj @ P)
             if self.solver == "pardiso":
                 cs = mb.CSolver(Ajj, n_ref=0)
                 op = cs.factor_solve
             else:
-                dt = np.complex64 if self.solver == "dense64" else complex
-                lu = sla.lu_factor(Ajj.toarray().astype(dt), check_finite=False, overwrite_a=True)
-                op = (lambda lu, dt: lambda rj: sla.lu_solve(lu, rj.astype(dt), check_finite=False).astype(complex))(lu, dt)
+                dt = np.complex64 if self.solver in ("dense64", "rows64") else complex
+                D = gpu.csr_dense(Ajj, dt) if self.gpu else Ajj.toarray().astype(dt)
+                lu = gpu.lu_factor(D) if self.gpu else sla.lu_factor(D, check_finite=False, overwrite_a=True)
+                del D
+                if self.rows:                                      # (A_jj^-1)[core, :] = (A_jj^-H e_core)^H, LU dropped
+                    xq = gpu.cp if self.gpu else np
+                    c = np.where(self.core[k])[0]
+                    Ek = xq.zeros((Ajj.shape[0], len(c)), dt)
+                    Ek[xq.asarray(c), xq.arange(len(c))] = 1
+                    Ri = xq.ascontiguousarray((gpu.lu_solve(lu, Ek, trans=2) if self.gpu else
+                                               sla.lu_solve(lu, Ek, trans=2, check_finite=False)).conj().T)
+                    del lu, Ek
+                    self.rows_gb += Ri.nbytes / 2 ** 30
+                    op = (lambda Ri, dt: lambda rj: (Ri @ rj.astype(dt)).astype(complex))(Ri, dt)
+                elif self.gpu:
+                    op = (lambda lu, dt: lambda rj: gpu.lu_solve(lu, rj.astype(dt)).astype(complex))(lu, dt)
+                else:
+                    op = (lambda lu, dt: lambda rj: sla.lu_solve(lu, rj.astype(dt), check_finite=False).astype(complex))(lu, dt)
             return op, time.time() - t
         t = time.time()
         ks = range(len(self.idx))
+        self.ops, self.rows_gb = None, 0.0                         # drop the factors of the previous energy first
+        if self.gpu:
+            gpu.free()
         out = list(self.pool.map(factor, ks) if self.pool else map(factor, ks))
         self.ops, self.tfac = [o for o, _ in out], [t for _, t in out]
         self.twall = time.time() - t
         log(f"  factor {self.solver}: wall {self.twall:.1f} s, per window (" +
-            ", ".join(f"{len(i)}: {t:.1f}" for i, t in zip(self.idx, self.tfac)) + ")")
+            ", ".join(f"{len(i)}: {t:.1f}" for i, t in zip(self.idx, self.tfac)) + ")"
+            + (f"; core rows {self.rows_gb:.1f} GB (LUs would be "
+               f"{sum(len(i) ** 2 for i in self.idx) * (8 if self.solver == 'rows64' else 16) / 2**30:.1f} GB)"
+               if self.rows else ""))
         self.ndefl = [0]
 
     def __call__(self, r):
+        if self.gpu:                                              # r: cupy (host arrays are moved), result cupy
+            r = gpu.cp.asarray(r)
+            z = gpu.cp.zeros_like(r)
+            for k in range(len(self.idx)):
+                zk = self.ops[k](r[self.didx[k]])
+                z[self.dout[k]] = zk if self.rows else zk[self.dcore[k]]
+            return z
         z = np.zeros_like(r)
-        solve = lambda k: self.ops[k](r[self.idx[k]])[self.core[k]]
+        solve = lambda k: self.ops[k](r[self.idx[k]]) if self.rows else self.ops[k](r[self.idx[k]])[self.core[k]]
         ks = range(len(self.idx))
         for k, zk in zip(ks, self.pool.map(solve, ks) if self.pool else map(solve, ks)):
             z[self.idx[k][self.core[k]]] = zk                  # cores are disjoint
         return z
+
+    def free(self):
+        self.ops = None
+        gpu.free()
+
+
+class GpuOp:
+    """A @ X on the GPU: the sparse device matrix as a cupyx CSR (complex128); X numpy or cupy, result cupy."""
+
+    def __init__(self, A):
+        self.A = gpu.csr(A, np.complex128)
+        self.shape = self.A.shape
+
+    def __matmul__(self, X):
+        return self.A @ gpu.cp.asarray(X, dtype=complex)
+
+
+def operator(A, threads=4):
+    """FastOp on the CPU, GpuOp in GPU mode (twin of the release schwarz.operator)."""
+    return GpuOp(A) if gpu.on else FastOp(A, threads)
+
+
+class FastOp:
+    """A @ X for a sparse complex A and a block X, faster than scipy's complex CSR product: A = Ar + i Ai with real
+    Ar, Ai (Ai holds only the complex entries, e.g. the lead self-energy blocks), real products on [Re X, Im X], rows
+    split over `threads` threads (scipy releases the GIL). MoS2/HfO2, 32M nonzeros, 64 columns: 2.8 s -> 0.3 s (8)."""
+
+    def __init__(self, A, threads=4):
+        A = sp.csr_matrix(A)
+        self.shape, self.n = A.shape, A.shape[0]
+        Ar = sp.csr_matrix(A.real, copy=True)            # copies: A.real / A.imag share A's index arrays, which
+        Ai = (sp.csr_matrix(A.imag, copy=True) if np.iscomplexobj(A.data)   # eliminate_zeros changes in place
+              else sp.csr_matrix(A.shape))
+        Ar.eliminate_zeros(); Ai.eliminate_zeros()
+        k = max(1, int(threads))
+        rows = np.linspace(0, self.n, k + 1).astype(int)
+        self.parts = [(rows[i], rows[i + 1], Ar[rows[i]:rows[i + 1]], Ai[rows[i]:rows[i + 1]] if Ai.nnz else None)
+                      for i in range(k)]
+        self.pool = ThreadPoolExecutor(k) if k > 1 else None
+
+    def __matmul__(self, X):
+        X = np.asarray(X)
+        one = X.ndim == 1
+        X = X.reshape(self.n, -1)
+        nc = X.shape[1]
+        Xs = np.hstack([X.real, X.imag]) if np.iscomplexobj(X) else np.hstack([X, np.zeros_like(X)])
+        Y = np.empty((self.n, nc), complex)
+
+        def part(p):
+            a, b, Ar, Ai = p
+            P = Ar @ Xs
+            yr, yi = P[:, :nc], P[:, nc:]
+            if Ai is not None:
+                Q = Ai @ Xs
+                yr, yi = yr - Q[:, nc:], yi + Q[:, :nc]
+            Y[a:b].real, Y[a:b].imag = yr, yi
+        list(self.pool.map(part, self.parts)) if self.pool else [part(p) for p in self.parts]
+        return Y[:, 0] if one else Y
 
 
 def fgmres_block(A, b, x0, prec, tol=1e-8, m=60, clock=None, cb=None):
@@ -228,49 +334,61 @@ def fgmres_block(A, b, x0, prec, tol=1e-8, m=60, clock=None, cb=None):
     Hessenberg matrix, but A and the preconditioner act on the block of the active columns' newest basis vectors
     (one multi-RHS local solve per window). A column stops when its GMRES residual estimate is below tol |b_j|.
     Returns x, iterations per column, true relative residuals; clock[key] accumulates seconds (matvec, prec, orth).
-    cb(i, est): called after iteration i with the GMRES residual estimates |r_j| / |b_j| of all columns."""
+    cb(i, est): called after iteration i with the GMRES residual estimates |r_j| / |b_j| of all columns.
+    Storage per column (V[j], Z[j]: (m + 1) x n, rows = basis vectors): the Gram-Schmidt step is one GEMV pair per
+    column on contiguous memory. b, x0, A @ and prec: numpy or cupy arrays (Hessenberg and least squares on the host);
+    x: an array of b's kind (twin of the release fgmres_block)."""
     clock = {} if clock is None else clock
     def tick(key, t0):
         clock[key] = clock.get(key, 0.0) + time.time() - t0
+    xp = gpu.xp_of(b)
     n, nc = b.shape
     t0 = time.time(); r0 = b - A @ x0; tick("matvec", t0)
-    beta, bn = np.linalg.norm(r0, axis=0), np.linalg.norm(b, axis=0)
-    V = np.zeros((m + 1, n, nc), complex); Z = np.zeros((m, n, nc), complex)
+    beta, bn = gpu.asnumpy(xp.linalg.norm(r0, axis=0)), gpu.asnumpy(xp.linalg.norm(b, axis=0))
+    V = xp.zeros((nc, m + 1, n), complex)
+    Z = xp.zeros((nc, m, n), complex)
     Hh = np.zeros((nc, m + 1, m), complex)
-    V[0] = r0 / beta
+    V[:, 0] = (r0 / xp.asarray(np.where(beta > 0, beta, 1))).T
     its = np.zeros(nc, int)
+    est = beta / bn
     act = np.where(beta > tol * bn)[0]
     Y = [np.zeros(0, complex) for _ in range(nc)]
     for i in range(m):
         if len(act) == 0:
             break
-        t0 = time.time(); Z[i][:, act] = prec(V[i][:, act]); tick("prec", t0)
-        t0 = time.time(); w = A @ Z[i][:, act]; tick("matvec", t0)
+        t0 = time.time(); zb = xp.asarray(prec(xp.ascontiguousarray(V[act, i].T))); tick("prec", t0)
+        Z[act, i] = zb.T
+        t0 = time.time(); w = xp.asarray(A @ zb); tick("matvec", t0)
         t0 = time.time()
-        for _ in range(2):                                     # classical Gram-Schmidt, twice, per column
-            h = np.einsum("kij,ij->kj", V[:i + 1][:, :, act].conj(), w)
-            w -= np.einsum("kij,kj->ij", V[:i + 1][:, :, act], h)
-            Hh[act, :i + 1, i] += h.T
-        hn = np.linalg.norm(w, axis=0)
-        Hh[act, i + 1, i] = hn
-        V[i + 1][:, act] = w / hn
         keep = []
         for jj, j in enumerate(act):
-            e1 = np.zeros(i + 2, complex); e1[0] = beta[j]
+            wj = w[:, jj].copy()
+            Vj = V[j, :i + 1]
+            for _ in range(2):                                  # classical Gram-Schmidt, twice
+                h = Vj.conj() @ wj
+                wj -= h @ Vj
+                Hh[j, :i + 1, i] += gpu.asnumpy(h)
+            hn = float(xp.linalg.norm(wj))
+            Hh[j, i + 1, i] = hn
+            if hn > 0:
+                V[j, i + 1] = wj / hn
+            e1 = np.zeros(i + 2, complex)
+            e1[0] = beta[j]
             Y[j] = np.linalg.lstsq(Hh[j, :i + 2, :i + 1], e1, rcond=None)[0]
             its[j] = i + 1
-            if np.linalg.norm(Hh[j, :i + 2, :i + 1] @ Y[j] - e1) > tol * bn[j]:
+            est[j] = np.linalg.norm(Hh[j, :i + 2, :i + 1] @ Y[j] - e1) / bn[j]
+            if est[j] > tol and hn > 0:
                 keep.append(j)
         act = np.array(keep, int)
         tick("orth", t0)
         if cb is not None:
-            est = np.array([np.linalg.norm(Hh[j, :its[j] + 1, :its[j]] @ Y[j] - np.eye(its[j] + 1, 1)[:, 0] * beta[j])
-                            if its[j] else beta[j] for j in range(nc)]) / bn
             cb(i, est)
     x = x0.copy()
     for j in range(nc):
-        x[:, j] += np.einsum("kn,k->n", Z[:its[j], :, j], Y[j])
-    t0 = time.time(); res = np.linalg.norm(b - A @ x, axis=0) / bn; tick("matvec", t0)
+        if its[j]:
+            x[:, j] += xp.asarray(Y[j]) @ Z[j, :its[j]]
+    del V, Z
+    t0 = time.time(); res = gpu.asnumpy(xp.linalg.norm(b - A @ x, axis=0)) / bn; tick("matvec", t0)
     return x, its, res
 
 

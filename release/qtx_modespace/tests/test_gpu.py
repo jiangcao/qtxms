@@ -147,6 +147,28 @@ def test_fgmres_cap_schwarz_gpu(coarse):
     assert np.abs(its - out["cpu"][1]).max() <= 1
 
 
+def test_cap_schwarz_inverse_batched_gpu():
+    """solver inv64 on the GPU (resident window inverses, batched matmuls) = the CPU inv64 smoother and = dense64."""
+    inp = wire(nb=8)
+    dev = core.Device(inp)
+    E = -0.4
+    SL, SR = dev.sigma(E + 1e-6j)
+    A = dev.A(E, SL, SR)
+    r = np.random.default_rng(4).standard_normal((dev.n, 3)) + 0j
+    out = {}
+    for mode, solver in (("cpu", "inv64"), ("gpu", "inv64"), ("cpu", "dense64")):
+        gpu.enable(mode == "gpu")
+        try:
+            sw = schwarz.CapSchwarz(dev, inp, width=4.0, s=2.0, d=1.0, solver=solver, pad=0.3, log=lambda *a: None)
+            sw.set_energy(A, log=lambda *a: None)
+            out[mode + solver] = gpu.asnumpy(sw(gpu.asarray(r) if mode == "gpu" else r))
+        finally:
+            gpu.enable(False)
+    nr = np.linalg.norm(out["cpudense64"])
+    assert np.linalg.norm(out["gpuinv64"] - out["cpuinv64"]) < 1e-5 * nr
+    assert np.linalg.norm(out["gpuinv64"] - out["cpudense64"]) < 1e-4 * nr
+
+
 def test_slow_coarse_gpu():
     """schwarz.SlowCoarse on the GPU (Q, A_c, LU on the device): FGMRES converges to the direct solution like on the
     CPU (the random start vectors are the same; iteration counts within 2)."""

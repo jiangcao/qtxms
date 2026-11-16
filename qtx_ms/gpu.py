@@ -131,3 +131,37 @@ def free():
 def mem_used():
     """Bytes held by cupy's memory pool (0 on CPU)."""
     return int(cp.get_default_memory_pool().used_bytes()) if on else 0
+
+
+_peak = [0, False]                                                   # peak of the live bytes, allocator installed
+
+
+def track_peak():
+    """Record the peak of the live bytes of cupy's memory pool (an allocator that looks at the pool after every
+    allocation). No-op on the CPU."""
+    if not on or _peak[1]:
+        return
+    pool = cp.get_default_memory_pool()
+
+    def alloc(size):
+        m = pool.malloc(size)
+        u = pool.used_bytes()
+        if u > _peak[0]:
+            _peak[0] = u
+        return m
+    cp.cuda.set_allocator(alloc)
+    _peak[0], _peak[1] = int(pool.used_bytes()), True
+
+
+def mem_mark():
+    """Memory since the last mark, in bytes: live (arrays alive now), peak (highest live since the last mark; needs
+    track_peak), pool (held by cupy, live + cached), free (driver free: other users of a shared GPU count).
+    None on the CPU. Resets the peak."""
+    if not on:
+        return None
+    pool = cp.get_default_memory_pool()
+    live = int(pool.used_bytes())
+    out = dict(live=live, peak=max(_peak[0], live), pool=int(pool.total_bytes()),
+               free=int(cp.cuda.Device().mem_info[0]))
+    _peak[0] = live
+    return out

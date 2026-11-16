@@ -507,7 +507,12 @@ def main(argv=None):
                    help="all: interfaces + between them; ends: interfaces + the two lead-face windows")
     g.add_argument("--cap-split", default="", help="pieces per periodic transverse axis, e.g. 1,2 (default none)")
     g.add_argument("--cap-tov", type=float, default=2.5, help="transverse overlap of the split boxes [A]")
-    g.add_argument("--cap-solver", default="dense64", choices=["dense64", "dense", "pardiso"], help="window LU")
+    g.add_argument("--cap-solver", default="dense64", choices=["dense64", "dense", "pardiso", "inv64", "inv", "rows64",
+                                                                    "rows"],
+                   help="window LU; inv64 / inv: explicit window inverses applied as batched matmuls (resident, not "
+                        "with --cap-lu-host; ~3x the factor time, faster passes); rows64 / rows: only the core rows "
+                        "of each window inverse (n_core x n_window instead of the LU, one matmul per window; the "
+                        "same correction as dense64 / dense)")
     g.add_argument("--cap-lu-host", action="store_true", help="GPU: keep the window LUs in pinned host memory and "
                    "stream them to the device per Schwarz sweep (device memory: 2 windows instead of all)")
     g.add_argument("--cap-dE0", type=float, default=0.0, help="factor the windows at E + dE0 [eV]")

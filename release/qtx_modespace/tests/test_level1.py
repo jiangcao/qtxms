@@ -167,6 +167,65 @@ def test_fgmres_cap_schwarz_slow_coarse():
     assert np.linalg.norm(xs - x) < 1e-8 * np.linalg.norm(x)
 
 
+@pytest.mark.parametrize("pad", [1.0, 0.3])
+def test_cap_schwarz_inverse_batched(pad):
+    """solver inv (window inverses, batched matmuls over zero-padded groups) = the LU smoother; inv64 = dense64 to
+    single precision; FGMRES with inv64 converges."""
+    inp = wire(nb=8)
+    dev = core.Device(inp)
+    E = -0.4
+    SL, SR = dev.sigma(E + 1e-6j)
+    A = dev.A(E, SL, SR)
+    rng = np.random.default_rng(3)
+    r = rng.standard_normal((dev.n, 3)) + 1j * rng.standard_normal((dev.n, 3))
+    out = {}
+    for solver in ("dense", "inv", "dense64", "inv64"):
+        sw = schwarz.CapSchwarz(dev, inp, width=4.0, s=2.0, d=1.0, solver=solver, pad=pad, log=lambda *a: None)
+        sw.set_energy(A, log=lambda *a: None)
+        out[solver] = sw(r)
+        if solver == "inv64":
+            assert len(sw.grp) <= len(sw.idx) and (pad < 1 or len({g["m"] for g in sw.grp}) == len(sw.grp))
+            B = core.injection(SL)
+            b = np.zeros((dev.n, B.shape[1]), complex)
+            b[dev.bL] = B
+            xs, its, res = schwarz.fgmres_block(A, b, np.zeros_like(b), sw, tol=1e-11, m=300)
+            assert res.max() < 1e-10
+    nr = np.linalg.norm(out["dense"])
+    assert np.linalg.norm(out["inv"] - out["dense"]) < 1e-10 * nr
+    assert np.linalg.norm(out["inv64"] - out["dense64"]) < 1e-4 * nr
+
+
+def test_cap_schwarz_rows():
+    """solver rows (core rows of the window inverses) = the LU smoother; rows64 = dense64 to single precision; less
+    memory than the window LUs; FGMRES with rows64 converges."""
+    inp = wire(nb=8)
+    dev = core.Device(inp)
+    E = -0.4
+    SL, SR = dev.sigma(E + 1e-6j)
+    A = dev.A(E, SL, SR)
+    rng = np.random.default_rng(3)
+    r = rng.standard_normal((dev.n, 3)) + 1j * rng.standard_normal((dev.n, 3))
+    out = {}
+    for solver in ("dense", "rows", "dense64", "rows64"):
+        sw = schwarz.CapSchwarz(dev, inp, width=4.0, s=2.0, d=1.0, solver=solver, log=lambda *a: None)
+        sw.set_energy(A, log=lambda *a: None)
+        out[solver] = sw(r)
+        if solver.startswith("rows"):
+            lub = 8 if solver == "rows64" else 16
+            assert 0 < sw.rows_gb * 2 ** 30 < sum(len(i) ** 2 for i in sw.idx) * lub
+            sw.set_energy(A, log=lambda *a: None)                    # refactoring does not accumulate
+            assert np.array_equal(sw(r), out[solver])
+        if solver == "rows64":
+            B = core.injection(SL)
+            b = np.zeros((dev.n, B.shape[1]), complex)
+            b[dev.bL] = B
+            xs, its, res = schwarz.fgmres_block(A, b, np.zeros_like(b), sw, tol=1e-11, m=300)
+            assert res.max() < 1e-10
+    nr = np.linalg.norm(out["dense"])
+    assert np.linalg.norm(out["rows"] - out["dense"]) < 1e-10 * nr
+    assert np.linalg.norm(out["rows64"] - out["dense64"]) < 1e-4 * nr
+
+
 @pytest.mark.parametrize("coarse,eta,face", [("ms", 0.0, False), ("none", 0.0, False), ("ms", 0.01, True),
                                              ("slow", 0.0, False)])
 def test_closed_system_unit_rhs(tmp_path, coarse, eta, face):

@@ -31,8 +31,10 @@ from .level1 import periodic_axes
 
 class CapSchwarz:
     def __init__(self, dev, inp, width=16.0, s=2.0, d=2.0, spacing=None, centres="all", split=None, tov=2.5,
-                 solver="dense64", workers=1, lu_host=False, log=log):
-        assert centres in ("all", "ends") and solver in ("dense", "dense64", "pardiso")
+                 solver="dense64", workers=1, lu_host=False, pad=0.85, log=log):
+        assert centres in ("all", "ends") and solver in ("dense", "dense64", "pardiso", "inv", "inv64", "rows",
+                                                           "rows64")
+        assert not (lu_host and solver[:3] in ("inv", "row")), "inv / rows keep the window inverses resident"
         ax = inp["meta"]["axis"]
         atom = np.repeat(np.arange(len(inp["norb"])), inp["norb"])[dev.dev]
         self.x = x = inp["xyz"][atom, ax]
@@ -83,11 +85,17 @@ class CapSchwarz:
                 workers = 1
         self.pool = ThreadPoolExecutor(workers) if workers > 1 else None
         self.ops, self.twall = None, 0.0
+        self.inv = solver.startswith("inv")
+        # rows / rows64: only the core rows of each window inverse (RAS keeps nothing else): n_core x n_window per
+        # window instead of the n_window^2 LU, one GEMM per window and pass; the same correction as dense / dense64
+        self.rows = solver.startswith("rows")
+        if self.inv:
+            self._groups(pad)
         log(f"CAP-Schwarz: {len(self.idx)} windows ({len(self.centres)} along x at "
             f"{', '.join(f'{c:.1f}' for c in self.centres)} A, width {width} A"
             + (f", transverse split {split} +{tov} A" if split and max(split) > 1 else "")
             + f"), {min(map(len, self.idx))}..{max(map(len, self.idx))} orbitals, absorbing {s} eV over {d} A, "
-            f"{solver} LU" + ((" on the GPU" + (", host-resident, streamed" if self.lu_host else "")) if self.gpu
+            + ("core rows of the window inverses" if self.rows else f"{solver} LU") + ((" on the GPU" + (", host-resident, streamed" if self.lu_host else "")) if self.gpu
                               else f", {workers} workers"))
 
     def set_energy(self, A, dE0=0.0, log=log):
@@ -96,7 +104,8 @@ class CapSchwarz:
         A = A.tocsr()
         xmin, xmax = x.min(), x.max()
 
-        def factor(k):
+        def factor_matrix(k):
+            """A_jj (+ dE0 S_jj) + i s P S_jj P of window k (sparse)."""
             idx = self.idx[k]
             xi = x[idx]
             lo, hi = xi.min(), xi.max()
@@ -109,10 +118,23 @@ class CapSchwarz:
                 ramp = np.maximum(ramp, np.clip((du - (h - self.d)) / self.d, 0, 1) ** 2)
             P = sp.diags(np.sqrt(ramp))
             Sjj = S[idx][:, idx]
-            Ajj = A[idx][:, idx] + dE0 * Sjj + 1j * self.s * (P @ Sjj @ P)
+            return A[idx][:, idx] + dE0 * Sjj + 1j * self.s * (P @ Sjj @ P)
+
+        def factor(k):
+            Ajj = factor_matrix(k)
             if self.solver == "pardiso":
                 return CSolver(Ajj, n_ref=0).factor_solve
-            dt = np.complex64 if self.solver == "dense64" else complex
+            dt = np.complex64 if self.solver in ("dense64", "rows64") else complex
+            if self.rows:                                # (A_jj^-1)[core, :] = (A_jj^-H e_core)^H, LU dropped
+                xq = gpu.cp if self.gpu else np
+                c = np.where(self.core[k])[0]
+                lu = gpu.lu_factor(gpu.csr_dense(Ajj, dt) if self.gpu else Ajj.toarray().astype(dt))
+                Ek = xq.zeros((Ajj.shape[0], len(c)), dt)
+                Ek[xq.asarray(c), xq.arange(len(c))] = 1
+                Ri = xq.ascontiguousarray(gpu.lu_solve(lu, Ek, trans=2).conj().T)
+                del lu, Ek
+                self.rows_gb += Ri.nbytes / 2 ** 30
+                return lambda rj: (Ri @ rj.astype(dt)).astype(complex)
             if self.gpu:
                 lu = gpu.lu_factor(gpu.csr_dense(Ajj, dt))
                 if self.lu_host:                         # (pinned host LU in Fortran order, device pivots)
@@ -126,6 +148,16 @@ class CapSchwarz:
             return lambda rj: sla.lu_solve(lu, rj.astype(dt), check_finite=False).astype(complex)
         t = time.time()
         ks = range(len(self.idx))
+        self.rows_gb = 0.0
+        if self.rows:
+            self.ops = None
+            gpu.free()
+        if self.inv:
+            self._factor_inv(factor_matrix, dE0, A, S)
+            self.twall = time.time() - t
+            log(f"  CAP-Schwarz factor: {self.twall:.1f} s (window inverses, {len(self.grp)} batches, "
+                f"{sum(g['M'].nbytes for g in self.grp) / 2**30:.1f} GB)")
+            return
         if self.pool:
             with self.limit():
                 self.ops = list(self.pool.map(factor, ks))
@@ -141,7 +173,10 @@ class CapSchwarz:
         self.twall = time.time() - t
         log(f"  CAP-Schwarz factor: {self.twall:.1f} s"
             + (f" (LUs on the host, {sum(h.nbytes for h, _ in self.ops) / 2**30:.1f} GB pinned, streamed)"
-               if self.lu_host else ""))
+               if self.lu_host else "")
+            + (f" (core rows of the window inverses, {self.rows_gb:.1f} GB; LUs would be "
+               f"{sum(len(i) ** 2 for i in self.idx) * (8 if self.solver == 'rows64' else 16) / 2**30:.1f} GB)"
+               if self.rows else ""))
 
     def _streamed(self, r, z):
         """Window solves with the LUs copied host -> device, window k + 1 prefetched while window k is solved."""
@@ -178,17 +213,75 @@ class CapSchwarz:
         cur.synchronize()
         return z
 
+    def _groups(self, pad):
+        """Batches of windows for the inverse solver: windows sorted by size, a batch takes windows down to pad x the
+        largest one (zero padding: <= 1 / pad^2 - 1 extra memory), so one gather, one batched matmul and one scatter
+        per batch replace the loop over windows."""
+        sizes = np.array([len(i) for i in self.idx])
+        order = list(np.argsort(-sizes, kind="stable"))
+        xq = gpu.cp if self.gpu else np
+        nrow = len(self.x)
+        self.grp = []
+        while order:
+            m = int(sizes[order[0]])
+            ks = [k for k in order if sizes[k] >= pad * m]
+            order = [k for k in order if k not in ks]
+            gidx = np.full((len(ks), m), nrow, np.int64)           # row nrow = the appended zero row of r
+            out, src = [], []
+            for q, k in enumerate(ks):
+                gidx[q, :sizes[k]] = self.idx[k]
+                c = np.where(self.core[k])[0]
+                out.append(self.idx[k][c])
+                src.append(q * m + c)
+            self.grp.append(dict(ks=ks, m=m, gidx=xq.asarray(gidx.ravel()), out=xq.asarray(np.concatenate(out)),
+                                 src=xq.asarray(np.concatenate(src)), M=None))
+
+    def _factor_inv(self, factor_matrix, dE0, A, S):
+        """Window inverses (complex64 for inv64) written into the zero-padded batch stacks, one window at a time."""
+        dt = np.complex64 if self.solver == "inv64" else complex
+        xq = gpu.cp if self.gpu else np
+        for g in self.grp:
+            g["M"] = None
+        gpu.free()
+        for g in self.grp:
+            M = xq.zeros((len(g["ks"]), g["m"], g["m"]), dt)
+            for q, k in enumerate(g["ks"]):
+                Ajj = factor_matrix(k)
+                D = gpu.csr_dense(Ajj, dt) if self.gpu else Ajj.toarray().astype(dt)
+                n = D.shape[0]
+                M[q, :n, :n] = xq.linalg.inv(D)
+                del D
+            g["M"] = M
+            gpu.free()
+        self.ops = True
+
+    def _batched(self, r):
+        xq = gpu.cp if self.gpu else np
+        r = xq.asarray(r)
+        c = r.shape[1]
+        dt = self.grp[0]["M"].dtype
+        rext = xq.concatenate([r, xq.zeros((1, c), r.dtype)]).astype(dt)
+        z = xq.zeros(r.shape, complex)
+        for g in self.grp:
+            R = rext[g["gidx"]].reshape(len(g["ks"]), g["m"], c)
+            Z = xq.matmul(g["M"], R).reshape(-1, c)
+            z[g["out"]] = Z[g["src"]].astype(complex)
+        return z
+
     def __call__(self, r):
+        if self.inv:
+            return self._batched(r)
         if self.gpu:                                     # r: cupy (host arrays are moved, the result is cupy)
             r = gpu.cp.asarray(r)
             z = gpu.cp.zeros_like(r)
             if self.lu_host:
                 return self._streamed(r, z)
             for k in range(len(self.idx)):
-                z[self.dout[k]] = self.ops[k](r[self.didx[k]])[self.dcore[k]]
+                zk = self.ops[k](r[self.didx[k]])
+                z[self.dout[k]] = zk if self.rows else zk[self.dcore[k]]
             return z
         z = np.zeros_like(r)
-        solve = lambda k: self.ops[k](r[self.idx[k]])[self.core[k]]
+        solve = lambda k: self.ops[k](r[self.idx[k]]) if self.rows else self.ops[k](r[self.idx[k]])[self.core[k]]
         ks = range(len(self.idx))
         if self.pool:
             with self.limit():
@@ -201,6 +294,8 @@ class CapSchwarz:
 
     def free(self):
         self.ops, self.buf = None, None
+        for g in getattr(self, "grp", []):
+            g["M"] = None
         gpu.free()
 
 
