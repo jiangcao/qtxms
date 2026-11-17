@@ -260,3 +260,21 @@ def test_fastop_matches_csr(cplx):
         assert np.abs(op @ X - A @ X).max() < 1e-12
         assert np.abs(op @ X[:, 0] - A @ X[:, 0]).max() < 1e-12
         assert np.abs(op @ X.real - A @ X.real).max() < 1e-12
+
+
+@pytest.mark.parametrize("cplx", [False, True])
+def test_block_solve_matches_block_lu(cplx):
+    """core.block_solve (streaming sweep, Coarse.solve) = BlockTridiag LU = dense solve of the Galerkin system."""
+    inp = wire(cplx=cplx)
+    dev = core.Device(inp)
+    V, _, _ = level1.build_level1(inp, dev, CONTOUR, kind="tile", tile_orbs=12, d_emb=4.0, d_cap=1.5, eta_cap=0.5,
+                                  cut=1e-6, log=lambda *a: None)
+    E = -0.4
+    SL, SR = dev.sigma(E + 1e-6j)
+    b = np.zeros((dev.n, core.injection(SL).shape[1]), complex)
+    b[dev.bL] = core.injection(SL)
+    c = core.Coarse(dev, V)
+    rb = c.restrict(b)
+    x_lu = c.Ac(E, SL, SR).solve(rb)
+    x_sw = c.solve(E, SL, SR, rb)
+    assert np.abs(x_sw - x_lu).max() < 1e-11 * np.abs(x_lu).max()

@@ -77,6 +77,7 @@ def test_block_tridiag():
     A[-6:, -6:] -= SR
     B = cplx(18, 2)
     assert rel(mb.BlockTridiag(blk, z, SL, SR).solve(B), np.linalg.solve(A, B)) < 1e-12
+    assert rel(mb.block_solve(blk, z, SL, SR, B), np.linalg.solve(A, B)) < 1e-12      # streaming sweep (CPU path)
 
 
 def test_geometry_periodic():
@@ -466,3 +467,40 @@ def test_tile_rho_fast_equals_original(dense_fill):
     # smaller embedding far from the axis: still a close approximation (G decays at large Im z)
     U, s, _ = mb.tile_modes(r, geo, geo.tree(), atoms, None, fast=dict(gpp="schur", emb_far=[(0.5, 3.0)]), **kw)
     assert np.abs((U * s[:U.shape[1]]) @ U.T - rho0).max() < 5e-2
+
+
+def _gpu_ok():
+    try:
+        from qtx_ms import gpu
+        gpu.enable()
+        gpu.enable(False)
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _gpu_ok(), reason="no GPU / cupy")
+@pytest.mark.parametrize("env_prec", ["double", "single"])
+def test_tile_rho_contour_lean_gpu(env_prec, monkeypatch):
+    """GPU tile_rho_contour through GpuEmbedding (environment split into components, chunked A_EP / X and S_P^-1,
+    probe right-hand sides) = CPU path; lead Sigma in the embedding (obc=dev)."""
+    from qtx_ms import gpu
+    monkeypatch.setattr(mb, "ENV_MIN_COMP", 1)
+    r = strip(nonorth=True)
+    dev = mb.Device(r, obc="folded")
+    geo = mb.Geometry(r["xyz"])
+    rng = np.random.default_rng(0)
+    for blk in (1, 3):                                          # next to the left lead face / interior
+        atoms = np.where(r["blocks"] == blk)[0][:20]
+        kw = dict(contour=(-0.5, 1.5, 8), d_emb=5.0, d_cap=2.0, obc=dev, gpp="schur", env_prec=env_prec, refine=2,
+                  dense_fill=0.0)
+        m = sum(r["norb"][atoms])
+        for rhs in (None, rng.normal(size=(m, 3)) + 1j * rng.normal(size=(m, 3))):
+            ref, _ = mb.tile_rho_contour(r, geo, geo.tree(), atoms, rhs=rhs, **kw)
+            gpu.enable()
+            try:
+                got, _ = mb.tile_rho_contour(r, geo, geo.tree(), atoms, rhs=rhs, chunk_bytes=16 * 3 * 30 * 2, **kw)
+            finally:
+                gpu.enable(False)
+            assert isinstance(got, np.ndarray)
+            assert rel(got, ref) < (1e-11 if env_prec == "double" else 1e-8), (blk, env_prec, rhs is None)

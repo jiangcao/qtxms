@@ -244,3 +244,52 @@ def test_coarse_blocks_and_injection(cplx):
         for g, r in zip(got[k], ref[k]):
             assert isinstance(g, np.ndarray) and rel(g, r) < 1e-12, k
     assert B.shape == Bref.shape and rel(B @ B.conj().T, Bref @ Bref.conj().T) < 1e-10
+
+
+@pytest.mark.parametrize("cplx", [False, True])
+def test_block_solve_gpu(cplx):
+    """Mode-space solve on the GPU (core.block_solve via Coarse.solve, also with the C_s on the host) = CPU block LU."""
+    inp = wire(nb=8, cplx=cplx)
+    dev = core.Device(inp)
+    V, _, _ = level1.build_level1(inp, dev, CONTOUR, kind="slab", d_emb=3.0, d_cap=1.5, eta_cap=0.5, cut=1e-6,
+                                  log=lambda *a: None)
+    E = -0.4
+    SL, SR = dev.sigma(E + 1e-6j)
+    b = np.zeros((dev.n, core.injection(SL).shape[1]), complex)
+    b[dev.bL] = core.injection(SL)
+    c = core.Coarse(dev, V)
+    rb = c.restrict(b)
+    x_cpu = c.Ac(E, SL, SR).solve(rb)
+    gpu.enable()
+    try:
+        x_gpu = c.solve(E, SL, SR, rb)
+        SL1, SR1 = c.PL.conj().T @ SL @ c.PL, c.PR.conj().T @ SR @ c.PR
+        x_host = core.block_solve(c.blk, E, SL1, SR1, rb, host_frac=0.0)
+    finally:
+        gpu.enable(False)
+    assert isinstance(x_gpu, np.ndarray)
+    assert rel(x_gpu, x_cpu) < 1e-11 and rel(x_host, x_cpu) < 1e-11
+
+
+@pytest.mark.parametrize("kind", ["slab", "tile"])
+@pytest.mark.parametrize("env_prec", ["double", "single"])
+def test_local_rho_lean_gpu(kind, env_prec, monkeypatch):
+    """GpuEmbedding (environment split into components, A_EP / X and S_P^-1 in column chunks) = CPU local rho, with
+    every component factorized alone and chunks of a few columns; also with the lead faces in the embedding."""
+    monkeypatch.setattr(level1, "ENV_MIN_COMP", 1)
+    inp = wire()
+    dev = core.Device(inp)
+    geo = level1.Geometry(inp["xyz"])
+    for b in (level1.partition(inp, dev, kind, tile_orbs=12)[i] for i in (0, 2)):
+        e = level1.embedding(inp, geo, geo.tree(), b["atoms"], 3.0, 1.5, 0.5, obc=dev)
+        kw = dict(gpp="schur", env_prec=env_prec, refine=2)
+        ref, _ = level1.local_rho(e, CONTOUR, **kw)
+        gpu.enable()
+        try:
+            ge = level1.GpuEmbedding(e)
+            got, _ = level1.local_rho(e, CONTOUR, chunk_bytes=16 * 3 * 40 * 3, **kw)    # chunks of ~3 columns
+        finally:
+            gpu.enable(False)
+        if kind == "slab" and b is not None:
+            assert len(ge.env_sizes) >= 1
+        assert rel(got, ref) < (1e-11 if env_prec == "double" else 1e-7), (kind, env_prec, ge.env_sizes)

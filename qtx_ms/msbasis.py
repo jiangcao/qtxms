@@ -737,9 +737,138 @@ def _sig_emb(obc, e, z):
     return M
 
 
+ENV_MIN_COMP = 2000        # environment components smaller than this are factorized together
+
+
+class GpuEmbedding:
+    """Device copies of one CAP(+OBC) embedding for the dense Schur-complement G_PP on the GPU, made once per block
+    (blocks of z S - K, K = H - i W, as CSR; per point only z S - K is formed on the device and Sigma(z) scattered into
+    the lead-face rows). Memory-lean (2026-11-17, for the 12 nm slabs):
+      1. the environment E is split into its connected components (graph of H, S and the lead faces restricted to E;
+         a slab embedding has a left and a right piece): one LU per component, A_EE is block diagonal, exact;
+      2. A_EP and X = A_EE^-1 A_EP in column chunks of ~chunk_bytes, folded into S_P = A_PP - A_PE X at once;
+      3. S_P^-1 by its LU and solves against identity column chunks added straight into the accumulator (no inverse).
+    Peak ~ (max_c n_Ec^2 + 2 m^2) x 16 B + chunks instead of (n_E^2 + 2 n_E m + 3 m^2) x 16 B.
+    Same class as the release (qtx_modespace.level1.GpuEmbedding), 2026-11-17."""
+
+    def __init__(self, e, chunk_bytes=4e9, min_comp=None, obc=None):
+        from scipy.sparse.csgraph import connected_components
+        cp = gpu.cp
+        He, Se, W, pidx = e["He"], e["Se"], e["W"], np.asarray(e["pidx"])
+        n = He.shape[0]
+        self.e, self.m, self.chunk_bytes = e, len(pidx), chunk_bytes
+        eidx = np.setdiff1d(np.arange(n), pidx)
+        self.obc = obc if obc is not None else e.get("obc")
+        faces = [(np.asarray(p, int), np.asarray(f, int)) for p, f in
+                 ((e.get("faces") or []) if self.obc is not None else [])]
+        # components of the environment (lead faces: Sigma couples all face orbitals of one lead)
+        G = (abs(He) + abs(Se)).tocsr()[eidx][:, eidx]
+        loc = np.full(n, -1)
+        loc[eidx] = np.arange(len(eidx))
+        rows, cols = [], []
+        for p, _ in faces:
+            q = loc[p][loc[p] >= 0]
+            if len(q) > 1:
+                rows.append(q[:-1]); cols.append(q[1:])
+        if rows:
+            r_, c_ = np.concatenate(rows), np.concatenate(cols)
+            G = G + sp.csr_matrix((np.ones(len(r_)), (r_, c_)), shape=G.shape)
+        ncomp, lab = connected_components(G, directed=False)
+        sizes = np.bincount(lab, minlength=ncomp)
+        min_comp = ENV_MIN_COMP if min_comp is None else min_comp
+        big = [c for c in np.argsort(-sizes) if sizes[c] >= min_comp]
+        groups = [eidx[lab == c] for c in big]
+        small = np.isin(lab, big, invert=True)
+        if small.any():
+            groups.append(eidx[small])                          # small pieces together (still block diagonal)
+        self.env_sizes = [len(g) for g in groups]
+        K, Sc = (He - 1j * W).tocsr(), sp.csr_matrix(Se)
+        d = lambda M: gpu.csr(M, np.complex128)
+        self.PP = (d(Sc[pidx][:, pidx]), d(K[pidx][:, pidx]))
+        self.env = []
+        for g in groups:
+            self.env.append(dict(
+                EE=(d(Sc[g][:, g]), d(K[g][:, g])),
+                EPT=(d(Sc[g][:, pidx].T.tocsr()), d(K[g][:, pidx].T.tocsr())),     # rows = P: column chunks by rows
+                PE=(d(Sc[pidx][:, g]), d(K[pidx][:, g])),
+                idx=g))
+        # where the lead-face orbitals sit in P and in each environment group: (rows in the group, rows in Sigma)
+        def where(idx):
+            l = np.full(n, -1)
+            l[idx] = np.arange(len(idx))
+            out = []
+            for p, f in faces:
+                ok = l[p] >= 0
+                out.append((cp.asarray(l[p][ok]), cp.asarray(f[ok])))
+            return out
+        self.fP = where(pidx)
+        for g in self.env:
+            g["f"] = where(g["idx"])
+        self.has_sigma = any(len(r) for r, _ in self.fP) or any(len(r) for g in self.env for r, _ in g["f"])
+
+    @staticmethod
+    def _sub(M, z, Sg, fr, fc):
+        """M -= Sigma[fr-rows, fc-cols] for every lead (dense M, in place)."""
+        cp = gpu.cp
+        for (ro, sr), (co, sc), G in zip(fr, fc, Sg):
+            if len(ro) and len(co):
+                ix = cp.ix_(ro, co)
+                M[ix] = M[ix] - G[cp.ix_(sr, sc)]
+        return M
+
+    def accumulate(self, z, dz, acc, env_prec="double", refine=1, R=None):
+        """acc += G_PP(z) dz (cupy m x m), or G_PP(z) R dz for probe columns R (cupy m x r)."""
+        cp, m = gpu.cp, self.m
+        Sg = [cp.asarray(M) for M in self.obc.sigma(z)] if self.has_sigma else []
+        Sp = self._sub((z * self.PP[0] - self.PP[1]).toarray(), z, Sg, self.fP, self.fP)
+        for g in self.env:
+            nE = len(g["idx"])
+            AEE = self._sub((z * g["EE"][0] - g["EE"][1]).toarray(), z, Sg, g["f"], g["f"])
+            if env_prec == "single":
+                lu = gpu.lu_factor(AEE.astype(np.complex64))
+            else:
+                lu, AEE = gpu.lu_factor(AEE), None                  # overwrites A_EE
+            APE = z * g["PE"][0] - g["PE"][1]
+            k = max(1, min(m, int(self.chunk_bytes // (16 * 3 * max(nE, 1)))))
+            for j0 in range(0, m, k):
+                j1 = min(m, j0 + k)
+                AEP = cp.ascontiguousarray((z * g["EPT"][0][j0:j1] - g["EPT"][1][j0:j1]).toarray().T)
+                for (ro, sr), (co, sc), G in zip(g["f"], self.fP, Sg):       # Sigma on (E rows, P columns in chunk)
+                    sel = (co >= j0) & (co < j1)
+                    if len(ro) and bool(sel.any()):
+                        ix = cp.ix_(ro, co[sel] - j0)
+                        AEP[ix] = AEP[ix] - G[cp.ix_(sr, sc[sel])]
+                if env_prec == "single":
+                    X = gpu.lu_solve(lu, AEP.astype(np.complex64)).astype(complex)
+                    for _ in range(refine):
+                        X += gpu.lu_solve(lu, (AEP - AEE @ X).astype(np.complex64))
+                else:
+                    X = gpu.lu_solve(lu, AEP)
+                del AEP
+                Sp[:, j0:j1] -= APE @ X                             # A_PE X: sparse part, then its Sigma part
+                for (ro, sr), (co, sc), G in zip(self.fP, g["f"], Sg):
+                    if len(ro) and len(co):
+                        Sp[ro, j0:j1] += G[cp.ix_(sr, sc)] @ X[co]
+                del X
+            del lu, AEE, APE
+        lu = gpu.lu_factor(Sp)                                      # overwrites S_P
+        del Sp
+        if R is not None:
+            acc += gpu.lu_solve(lu, R) * dz
+            return
+        k = max(1, min(m, int(self.chunk_bytes // (16 * 2 * m))))
+        for j0 in range(0, m, k):
+            j1 = min(m, j0 + k)
+            I = cp.zeros((m, j1 - j0), complex)
+            I[cp.arange(j0, j1), cp.arange(j1 - j0)] = 1.0
+            acc[:, j0:j1] += gpu.lu_solve(lu, I) * dz
+            del I
+        del lu
+
+
 def tile_rho_contour(inp, geo, tree, atoms, contour, d_emb=12.0, d_cap=3.0, eta_cap=0.3, obc=None, gpp="schur",
                      env_prec="single", refine=1, emb_far=None, workers=1, threads=None, rhs=None,
-                     dense_fill=0.02, dense_max=30000):
+                     dense_fill=0.02, dense_max=30000, chunk_bytes=4e9):
     """Accelerated contour integral of the tile block of the CAP(+OBC) embedding Green's function,
     acc = int_arc G_PP(z) R dz on the upper arc (Gauss-Legendre in theta, as tile_modes(contour=)); returns
     (acc, info). R = rhs (m x r probes; None: identity, the full G_PP).
@@ -868,10 +997,26 @@ def tile_rho_contour(inp, geo, tree, atoms, contour, d_emb=12.0, d_cap=3.0, eta_
         del X
         return np.linalg.inv(Sp) if rhs is None else sla.solve(Sp, RP, check_finite=False)
 
+    def lean(k):
+        """GpuEmbedding of point k's embedding (GPU + dense + Schur), made once per embedding; else None."""
+        e = embs[dz[k]]
+        n = e["He"].shape[0]
+        if not (gpu.on and gpp != "full" and (e["He"] + e["Se"]).nnz > dense_fill * n * n and n <= dense_max):
+            return None
+        if "_lean" not in e:
+            e["_lean"] = GpuEmbedding(e, chunk_bytes=chunk_bytes, obc=obc)
+        return e["_lean"]
+
     def run(ks):
         acc = (gpu.cp if gpu.on else np).zeros((m, r), complex)
+        Rd = None if rhs is None or not gpu.on else gpu.cp.asarray(rhs.astype(complex))
         for k in ks:
-            acc += point(k) * (-1j * rr * np.exp(1j * th[k]) * wq[k])
+            w = -1j * rr * np.exp(1j * th[k]) * wq[k]
+            ge = lean(k)
+            if ge is not None:
+                ge.accumulate(zs[k], w, acc, env_prec=env_prec, refine=refine, R=Rd)
+            else:
+                acc += point(k) * w
         return gpu.asnumpy(acc)
 
     t0 = time.time()
@@ -879,6 +1024,7 @@ def tile_rho_contour(inp, geo, tree, atoms, contour, d_emb=12.0, d_cap=3.0, eta_
         acc = run(range(len(zs)))
         for e_ in embs.values():
             e_.pop("_gpu", None)
+            e_.pop("_lean", None)
         gpu.free()
     elif workers <= 1:
         if threads:
@@ -1606,6 +1752,57 @@ class BlockTridiag:
         for s in range(n - 2, -1, -1):
             X[s] = sla.lu_solve(self.lu[s], Y[s] - self.Up[s] @ X[s + 1], check_finite=False)
         return np.concatenate(X)
+
+
+def block_solve(blk, z, SL1, SR1, B, host_frac=0.4):
+    """X = A_c(z)^-1 B for the block-tridiagonal A_c(z) = z S_c - H_c - SL1 (first block) - SR1 (last block) of
+    slab_blocks, in one forward / backward sweep with the right-hand sides carried along (block Thomas; no factors
+    kept, so one call per energy):
+        forward   C_s = D~_s^-1 U_s,  Z_s = D~_s^-1 Y~_s,  D~_{s+1} = D_{s+1} - L_s C_s,  Y~_{s+1} = B_{s+1} - L_s Z_s
+        backward  X_s = Z_s - C_s X_{s+1}
+    With gpu.on the blocks are copied to the device one slab at a time (the mode-space solve on the GPU: N 82 557 on
+    6 nm in seconds instead of ~2 min with numpy); the C_s stay on the device when they take < host_frac of the free
+    memory, else they go to the host. Peak device memory otherwise ~6 dense blocks. Without the GPU: numpy, same
+    sweep. B and X are numpy arrays (N x columns). Ported from the release (qtx_modespace.core.block_solve,
+    --ms-solve gpu), 2026-11-17."""
+    n = len(blk["HD"])
+    xp = gpu.cp if gpu.on else np
+    put = (lambda M: gpu.cp.asarray(M)) if gpu.on else (lambda M: M)
+    sz = [len(d) for d in blk["HD"]]
+    o = np.concatenate([[0], np.cumsum(sz)])
+    keep = True
+    if gpu.on:
+        need = 16 * sum(sz[s] * sz[s + 1] for s in range(n - 1))
+        keep = need < host_frac * gpu.cp.cuda.Device().mem_info[0]
+    B = np.asarray(B)
+    Dt = z * put(blk["SD"][0]) - put(blk["HD"][0]) - put(SL1)
+    Yt = put(B[o[0]:o[1]].astype(complex))
+    C, Z = [], []
+    for s in range(n):
+        if s == n - 1:
+            Dt = Dt - put(SR1)
+        F = gpu.lu_factor(Dt)
+        Dt = None
+        Z.append(gpu.lu_solve(F, Yt))
+        if s < n - 1:
+            SU, HU = put(blk["SU"][s]), put(blk["HU"][s])
+            Cs = gpu.lu_solve(F, z * SU - HU)
+            F = None
+            Lo = z * SU.conj().T - HU.conj().T
+            SU = HU = None
+            Dt = z * put(blk["SD"][s + 1]) - put(blk["HD"][s + 1]) - Lo @ Cs
+            Yt = put(B[o[s + 1]:o[s + 2]].astype(complex)) - Lo @ Z[-1]
+            Lo = None
+            C.append(Cs if keep else gpu.asnumpy(Cs))
+            Cs = None
+    X = [None] * n
+    X[-1] = Z[-1]
+    for s in range(n - 2, -1, -1):
+        X[s] = Z[s] - put(C[s]) @ X[s + 1]
+        C[s] = None
+    X = gpu.asnumpy(xp.concatenate(X))
+    gpu.free()
+    return X
 
 
 class MRCoarse:

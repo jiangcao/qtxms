@@ -174,14 +174,144 @@ def contour_points(mu1, mu2, npts):
     return c + r * np.exp(1j * th), -1j * r * np.exp(1j * th) * w
 
 
+ENV_MIN_COMP = 2000        # environment components smaller than this are factorized together
+
+
+class GpuEmbedding:
+    """Device copies of one CAP(+OBC) embedding for the dense Schur-complement G_PP on the GPU, made once per block
+    (blocks of z S - K, K = H - i W, as CSR; per point only z S - K is formed on the device and Sigma(z) scattered into
+    the lead-face rows). Memory-lean (2026-11-17, for the 12 nm slabs):
+      1. the environment E is split into its connected components (graph of H, S and the lead faces restricted to E;
+         a slab embedding has a left and a right piece): one LU per component, A_EE is block diagonal, exact;
+      2. A_EP and X = A_EE^-1 A_EP in column chunks of ~chunk_bytes, folded into S_P = A_PP - A_PE X at once;
+      3. S_P^-1 by its LU and solves against identity column chunks added straight into the accumulator (no inverse).
+    Peak ~ (max_c n_Ec^2 + 2 m^2) x 16 B + chunks instead of (n_E^2 + 2 n_E m + 3 m^2) x 16 B."""
+
+    def __init__(self, e, chunk_bytes=4e9, min_comp=None, obc=None):
+        from scipy.sparse.csgraph import connected_components
+        cp = gpu.cp
+        He, Se, W, pidx = e["He"], e["Se"], e["W"], np.asarray(e["pidx"])
+        n = He.shape[0]
+        self.e, self.m, self.chunk_bytes = e, len(pidx), chunk_bytes
+        eidx = np.setdiff1d(np.arange(n), pidx)
+        self.obc = obc if obc is not None else e.get("obc")
+        faces = [(np.asarray(p, int), np.asarray(f, int)) for p, f in
+                 ((e.get("faces") or []) if self.obc is not None else [])]
+        # components of the environment (lead faces: Sigma couples all face orbitals of one lead)
+        G = (abs(He) + abs(Se)).tocsr()[eidx][:, eidx]
+        loc = np.full(n, -1)
+        loc[eidx] = np.arange(len(eidx))
+        rows, cols = [], []
+        for p, _ in faces:
+            q = loc[p][loc[p] >= 0]
+            if len(q) > 1:
+                rows.append(q[:-1]); cols.append(q[1:])
+        if rows:
+            r_, c_ = np.concatenate(rows), np.concatenate(cols)
+            G = G + sp.csr_matrix((np.ones(len(r_)), (r_, c_)), shape=G.shape)
+        ncomp, lab = connected_components(G, directed=False)
+        sizes = np.bincount(lab, minlength=ncomp)
+        min_comp = ENV_MIN_COMP if min_comp is None else min_comp
+        big = [c for c in np.argsort(-sizes) if sizes[c] >= min_comp]
+        groups = [eidx[lab == c] for c in big]
+        small = np.isin(lab, big, invert=True)
+        if small.any():
+            groups.append(eidx[small])                          # small pieces together (still block diagonal)
+        self.env_sizes = [len(g) for g in groups]
+        K, Sc = (He - 1j * W).tocsr(), sp.csr_matrix(Se)
+        d = lambda M: gpu.csr(M, np.complex128)
+        self.PP = (d(Sc[pidx][:, pidx]), d(K[pidx][:, pidx]))
+        self.env = []
+        for g in groups:
+            self.env.append(dict(
+                EE=(d(Sc[g][:, g]), d(K[g][:, g])),
+                EPT=(d(Sc[g][:, pidx].T.tocsr()), d(K[g][:, pidx].T.tocsr())),     # rows = P: column chunks by rows
+                PE=(d(Sc[pidx][:, g]), d(K[pidx][:, g])),
+                idx=g))
+        # where the lead-face orbitals sit in P and in each environment group: (rows in the group, rows in Sigma)
+        def where(idx):
+            l = np.full(n, -1)
+            l[idx] = np.arange(len(idx))
+            out = []
+            for p, f in faces:
+                ok = l[p] >= 0
+                out.append((cp.asarray(l[p][ok]), cp.asarray(f[ok])))
+            return out
+        self.fP = where(pidx)
+        for g in self.env:
+            g["f"] = where(g["idx"])
+        self.has_sigma = any(len(r) for r, _ in self.fP) or any(len(r) for g in self.env for r, _ in g["f"])
+
+    @staticmethod
+    def _sub(M, z, Sg, fr, fc):
+        """M -= Sigma[fr-rows, fc-cols] for every lead (dense M, in place)."""
+        cp = gpu.cp
+        for (ro, sr), (co, sc), G in zip(fr, fc, Sg):
+            if len(ro) and len(co):
+                ix = cp.ix_(ro, co)
+                M[ix] = M[ix] - G[cp.ix_(sr, sc)]
+        return M
+
+    def accumulate(self, z, dz, acc, env_prec="double", refine=1, R=None):
+        """acc += G_PP(z) dz (cupy m x m), or G_PP(z) R dz for probe columns R (cupy m x r)."""
+        cp, m = gpu.cp, self.m
+        Sg = [cp.asarray(M) for M in self.obc.sigma(z)] if self.has_sigma else []
+        Sp = self._sub((z * self.PP[0] - self.PP[1]).toarray(), z, Sg, self.fP, self.fP)
+        for g in self.env:
+            nE = len(g["idx"])
+            AEE = self._sub((z * g["EE"][0] - g["EE"][1]).toarray(), z, Sg, g["f"], g["f"])
+            if env_prec == "single":
+                lu = gpu.lu_factor(AEE.astype(np.complex64))
+            else:
+                lu, AEE = gpu.lu_factor(AEE), None                  # overwrites A_EE
+            APE = z * g["PE"][0] - g["PE"][1]
+            k = max(1, min(m, int(self.chunk_bytes // (16 * 3 * max(nE, 1)))))
+            for j0 in range(0, m, k):
+                j1 = min(m, j0 + k)
+                AEP = cp.ascontiguousarray((z * g["EPT"][0][j0:j1] - g["EPT"][1][j0:j1]).toarray().T)
+                for (ro, sr), (co, sc), G in zip(g["f"], self.fP, Sg):       # Sigma on (E rows, P columns in chunk)
+                    sel = (co >= j0) & (co < j1)
+                    if len(ro) and bool(sel.any()):
+                        ix = cp.ix_(ro, co[sel] - j0)
+                        AEP[ix] = AEP[ix] - G[cp.ix_(sr, sc[sel])]
+                if env_prec == "single":
+                    X = gpu.lu_solve(lu, AEP.astype(np.complex64)).astype(complex)
+                    for _ in range(refine):
+                        X += gpu.lu_solve(lu, (AEP - AEE @ X).astype(np.complex64))
+                else:
+                    X = gpu.lu_solve(lu, AEP)
+                del AEP
+                Sp[:, j0:j1] -= APE @ X                             # A_PE X: sparse part, then its Sigma part
+                for (ro, sr), (co, sc), G in zip(self.fP, g["f"], Sg):
+                    if len(ro) and len(co):
+                        Sp[ro, j0:j1] += G[cp.ix_(sr, sc)] @ X[co]
+                del X
+            del lu, AEE, APE
+        lu = gpu.lu_factor(Sp)                                      # overwrites S_P
+        del Sp
+        if R is not None:
+            acc += gpu.lu_solve(lu, R) * dz
+            return
+        k = max(1, min(m, int(self.chunk_bytes // (16 * 2 * m))))
+        for j0 in range(0, m, k):
+            j1 = min(m, j0 + k)
+            I = cp.zeros((m, j1 - j0), complex)
+            I[cp.arange(j0, j1), cp.arange(j1 - j0)] = 1.0
+            acc[:, j0:j1] += gpu.lu_solve(lu, I) * dz
+            del I
+        del lu
+
+
 def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, threads=None, dense_fill=0.02,
-              dense_max=30000):
+              dense_max=30000, chunk_bytes=4e9):
     """rho_PP of the embedding e over contour = (mu1, mu2, npts) [absolute eV]; returns (rho, seconds).
     gpp "schur": G_PP = (A_PP - A_PE A_EE^-1 A_EP)^-1 (env_prec "single": A_EE LU in complex64 + `refine` steps of
     iterative refinement); "full": one LU of the whole embedding with m right-hand sides.
     workers > 1: the contour points over forked processes with `threads` BLAS threads each (needs threadpoolctl).
     GPU mode (gpu.on, dense embeddings): every point on the GPU (blocks built there from the CSR matrix, LU, solves,
-    Schur complement and its inverse), rho accumulated on the device; points one after another (workers ignored)."""
+    Schur complement and its inverse), rho accumulated on the device; points one after another (workers ignored).
+    GPU memory (GpuEmbedding): environment LU per connected component, A_EP / X in column chunks of ~chunk_bytes,
+    S_P inverted chunk-wise into the accumulator -> peak ~ max_c n_Ec^2 + 2 m^2 (x 16 B) + chunks."""
     zs, dzs = contour_points(*contour)
     He, Se, W, pidx = e["He"], e["Se"], e["W"], e["pidx"]
     n, m = He.shape[0], len(pidx)
@@ -190,29 +320,10 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
     eidx = np.setdiff1d(np.arange(n), pidx)
     on_gpu = gpu.on and dense
 
-    if on_gpu:
-        # device copies, made once: the E / P blocks of S and K = H - i W as CSR, and where the lead-face orbitals sit
-        # in E and P. Per point only A = z S - K is formed (on the device) and Sigma(z) is scattered into the blocks;
-        # assembling and slicing the sparse A on the host cost more than the factorization.
-        K = (He - 1j * W).tocsr()
-        Sc = sp.csr_matrix(Se)
-        gS = {a + b: gpu.csr(Sc[i][:, j], np.complex128) for a, i in (("E", eidx), ("P", pidx))
-              for b, j in (("E", eidx), ("P", pidx))}
-        gK = {a + b: gpu.csr(K[i][:, j], np.complex128) for a, i in (("E", eidx), ("P", pidx))
-              for b, j in (("E", eidx), ("P", pidx))}
-        del K, Sc
-        loc = {}
-        for a, i in (("E", eidx), ("P", pidx)):
-            loc[a] = np.full(n, -1)
-            loc[a][i] = np.arange(len(i))
-        faces = []                                                  # per lead: {E, P: (block rows, Sigma rows)}
-        for pos, fi in (e["faces"] or []):
-            pos, fi = np.asarray(pos, int), np.asarray(fi, int)
-            faces.append({a: (gpu.cp.asarray(loc[a][pos][loc[a][pos] >= 0]), gpu.cp.asarray(fi[loc[a][pos] >= 0]))
-                          for a in "EP"})
-        has_sigma = any(len(f[a][0]) for f in faces for a in "EP")
+    if on_gpu and gpp != "full":
+        ge = GpuEmbedding(e, chunk_bytes=chunk_bytes)
 
-    def point_gpu(k):
+    def point_gpu(k, acc):
         cp, z = gpu.cp, zs[k]
         if gpp == "full":
             A = (z * Se - He + 1j * W + sigma_emb(e, z)).tocsr()
@@ -220,39 +331,11 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
             R = cp.zeros((n, m), complex)
             R[cp.asarray(pidx), cp.arange(m)] = 1.0
             X = gpu.lu_solve(gpu.lu_factor(Ad), R)
-            return X[cp.asarray(pidx)]
-        Sg = [cp.asarray(M) for M in e["obc"].sigma(z)] if has_sigma else []
-
-        def block(ab):                                              # dense A_ab = z S - K - Sigma on the device
-            M = (z * gS[ab] - gK[ab]).toarray()
-            for f, G in zip(faces, Sg):
-                (r, fr), (c, fc) = f[ab[0]], f[ab[1]]
-                if len(r) and len(c):
-                    ix = cp.ix_(r, c)
-                    M[ix] = M[ix] - G[cp.ix_(fr, fc)]
-            return M
-
-        AEE, AEP = block("EE"), block("EP")
-        if env_prec == "single":
-            lu = gpu.lu_factor(AEE.astype(cdt))
-            X = gpu.lu_solve(lu, AEP.astype(cdt)).astype(complex)
-            for _ in range(refine):
-                X += gpu.lu_solve(lu, (AEP - AEE @ X).astype(cdt))
-        else:
-            lu = gpu.lu_factor(AEE)                                 # overwrites AEE
-            X = gpu.lu_solve(lu, AEP)
-        del lu, AEE, AEP
-        Sp = block("PP") - (z * gS["PE"] - gK["PE"]) @ X            # A_PE X: sparse part, then its Sigma part
-        for f, G in zip(faces, Sg):
-            (r, fr), (c, fc) = f["P"], f["E"]
-            if len(r) and len(c):
-                Sp[r] = Sp[r] + G[cp.ix_(fr, fc)] @ X[c]
-        del X
-        return cp.linalg.inv(Sp)
+            acc += X[cp.asarray(pidx)] * dzs[k]
+            return
+        ge.accumulate(z, dzs[k], acc, env_prec=env_prec, refine=refine)
 
     def point(k):
-        if on_gpu:
-            return point_gpu(k)
         z = zs[k]
         A = (z * Se - He + 1j * W + sigma_emb(e, z)).tocsr()
         if gpp == "full":
@@ -287,7 +370,10 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
     def run(ks):
         acc = (gpu.cp if on_gpu else np).zeros((m, m), complex)
         for k in ks:
-            acc += point(k) * dzs[k]
+            if on_gpu:
+                point_gpu(k, acc)
+            else:
+                acc += point(k) * dzs[k]
         return gpu.asnumpy(acc)
 
     def limited(f, nthr):

@@ -543,6 +543,56 @@ class BlockTridiag:
         return xp.concatenate(X)
 
 
+def block_solve(blk, z, SL1, SR1, B, host_frac=0.4):
+    """X = A_c(z)^-1 B for the block-tridiagonal A_c(z) = z S_c - H_c - SL1 (first block) - SR1 (last block) of
+    slab_blocks, in one forward / backward sweep with the right-hand sides carried along (block Thomas; no factors
+    kept, so one call per energy):
+        forward   C_s = D~_s^-1 U_s,  Z_s = D~_s^-1 Y~_s,  D~_{s+1} = D_{s+1} - L_s C_s,  Y~_{s+1} = B_{s+1} - L_s Z_s
+        backward  X_s = Z_s - C_s X_{s+1}
+    With gpu.on the blocks are copied to the device one slab at a time (the mode-space solve on the GPU: N 82 557 on
+    6 nm in seconds instead of ~2 min with numpy); the C_s stay on the device when they take < host_frac of the free
+    memory, else they go to the host. Peak device memory otherwise ~6 dense blocks. Without the GPU: numpy, same
+    sweep. B and X are numpy arrays (N x columns)."""
+    n = len(blk["HD"])
+    xp = gpu.cp if gpu.on else np
+    put = (lambda M: gpu.cp.asarray(M)) if gpu.on else (lambda M: M)
+    sz = [len(d) for d in blk["HD"]]
+    o = np.concatenate([[0], np.cumsum(sz)])
+    keep = True
+    if gpu.on:
+        need = 16 * sum(sz[s] * sz[s + 1] for s in range(n - 1))
+        keep = need < host_frac * gpu.cp.cuda.Device().mem_info[0]
+    B = np.asarray(B)
+    Dt = z * put(blk["SD"][0]) - put(blk["HD"][0]) - put(SL1)
+    Yt = put(B[o[0]:o[1]].astype(complex))
+    C, Z = [], []
+    for s in range(n):
+        if s == n - 1:
+            Dt = Dt - put(SR1)
+        F = gpu.lu_factor(Dt)
+        Dt = None
+        Z.append(gpu.lu_solve(F, Yt))
+        if s < n - 1:
+            SU, HU = put(blk["SU"][s]), put(blk["HU"][s])
+            Cs = gpu.lu_solve(F, z * SU - HU)
+            F = None
+            Lo = z * SU.conj().T - HU.conj().T
+            SU = HU = None
+            Dt = z * put(blk["SD"][s + 1]) - put(blk["HD"][s + 1]) - Lo @ Cs
+            Yt = put(B[o[s + 1]:o[s + 2]].astype(complex)) - Lo @ Z[-1]
+            Lo = None
+            C.append(Cs if keep else gpu.asnumpy(Cs))
+            Cs = None
+    X = [None] * n
+    X[-1] = Z[-1]
+    for s in range(n - 2, -1, -1):
+        X[s] = Z[s] - put(C[s]) @ X[s + 1]
+        C[s] = None
+    X = gpu.asnumpy(xp.concatenate(X))
+    gpu.free()
+    return X
+
+
 def device_blocks(dev, A, xp=np):
     """Dense diagonal / upper / lower slab blocks of a sparse device matrix A (device order), as numpy or cupy arrays
     (cupy: built on the GPU from the CSR slices)."""
@@ -657,6 +707,12 @@ class Coarse:
             cp = gpu.cp
             return BlockTridiag(self._g["blk"], E, cp.asarray(SL1), cp.asarray(SR1))
         return BlockTridiag(self.blk, E, SL1, SR1)
+
+    def solve(self, E, SL, SR, B):
+        """Mode-space solution A_c(E)^-1 B for one set of right-hand sides (numpy in / out): the streaming sweep
+        block_solve, on the GPU with gpu.on (blocks copied slab by slab, nothing kept between energies)."""
+        SL1, SR1 = self.PL.conj().T @ SL @ self.PL, self.PR.conj().T @ SR @ self.PR
+        return block_solve(self.blk, E, SL1, SR1, B)
 
     def _Vs(self, Y):
         if hasattr(self, "_g") and gpu.xp_of(Y) is not np:

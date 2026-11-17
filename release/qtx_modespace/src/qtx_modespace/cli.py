@@ -474,6 +474,9 @@ def main(argv=None):
     g.add_argument("--transmission", action="store_true", help="mode-space T at --dE")
     g.add_argument("--exact", action="store_true", help="also the exact T (sparse direct solve) and the error")
     g.add_argument("--dE", default="0.02,0.05,0.15,0.3", help="energies - Ec: list or lo:hi:step [eV]")
+    g.add_argument("--ms-solve", default="auto", choices=["auto", "gpu", "cpu"],
+                   help="mode-space solve: gpu = one streaming block sweep on the GPU (core.block_solve), cpu = block LU "
+                   "with numpy (core.BlockTridiag, the 0.4.0 path); auto = gpu with --gpu, else cpu")
     g.add_argument("--Ec", type=float, help="reference edge for --dE (default Ec_lead)")
     g.add_argument("--eta", type=float, default=0.0, help="imaginary part of E for the lead self-energies [eV] (0: real "
                    "axis, qttools OBC; the folded-lead fallback then uses E + 1e-6 i)")
@@ -619,7 +622,10 @@ def main(argv=None):
         Xms = None
         r.update(E=E, channels=int(B.shape[1]), t_sigma=ts)
         if c is not None:
-            Xms = gpu.asnumpy(c.prolong(c.Ac(E, SL, SR, device=False).solve(c.restrict(b))))
+            if a.ms_solve == "gpu" or (a.ms_solve == "auto" and gpu.on):
+                Xms = c.prolong(c.solve(E, SL, SR, c.restrict(b)))
+            else:
+                Xms = gpu.asnumpy(c.prolong(c.Ac(E, SL, SR, device=False).solve(c.restrict(b))))
             r.update(T_ms=Tof(Xms), t_ms=time.time() - t)
         A, X = None, None
         if a.exact and ("T_exact" not in r or "err_psi" not in r or a.fgmres):
