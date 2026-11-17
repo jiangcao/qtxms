@@ -168,3 +168,54 @@
 #   Plain mode space (cut 1e-2), T err / psi err: y-cut level 1 -1.2e-2 / 0.24, levels 2-6 -2.3e-2..-2.6e-2 / 0.54;
 #   unsplit level 1 -4.1e-1 / 2.5, levels 2-5 -2.3e-1..-2.5e-1 / 3.2; unsplit slice -4.2e-1..-4.7e-1 / 3.3-3.6;
 #   y-cut slice level 3 -2.5e-2 / 0.57, levels 4-6 +1.0e-1 / 5.4-6.3. FGMRES unchanged (y-cut 10-15 its, unsplit 18-25).
+#
+# Basis reuse over the window energies (2026-11-16 21:25, attelas2): qtx_ms/mlevel.py keeps the bases of the levels >= 2
+# (energy independent) in a basis store (memory + <dm-cache>/<tag>_levels/l<k>_<hash>.npz, --basis-cache); per energy
+# only A_k(E) and the smoothers are rebuilt. 2808a smoke test (run 1 two energies, run 2 from disk), exact psi of 21600a
+# at Ec + 0.02,0.05,0.1,0.15,0.3,0.45,0.58,0.7, then y-cut yxxxx and unsplit xxxx with every level exact:
+# setsid nohup results_ms/gpu/mlevel/run_basis_reuse.sh > results_ms/gpu/mlevel/run_basis_reuse.out 2>&1 &   # (attelas2)
+
+# Stand-alone MS T + T error on the 2808a grid (Ec+0...0.5, 10 meV) for slab level 1 cuts 1e-8 / 1e-6 / 1e-4 on 2808a,
+# 9072a, 21600a (user, 2026-11-17; big files in attelas2:/scratch/jiacao/mg_modespace/ms_cuts, table + ms_cuts.png in
+# reports/2026-11-17-slab-level1-cuts by workflows/ms_cuts_summary.py):
+# nohup workflows/run_ms_cuts.sh > results_ms/gpu/ms_cuts/run_ms_cuts.out 2>&1 &   # started 2026-11-17 08:04 (attelas2), stopped 08:18 (user), restarted 08:24
+
+# Rebuild check of the npy / npz files deleted from results_ms 2026-11-17 (list: results_ms/deleted_2026-11-17.txt):
+# workflows/{sigma,psi,bases} rebuild them, compared with the recorded json / logs; results in results_ms/verify_rebuild/
+# nohup workflows/verify_rebuild_gpu.sh > results_ms/verify_rebuild/gpu.out 2>&1 &   # attelas1, started 08:52: 2808a + 9072a Sigma / psi, 15 release-CLI GPU runs from config.toml
+# nohup workflows/verify_rebuild_cpu.sh > results_ms/verify_rebuild/cpu.out 2>&1 &   # mont-fort15, started 08:54: qtx_ms qttools Sigma / psi, release020 runs
+# nohup workflows/bases/rebuild_l2direct.sh > results_ms/verify_rebuild/l2direct.out 2>&1 &   # mont-fort15, started 08:55 (~2 h): mos2_hfo2_l2direct/modes
+# /scratch/jiacao/mg_modespace/queue_psi_21600a.sh -> workflows/psi/rebuild_psi_21600a.sh (attelas2, waits for the ms_cuts sweep): 21600a psi, 8 energies
+# 2026-11-17 09:25 (user): release020 / ship010 re-checks stopped; mos2_hfo2_l2direct/modes restored after the rebuild
+# passes its compare (waiter -> results_ms/verify_rebuild/l2direct_restore.out); mlevel exact psi now in
+# /scratch/jiacao/mg_modespace/<dev>/psi on each GPU host, computed on demand by workflows/psi/ensure_psi.sh (the mlevel
+# run scripts call it; the --psi-dir results_ms/gpu/wf_gh200*/psi paths in the older lines above no longer exist)
+# 2026-11-17 (user): same sweep with the end slabs cleaned against the lead bands (--clean-slabs 0,-1 --win -0.6,0.55),
+# queued on attelas2 after the raw sweep + 21600a psi job; runs <dev>_l1_<cut>_clean in results_ms/gpu/ms_cuts, summary
+# (raw + clean) in reports/2026-11-17-slab-level1-cuts
+#   CLEAN=1 nohup workflows/run_ms_cuts.sh > results_ms/gpu/ms_cuts/run_ms_cuts_clean.out 2>&1 &
+# 2026-11-17 11:15 (user): OFF-state sweep, 0.4 eV barrier over the middle third (workflows/gate_device.py), cuts
+# 1e-8 / 1e-6 / 1e-4 x {basis rebuilt at the gate (_gate), flat-band basis reused (_flat)}, 2808a / 9072a / 21600a
+# (attelas2, needs the run_ms_cuts.sh modes in its /scratch); summary -> reports/2026-11-17-slab-level1-cuts-gate
+#   nohup workflows/run_ms_cuts_gate.sh > results_ms/gpu/ms_cuts_gate/run.out 2>&1 &
+# 11:39 cleaned sweep moved to attelas1 (user): /scratch/jiacao/mg_modespace/ms_cuts/copy_and_clean.sh pulls the Sigma /
+# psi / 21600a prep + level-1 caches from attelas2, then CLEAN=1 workflows/run_ms_cuts.sh (log run_ms_cuts_clean.out)
+
+# Stand-alone MS with tile level 1 cut in y, 6 nm 4 y strips / 12 nm 8 y strips per slab, CAP+OBC, cut 1e-8, 2808a grid
+# Ec+0..0.5 (10 meV); exact T for 6 nm only (12 nm streamed LU ~400 GB host; EXACT_12nm=1 to force) (user, 2026-11-17).
+# Prep of both devices redone (6 nm caches no longer on either host). Logs results_ms/gpu/ms_ycut, big files /scratch/jiacao/mg_modespace/<dev>
+#   setsid nohup workflows/run_ms_ycut.sh > results_ms/gpu/ms_ycut/run.out 2>&1 &   # started 2026-11-17 16:50 (attelas2), stopped ~18:20 (user) after Ec+0..0.04 (level 1 N1 82 557, 2742 s, cached in /scratch/jiacao/mg_modespace/6nm/level1_tile4y; MS solve on the CPU, 118 s per energy)
+# 2026-11-17 18:15 (user): mode-space solve on the GPU (core.block_solve: streaming block sweep, --ms-solve auto|gpu|cpu
+# in the release CLI; ported to qtx_ms.msbasis.block_solve). Validation on the 6 nm tile4y basis at Ec+0.03/0.04/0.15,
+# then the y-cut sweep restarted only if GPU / CPU T_MS agree to 1e-9 (attelas2):
+#   setsid nohup results_ms/gpu/ms_ycut/validate_ms_gpu.sh > results_ms/gpu/ms_ycut/validate_ms_gpu.out 2>&1 &
+#   setsid nohup results_ms/gpu/ms_ycut/queue_restart.sh > results_ms/gpu/ms_ycut/queue_restart.out 2>&1 &
+# 2026-11-17 19:38 (user): y-cut tile sweep stopped after 19 energies on 6 nm (T err ~4x worse than slab level 1 at 2.2x
+# N; partial json in results_ms/gpu/ms_ycut/6nm_tile4y_l1_1e-8, log run_tile.out); switched to slab level 1 (PART=slab,
+# default now; CAP+OBC, emb 12, 24 pts, cut 1e-8; exact psi of the 19 energies reused), 6 nm then 12 nm (MS only):
+#   setsid nohup workflows/run_ms_ycut.sh > results_ms/gpu/ms_ycut/run.out 2>&1 &   # started 19:38 (attelas2)
+# 2026-11-17 20:20 (user): 12 nm as tile level 1 with 2 y strips (unsplit slab local rho ~145 GB of GPU); memory-lean GPU
+# local rho (level1.GpuEmbedding in the release, msbasis.GpuEmbedding in qtx_ms: environment components, chunked A_EP / X,
+# S_P^-1 into the accumulator; check: results_ms/gpu/ms_ycut/check_lean_rho.sh, 2808a block 1 = cached block to 1.3e-8).
+# The 6 nm wrapper was stopped (python 2336043 keeps running); queue (attelas2):
+#   setsid nohup results_ms/gpu/ms_ycut/queue_12nm.sh 2336043 >> results_ms/gpu/ms_ycut/run.out 2>&1 &

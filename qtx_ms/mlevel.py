@@ -27,14 +27,19 @@ Cycle (preconditioner of flexible block GMRES on the fine system, x0 = 0): on ev
             (schwarz.SlowCoarse) in rounds of --slow m,q, the first N of them (--counts)
   fine  : two-level baseline, slow modes directly on the fine smoother.
 
+Basis reuse over energies: the block bases of every level are energy independent (contour rho over the window from
+  S, H, the projected CAP and Sigma(z)); only A_k(E) = E S_k - H_k - Sigma_k(E) and the smoothers depend on E. merge(...,
+  bkey=K) keeps U_{k+1} per key in memory (host) and, with h.basis_dir set, in <basis_dir>/l<k>_<hash>.npz; a later
+  merge with the same key skips the contour rho (driver: --basis-cache, default <dm-cache>/<tag>_levels).
+
 Library: h = Hierarchy(dev, inp, sw); DM = h.window_dm(...); U = h.basis1(DM, kind, cut); h.level1(U, E, SL, SR);
-h.merge(axis, cut, kind, mu1, mu2, npts, halo) per further level; prec, timer = h.cycle(m, bottom, A0, S0, gamma).
+h.merge(axis, cut, kind, mu1, mu2, npts, halo, bkey) per further level; prec, timer = h.cycle(m, bottom, A0, S0, gamma).
 
     python -m qtx_ms.mlevel --inputs inputs/mos2_hfo2_9072a --dE 0.15 --gpu --sigma-cache DIR --psi-dir DIR \\
         --dm-cache DIR [--cap 16,2,2 --cap-split 2,1 --cap-tov 6 --cap-solver rows64] --l1 dm:1e-2 \\
         --up y:1e-2,x:1e-2:0.05:0.25 [--halo 1 --halo-smooth same] [--sweep fine,exact,top --counts 32,128,256]
 """
-import argparse, json, os, time
+import argparse, hashlib, json, os, time
 import numpy as np
 import scipy.sparse as sp
 
@@ -302,6 +307,7 @@ class Hierarchy:
         cx = np.array([self.x[c].mean() for c in self.cores]).reshape(-1, self.ny)
         assert np.ptp(cx, axis=1).max() < 3.0 and (np.diff(cx.mean(1)) > 0).all(), "window order is not (x, strip)"
         self.LV = {}
+        self.ubank, self.basis_dir = {}, None                       # level bases by key: host copies / disk cache
         log(f"fine: n {n}, {nw} window cores, {min(len(c) for c in self.cores)}..{max(len(c) for c in self.cores)} "
             f"orbitals, core graph {int(G.sum())} coupled pairs ({G.sum(1).min()}..{G.sum(1).max()} per core); level "
             f"CAP {self.s1:g} eV over {self.d1:g} Å, ramp {l1_ramp}, LU {l1_lu}")
@@ -506,6 +512,34 @@ class Hierarchy:
                 if (i, j) in sg:
                     M1[o[a_]:o[a_ + 1], o[b_]:o[b_ + 1]] = sg[(i, j)]
         return Y.conj().T @ (M1 @ Y)
+
+    # ------------------------------------------------------------------ basis store
+    def basis_get(self, key, k):
+        """(U blocks as host arrays, trace per block) of the level-k bases stored under key, or None."""
+        if key is None:
+            return None
+        if key in self.ubank:
+            return self.ubank[key]
+        if self.basis_dir:
+            f = os.path.join(self.basis_dir, f"l{k}_{hashlib.sha1(key.encode()).hexdigest()[:16]}.npz")
+            if os.path.exists(f):
+                c = np.load(f)
+                assert str(c["key"]) == key, f"{f}: key mismatch"
+                self.ubank[key] = ([c[f"u{i}"] for i in range(int(c["nb"]))], c["tr"])
+                return self.ubank[key]
+        return None
+
+    def basis_put(self, key, k, U, tr):
+        if key is None:
+            return
+        Uh = [gpu.asnumpy(u) for u in U]
+        self.ubank[key] = (Uh, np.asarray(tr))
+        if self.basis_dir:
+            os.makedirs(self.basis_dir, exist_ok=True)
+            f = os.path.join(self.basis_dir, f"l{k}_{hashlib.sha1(key.encode()).hexdigest()[:16]}.npz")
+            tmp = f + f".tmp{os.getpid()}.npz"
+            np.savez(tmp, key=key, nb=len(Uh), tr=np.asarray(tr), **{f"u{i}": u for i, u in enumerate(Uh)})
+            os.replace(tmp, f)
 
     # ------------------------------------------------------------------ level 1
     def window_dm(self, cache, tag, mu1, mu2, npts, keep=1e-4, batch_gb=16.0):
@@ -712,10 +746,11 @@ class Hierarchy:
         Sm.sizes, Sm.gb = sizes, gb
         return Sm
 
-    def merge(self, axis, cut, kind, mu1, mu2, npts, halo=None):
+    def merge(self, axis, cut, kind, mu1, mu2, npts, halo=None, bkey=None):
         """Append level k + 1 = pairs of blocks of the deepest level L along axis ("x" | "y"); also the smoother of
         L.A with these pairs as blocks. mu1, mu2: absolute energy window of the contour rho; halo: x halo of the
-        windows in blocks of L (None: every coupled block). Returns the new level."""
+        windows in blocks of L (None: every coupled block); bkey: the bases of this level are taken from / stored in
+        the basis store under bkey (energy independent: no contour rho when stored). Returns the new level."""
         assert axis in ("x", "y") and kind in ("dm", "dmc")
         xp, log = self.xp, self.log
         L = self.LV[len(self.LV)]
@@ -749,67 +784,75 @@ class Hierarchy:
         win = [w[d <= hu] for w, d in zip(full, xd)]                                      # rho windows
         wsm = [w[d <= hs] for w, d in zip(full, xd)]                                      # windows of the smoother of L.A
         nwin = np.array([int(L.r[w].sum()) for w in win])
-        zs, dzs = contour_points(mu1, mu2, npts)
-        isl = [bool(set(self.cores_of(L, w)) & self.lead_cores) for w in win]
-        order = sorted(range(nc), key=lambda c: (not isl[c], c))
-        batches, cur, m_ = [], [], 0.0
-        # per window of a batch: S_w, K_w, accumulator stay (3 n^2); the pencil and its inverse are transient (the
-        # largest window once: + 3 n^2 with the LU workspace)
-        lim = min(self.batch_gb, self.mem_frac * self.gpu_free_gb()) - 3 * nwin.max() ** 2 * 16 / 2 ** 30
-        for c in order:
-            m = 3 * nwin[c] ** 2 * 16 / 2 ** 30
-            if cur and m_ + m > lim:
-                batches.append(cur)
-                cur, m_ = [], 0.0
-            cur.append(c)
-            m_ += m
-        batches.append(cur)
-        Nn.U, tr = [None] * nc, np.zeros(nc)
-        U1 = self.LV[1].U
         lv = f"level {Nn.k}"
-        self.mem(f"{lv}: start of the {axis} merge")
-        for bi, ks in enumerate(batches):
-            bt = f"{lv} rho batch {bi + 1}/{len(batches)}"
-            dat = {}
-            for c in ks:
-                w = win[c]
-                Kw = -self.dense(L, L.Hb, w, w)
-                Cw = self.cap_of(L, w)                           # not kept: the smoother below rebuilds it (cheap)
-                if Cw is not None:
-                    Kw += Cw
-                del Cw
-                dat[c] = [self.dense(L, L.Sb, w, w), Kw, xp.zeros((nwin[c],) * 2, complex)]
-            self.mem(f"{bt}: S, K, accumulator of {len(ks)} windows")
-            lead = any(isl[c] for c in ks)
-            sf = {c: self.sig_factor(L, win[c]) for c in ks if isl[c]}
-            if sf:
-                self.mem(f"{bt}: lead Sigma factors of {len(sf)} windows")
-            for z, dz in zip(zs, dzs):
-                sg = self.sigma1(U1, *self.dev.sigma(z)) if lead else {}
+        stored = self.basis_get(bkey, Nn.k)
+        if stored is not None:
+            Nn.U, tr, batches = [xp.asarray(u) for u in stored[0]], np.asarray(stored[1]), []
+            for c in range(nc):
+                assert Nn.U[c].shape[0] == int(L.r[list(Nn.kids[c])].sum()), "stored bases belong to another hierarchy"
+            self.mem(f"level {Nn.k}: bases from the store")
+        else:
+            zs, dzs = contour_points(mu1, mu2, npts)
+            isl = [bool(set(self.cores_of(L, w)) & self.lead_cores) for w in win]
+            order = sorted(range(nc), key=lambda c: (not isl[c], c))
+            batches, cur, m_ = [], [], 0.0
+            # per window of a batch: S_w, K_w, accumulator stay (3 n^2); the pencil and its inverse are transient (the
+            # largest window once: + 3 n^2 with the LU workspace)
+            lim = min(self.batch_gb, self.mem_frac * self.gpu_free_gb()) - 3 * nwin.max() ** 2 * 16 / 2 ** 30
+            for c in order:
+                m = 3 * nwin[c] ** 2 * 16 / 2 ** 30
+                if cur and m_ + m > lim:
+                    batches.append(cur)
+                    cur, m_ = [], 0.0
+                cur.append(c)
+                m_ += m
+            batches.append(cur)
+            Nn.U, tr = [None] * nc, np.zeros(nc)
+            U1 = self.LV[1].U
+            self.mem(f"{lv}: start of the {axis} merge")
+            for bi, ks in enumerate(batches):
+                bt = f"{lv} rho batch {bi + 1}/{len(batches)}"
+                dat = {}
                 for c in ks:
-                    M = z * dat[c][0] + dat[c][1]
-                    if isl[c]:
-                        M -= self.sig_of(sf[c], sg)
-                    M = xp.linalg.inv(M)
-                    M *= dz
-                    dat[c][2] += M
-                    del M
-                del sg
-                gpu.free()
-            del sf
-            self.mem(f"{bt}: contour ({npts} inversions per window)")
-            for c in ks:
-                w = win[c]
-                o = offs(L.r[w])
-                loc = {int(k): q for q, k in enumerate(w)}
-                rows = xp.asarray(np.concatenate([np.arange(o[loc[k]], o[loc[k] + 1]) for k in Nn.kids[c]]))
-                rho = rho_of(dat[c][2])
-                dat[c] = None
-                Nn.U[c] = select(rho, rows, cut, kind)
-                tr[c] = float(xp.real(xp.trace(rho[rows][:, rows])))
-                del rho
-                gpu.free()
-            self.mem(f"{bt}: block bases from rho")
+                    w = win[c]
+                    Kw = -self.dense(L, L.Hb, w, w)
+                    Cw = self.cap_of(L, w)                           # not kept: the smoother below rebuilds it (cheap)
+                    if Cw is not None:
+                        Kw += Cw
+                    del Cw
+                    dat[c] = [self.dense(L, L.Sb, w, w), Kw, xp.zeros((nwin[c],) * 2, complex)]
+                self.mem(f"{bt}: S, K, accumulator of {len(ks)} windows")
+                lead = any(isl[c] for c in ks)
+                sf = {c: self.sig_factor(L, win[c]) for c in ks if isl[c]}
+                if sf:
+                    self.mem(f"{bt}: lead Sigma factors of {len(sf)} windows")
+                for z, dz in zip(zs, dzs):
+                    sg = self.sigma1(U1, *self.dev.sigma(z)) if lead else {}
+                    for c in ks:
+                        M = z * dat[c][0] + dat[c][1]
+                        if isl[c]:
+                            M -= self.sig_of(sf[c], sg)
+                        M = xp.linalg.inv(M)
+                        M *= dz
+                        dat[c][2] += M
+                        del M
+                    del sg
+                    gpu.free()
+                del sf
+                self.mem(f"{bt}: contour ({npts} inversions per window)")
+                for c in ks:
+                    w = win[c]
+                    o = offs(L.r[w])
+                    loc = {int(k): q for q, k in enumerate(w)}
+                    rows = xp.asarray(np.concatenate([np.arange(o[loc[k]], o[loc[k] + 1]) for k in Nn.kids[c]]))
+                    rho = rho_of(dat[c][2])
+                    dat[c] = None
+                    Nn.U[c] = select(rho, rows, cut, kind)
+                    tr[c] = float(xp.real(xp.trace(rho[rows][:, rows])))
+                    del rho
+                    gpu.free()
+                self.mem(f"{bt}: block bases from rho")
+            self.basis_put(bkey, Nn.k, Nn.U, tr)
         t_rho = time.time() - t0
         Nn.r = np.array([u.shape[1] for u in Nn.U])
         Nn.off = offs(Nn.r)
@@ -849,12 +892,12 @@ class Hierarchy:
             f"columns; smoother of A{L.k} (halo {allh(hs)}): {nsm.min()}..{int(np.median(nsm))}..{nsm.max()} columns, "
             f"{self.l1_solver} {Nn.Sbelow.gb:.2f} GB (LUs {(nsm.astype(float) ** 2).sum() * self.lub / 2 ** 30:.2f} GB); "
             f"A{Nn.k} {gb:.2f} GB; trace per block {tr.min():.1f}..{np.median(tr):.1f}..{tr.max():.1f}; rho "
-            f"{t_rho:.0f} s in {len(batches)} batches, smoother {time.time() - t:.0f} s; {self.memstr()}")
+            + (f"{t_rho:.0f} s in {len(batches)} batches" if batches else f"from the store ({t_rho:.0f} s)") + f", smoother {time.time() - t:.0f} s; {self.memstr()}")
         Nn.info = dict(level=Nn.k, axis=axis, kind=kind, cut=cut, window=[mu1, mu2], npts=int(npts), blocks=nc,
                        N=Nn.N, per_block=Nn.r.tolist(), halo_max=hmax, halo_rho=hu, halo_smoother=hs,
                        rho_windows=nwin.tolist(), smoother_windows=nsm.tolist(), smoother_gb=Nn.Sbelow.gb, A_gb=gb,
                        halo_cost={str(h): cost[h] / max(cost[hmax], 1) for h in cost}, couplings_below=cpl,
-                       trace=tr.tolist(), t_rho=t_rho, rho_batches=len(batches))
+                       trace=tr.tolist(), t_rho=t_rho, rho_batches=len(batches), stored=not batches)
         self.LV[Nn.k] = Nn
         return Nn
 
@@ -968,6 +1011,8 @@ def main(argv=None):
     p.add_argument("--tol", type=float, default=1e-10)
     p.add_argument("--fgmres-log", type=int, default=0)
     p.add_argument("--dm-cache", default="", help="window density-matrix cache dir (shared with the mlevel scripts)")
+    p.add_argument("--basis-cache", default="", help="bases of the levels >= 2 (energy independent): dir, none, or "
+                                                     "empty = <dm-cache>/<tag>_levels (in memory only without dm-cache)")
     p.add_argument("--mu", default="-0.15,0.6", help="contour window relative to Ec [eV]")
     p.add_argument("--npts", type=int, default=24)
     p.add_argument("--dm-keep", type=float, default=1e-4)
@@ -1006,7 +1051,14 @@ def main(argv=None):
     ups = parse_up(a.up, a.halo, mu)
     tag = (f"dm_w{a.cap.replace(',', '_')}_s{a.cap_split.replace(',', '_') or '1'}_t{a.cap_tov:g}"
            f"_mu{a.mu.replace(',', '_')}_n{a.npts}")
-    DM = None
+    if a.basis_cache != "none":
+        h.basis_dir = a.basis_cache or (os.path.join(a.dm_cache, tag + "_levels") if a.dm_cache else None)
+    s1_, d1_ = h.s1, h.d1
+    keys, chain = [], f"{name}|{tag}|l1 {a.l1}|cap {s1_:g},{d1_:g},{a.l1_ramp}"
+    for axis, cut, m1, m2, npts, halo in ups:                    # key of each level = everything its rho depends on
+        chain += f"|{axis}:{cut:g}:{m1:g}:{m2:g}:{npts or a.npts}:h{'all' if halo is None else halo}"
+        keys.append(chain if a.basis_cache != "none" else None)
+    DM = U1 = None
     for dE in (float(v) for v in a.dE.split(",")):
         E = Ec + dE
         SL, SR = dev.sigma(E + 1j * a.eta)
@@ -1079,9 +1131,15 @@ def main(argv=None):
                        (S0, A0))
         if DM is None:
             DM = h.window_dm(a.dm_cache or None, tag, Ec + mu[0], Ec + mu[1], a.npts, a.dm_keep, a.dm_batch_gb)
-        h.level1(h.basis1(DM, kind, cut1), E, SL, SR)
-        for axis, cut, m1, m2, npts, halo in ups:
-            h.merge(axis, cut, kind, Ec + m1, Ec + m2, npts or a.npts, halo)
+        if U1 is None:
+            U1 = h.basis1(DM, kind, cut1)                         # energy independent: built once
+        tb = time.time()
+        h.level1(U1, E, SL, SR)
+        for (axis, cut, m1, m2, npts, halo), key in zip(ups, keys):
+            h.merge(axis, cut, kind, Ec + m1, Ec + m2, npts or a.npts, halo, key)
+        rec["t_levels"] = time.time() - tb
+        log(f"  levels at Ec {dE:+.3f}: {rec['t_levels']:.0f} s (" + ", ".join(
+            f"level {k} {'stored' if h.LV[k].info.get('stored') else 'rho'}" for k in range(2, len(h.LV) + 1)) + ")")
         nl = len(h.LV)
         rec["levels"] = [h.LV[k].info for k in range(1, nl + 1)]
         rec["mem"] = h.memlog

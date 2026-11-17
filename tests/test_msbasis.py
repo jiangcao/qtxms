@@ -221,13 +221,36 @@ def test_partition_covers_device(real_strip):
     assert not core.any()
 
 
+# reference bulk H(k) of the model (from qtmode.cms)
+def _bulk_hk_batch(P, ks):
+    """Primitive-cell H(k) for many k: (nk, 2 nsi, 2 nsi). Convention psi(r) = c e^{ik.r}.
+    sp3s* (TBParams) or sp3d5s* (TB5Params, no spin-orbit, shifted so the bulk VBM is 0)."""
+    from qtx_ms.prep.structure import A_SI, SI_C, VB
+    from qtx_ms.prep.hamiltonian import sk_block
+    v = VB * A_SI / 4
+    if hasattr(P, "si"):                                  # sp3d5s*
+        from qtx_ms.prep import sp3d5s as T5
+        ns = T5.NORB
+        on = np.kron(np.eye(2), T5.onsite(P.si)) + P.shift * np.eye(2 * ns)
+        Ms = [T5.sk_block(d, P.si) for d in v]
+    else:
+        ns = 5
+        on = np.diag(np.concatenate([P.onsite(SI_C)] * 2))
+        Ms = [sk_block(SI_C, SI_C, d, P) for d in v]
+    Hk = np.repeat(on[None].astype(complex), len(ks), 0)
+    for d, M in zip(v, Ms):
+        ph = np.exp(1j * ks @ d)
+        Hk[:, :ns, ns:] += M[None] * ph[:, None, None]
+    Hk[:, ns:, :ns] = np.conj(np.transpose(Hk[:, :ns, ns:], (0, 2, 1)))
+    return Hk
+
+
 def test_bulk_from_device_sp3s():
     """Bulk H(k) read off the device H at a core atom = the sp3s* bulk H(k) of the model."""
     from qtx_ms.prep import model
     from qtx_ms.prep.structure import build_open_device
     from qtx_ms.prep.hamiltonian import TBParams, build_H
     from qtx_ms.prep.si_sheet import LABELS
-    from qtmode.cms import _bulk_hk_batch
     model.select("sp3s")
     st = build_open_device(n_dev_blocks=1, n_lead_blocks=1, nt=(4, 4), half_width=(9.0, 9.0), rough_rms=0.0)
     P = TBParams()
@@ -477,6 +500,32 @@ def _gpu_ok():
         return True
     except Exception:
         return False
+
+
+@pytest.mark.skipif(not _gpu_ok(), reason="no GPU / cupy")
+@pytest.mark.parametrize("nonorth", [False, True])
+def test_exact_solve_gpu_dense_and_stream(nonorth):
+    """GPU exact_solve: dense block LU and the streaming variant (LU factors on the host) = sparse direct solve."""
+    from qtx_ms import gpu
+    inp = strip(nd=6, nonorth=nonorth)
+    dev = mb.Device(inp, obc="folded")
+    E = E_TEST[0]
+    SL, SR = dev.sigma(E + 1e-6j)
+    B = dev.inject(SL)
+    b = np.zeros((dev.n, B.shape[1]), complex)
+    b[dev.bL] = B
+    A = dev.A(E, SL, SR).tocsr()
+    Xr = mb.CSolver(A).solve(b)
+    gpu.enable()
+    try:
+        for stream in (False, True, None):
+            X, res = mb.exact_solve(dev, A, b, stream=stream)
+            assert isinstance(X, np.ndarray) and res < 1e-12
+            assert rel(X, Xr) < 1e-10
+        st = mb.StreamBlockTridiag(dev, A)
+        assert all(isinstance(f[0], np.ndarray) for f in st.lu)
+    finally:
+        gpu.enable(False)
 
 
 @pytest.mark.skipif(not _gpu_ok(), reason="no GPU / cupy")

@@ -35,12 +35,53 @@ try:
 except ImportError:          # pragma: no cover
     pypardiso = None
 
-from qtmode.lead_ms import face_surface_gfs_small
 from qtx_ms import gpu
 
 
 def log(*a):
     print(*a, flush=True)
+
+
+# ------------------------------------------------------------------ exact lead surface GFs (from qtmode.lead_ms)
+def _sancho_both(h00, h01, z, tol=1e-11, maxit=300):
+    """Lopez-Sancho returning both bulk-side surface on-site matrices:
+    esR (cells n+1.. folded onto n) and esL (cells ..n-1 folded onto n), chain n -> n+1 via h01.
+    Complex symmetric chain: n+1 -> n coupling is h01^T."""
+    n = len(h00)
+    I = np.eye(n)
+    e = h00.astype(complex)
+    esR, esL = e.copy(), e.copy()
+    a, b = h01.astype(complex), h01.T.astype(complex)
+    for it in range(maxit):
+        X = sla.solve(z * I - e, np.hstack([a, b]), check_finite=False)
+        ga, gb = X[:, :n], X[:, n:]
+        agb, bga = a @ gb, b @ ga
+        esR += agb
+        esL += bga
+        e += agb + bga
+        a, b = a @ ga, b @ gb
+        if max(np.abs(a).max(), np.abs(b).max()) < tol:
+            break
+    return esR, esL, it + 1
+
+
+def face_surface_gfs_small(Heff, iL, iR, V, z):
+    """Exact surface GFs using only the chain on the smaller face Lf (eliminate every Rf):
+      right lead, first cell, on Lf : (z - esR + V^T gRR V)^-1          (no R_0 on its left)
+      left lead, last cell, on Rf   : R_0 couples only to L_0; L_0 without R_0 has on-site
+                                      esL - HLR gRR HRL, then one |Rf| solve."""
+    HLL, HLR = Heff[np.ix_(iL, iL)], Heff[np.ix_(iL, iR)]
+    HRR, HRL = Heff[np.ix_(iR, iR)], Heff[np.ix_(iR, iL)]
+    IR, IL = np.eye(len(iR)), np.eye(len(iL))
+    gRR = sla.solve(z * IR - HRR, np.hstack([HRL, V]), check_finite=False)
+    t_in, t_v = HLR @ gRR[:, :len(iL)], V.T @ gRR[:, len(iL):]
+    h00 = HLL + t_in + t_v
+    h01 = HLR @ gRR[:, len(iL):]                                   # L_n -> L_n+1
+    esR, esL, nit = _sancho_both(h00, h01, z)
+    gR = sla.inv(z * IL - (esR - t_v), check_finite=False)
+    GL0 = sla.inv(z * IL - (esL - t_in), check_finite=False)
+    gL = sla.inv(z * IR - HRR - HRL @ GL0 @ HLR, check_finite=False)
+    return gL, gR, nit
 
 
 # ------------------------------------------------------------------ sparse complex solves
@@ -416,7 +457,7 @@ class FoldedLead:
     and is folded onto F at complex z:  A_eff(z) = A_FF - A_FI A_II^-1 A_IF,  A = z S - H.
       general (complex Hermitian H, any S): Sancho decimation of the folded chain on F with
           A01 = z S01 - H01, A10 = z S01^H - H01^H;  g_L, g_R on F (oL = oR = F).
-      real symmetric H, S = I (fast): qtmode.lead_ms.face_surface_gfs_small, chain on the smaller face;
+      real symmetric H, S = I (fast): face_surface_gfs_small, chain on the smaller face;
           g_L on Rf (oL), g_R on Lf (oR).
     """
 
@@ -1894,10 +1935,59 @@ def level2_basis(rho, thr=1e-5, S=None):
 
 
 # ------------------------------------------------------------------ exact solve on the GPU
-def exact_solve(dev, A, B, n_ref=2, tol=1e-12):
+class StreamBlockTridiag:
+    """GPU block-tridiagonal LU of a sparse device matrix for devices whose dense blocks do not fit on the GPU
+    (ported from the release, qtx_modespace.core.StreamBlockTridiag, 2026-11-17): the diagonal blocks are densified
+    one at a time, the couplings stay sparse on the device, and the LU factor of every Schur-complemented diagonal
+    block is moved to host memory (copied back per solve). Peak GPU memory ~5 dense blocks; host memory one dense
+    block per slab. solve(B) takes and returns cupy arrays."""
+
+    def __init__(self, dev, A):
+        A, b, n = sp.csr_matrix(A), dev.sb, len(dev.ns)
+        cp = gpu.cp
+        self.bounds = b[:n + 1]
+        self.Up = [gpu.csr(A[b[s]:b[s + 1], b[s + 1]:b[s + 2]], np.complex128) for s in range(n - 1)]
+        self.Lo = [gpu.csr(A[b[s + 1]:b[s + 2], b[s]:b[s + 1]], np.complex128) for s in range(n - 1)]
+        self.lu = []
+        Dt = gpu.csr_dense(A[b[0]:b[1], b[0]:b[1]], np.complex128)
+        for s in range(n):
+            lu = gpu.lu_factor(Dt)
+            Dt = None
+            if s < n - 1:
+                W = gpu.lu_solve(lu, self.Up[s].toarray())          # D~_s^-1 A_{s,s+1}
+                Dt = gpu.csr_dense(A[b[s + 1]:b[s + 2], b[s + 1]:b[s + 2]], np.complex128)
+                Dt -= self.Lo[s] @ W
+                del W
+            self.lu.append((cp.asnumpy(lu[0]), cp.asnumpy(lu[1])))
+            del lu
+            gpu.free()
+
+    def _lu(self, s):
+        return gpu.cp.asarray(self.lu[s][0]), gpu.cp.asarray(self.lu[s][1])
+
+    def solve(self, B):
+        cp, b, n = gpu.cp, self.bounds, len(self.lu)
+        B = cp.asarray(B)
+        Z = [None] * n                                          # Z_s = D~_s^-1 Y~_s
+        Y = B[b[0]:b[1]].astype(complex)
+        for s in range(n):
+            Z[s] = gpu.lu_solve(self._lu(s), Y)
+            if s < n - 1:
+                Y = B[b[s + 1]:b[s + 2]].astype(complex) - self.Lo[s] @ Z[s]
+        X = [None] * n
+        X[-1] = Z[-1]
+        for s in range(n - 2, -1, -1):
+            X[s] = Z[s] - gpu.lu_solve(self._lu(s), self.Up[s] @ X[s + 1])
+        gpu.free()
+        return cp.concatenate(X)
+
+
+def exact_solve(dev, A, B, n_ref=2, tol=1e-12, stream=None):
     """A X = B for the sparse device matrix A (numpy in / out), returns (X, max relative residual).
     CPU: CSolver. GPU (gpu.on): dense block-tridiagonal LU over the slabs on the device (left-to-right elimination,
-    Dt_{s+1} = D_{s+1} - A_{s+1,s} Dt_s^-1 A_{s,s+1}) + n_ref refinement steps with the sparse A on the device."""
+    Dt_{s+1} = D_{s+1} - A_{s+1,s} Dt_s^-1 A_{s,s+1}) + n_ref refinement steps with the sparse A on the device.
+    stream: None = StreamBlockTridiag (LU factors on the host) when the dense blocks need more than 70% of the free
+    GPU memory (5 sum n_s^2 x 16 B, as the release), True / False = force it / the dense block LU."""
     if not gpu.on:
         cs = CSolver(A, n_ref=n_ref, tol=tol)
         X = cs.solve(B)
@@ -1905,26 +1995,34 @@ def exact_solve(dev, A, B, n_ref=2, tol=1e-12):
         return X, cs.res
     cp, b, ns = gpu.cp, dev.sb, len(dev.ns)
     A = sp.csr_matrix(A)
-    blk = lambda i, j: gpu.csr_dense(A[b[i]:b[i + 1], b[j]:b[j + 1]], np.complex128)
-    Up = [blk(s, s + 1) for s in range(ns - 1)]
-    lu, L = [], []
-    Dt = blk(0, 0)
-    for s in range(ns):
-        lu.append(gpu.lu_factor(Dt))
-        if s < ns - 1:
-            Lt = gpu.lu_solve(lu[s], blk(s + 1, s).T, trans=1).T          # A_{s+1,s} Dt_s^-1
-            L.append(Lt)
-            Dt = blk(s + 1, s + 1) - Lt @ Up[s]
+    if stream is None:
+        need = 16 * 5 * sum(int(n) ** 2 for n in dev.ns)      # dense D, Up, Lo + LU and L factors
+        stream = need > 0.7 * cp.cuda.Device().mem_info[0]
+        if stream:
+            log(f"  exact_solve: dense block LU needs ~{need / 2**30:.0f} GB, streaming variant (LU factors on the host)")
+    lu, L, Up, Dt = [], [], [], None
+    if stream:
+        solve = StreamBlockTridiag(dev, A).solve
+    else:
+        blk = lambda i, j: gpu.csr_dense(A[b[i]:b[i + 1], b[j]:b[j + 1]], np.complex128)
+        Up = [blk(s, s + 1) for s in range(ns - 1)]
+        Dt = blk(0, 0)
+        for s in range(ns):
+            lu.append(gpu.lu_factor(Dt))
+            if s < ns - 1:
+                Lt = gpu.lu_solve(lu[s], blk(s + 1, s).T, trans=1).T          # A_{s+1,s} Dt_s^-1
+                L.append(Lt)
+                Dt = blk(s + 1, s + 1) - Lt @ Up[s]
 
-    def solve(R):
-        Y = [R[b[s]:b[s + 1]] for s in range(ns)]
-        for s in range(1, ns):
-            Y[s] = Y[s] - L[s - 1] @ Y[s - 1]
-        X = [None] * ns
-        X[-1] = gpu.lu_solve(lu[-1], Y[-1])
-        for s in range(ns - 2, -1, -1):
-            X[s] = gpu.lu_solve(lu[s], Y[s] - Up[s] @ X[s + 1])
-        return cp.concatenate(X)
+        def solve(R):
+            Y = [R[b[s]:b[s + 1]] for s in range(ns)]
+            for s in range(1, ns):
+                Y[s] = Y[s] - L[s - 1] @ Y[s - 1]
+            X = [None] * ns
+            X[-1] = gpu.lu_solve(lu[-1], Y[-1])
+            for s in range(ns - 2, -1, -1):
+                X[s] = gpu.lu_solve(lu[s], Y[s] - Up[s] @ X[s + 1])
+            return cp.concatenate(X)
     Ad = gpu.csr(A, np.complex128)
     Bd = cp.asarray(np.asarray(B).reshape(len(B), -1), dtype=complex)
     X = solve(Bd)

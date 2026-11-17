@@ -14,3 +14,7 @@ release/qtx_modespace/data/
 envs/quatrex/.venv/
 .venv-aarch64/
 reports/
+qtmode/
+notes/
+docs/
+.claude/
