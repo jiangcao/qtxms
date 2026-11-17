@@ -74,6 +74,22 @@ def asnumpy(a):
     return np.asarray(a)
 
 
+def pinned(a):
+    """Copy of a (numpy or cupy array) in page-locked host memory, as a numpy array (plain numpy in CPU mode).
+    Use it for host arrays that are copied to the device repeatedly: pageable copies go through a single-threaded CPU
+    staging buffer (GH200: 4.4 GB/s host -> device, 26 GB/s back), pinned ones run at bus speed (~350 / ~300 GB/s)."""
+    if not on:
+        return np.asarray(a)
+    import cupyx
+    order = "F" if a.flags.f_contiguous and not a.flags.c_contiguous else "C"
+    h = cupyx.empty_pinned(a.shape, a.dtype, order=order)
+    if isinstance(a, cp.ndarray):
+        a.get(out=h)
+    else:
+        np.copyto(h, a)
+    return h
+
+
 def csr(A, dtype=None):
     """Host sparse matrix -> cupyx CSR on the device (dtype: one of float32/64, complex64/128)."""
     import scipy.sparse as sp

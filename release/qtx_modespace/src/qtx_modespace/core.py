@@ -607,8 +607,9 @@ def device_blocks(dev, A, xp=np):
 class StreamBlockTridiag:
     """GPU block-tridiagonal LU of a sparse device matrix for devices whose dense blocks do not fit on the GPU:
     diagonal blocks are densified one at a time, the couplings stay sparse on the device, and the LU factor of every
-    Schur-complemented diagonal block is moved to host memory (copied back per solve). Peak GPU memory ~5 dense
-    blocks; host memory one dense block per slab."""
+    Schur-complemented diagonal block is moved to pinned host memory (copied back twice per solve, at bus speed:
+    pageable copies made the exact solve copy-bound, ~115 of 137 s per energy on 6 nm / GH200). Peak GPU memory ~5
+    dense blocks; host memory one dense block per slab."""
 
     def __init__(self, dev, A):
         A, b, n = sp.csr_matrix(A), dev.sb, len(dev.ns)
@@ -626,7 +627,7 @@ class StreamBlockTridiag:
                 Dt = gpu.csr_dense(A[b[s + 1]:b[s + 2], b[s + 1]:b[s + 2]], np.complex128)
                 Dt -= self.Lo[s] @ W
                 del W
-            self.lu.append((cp.asnumpy(lu[0]), cp.asnumpy(lu[1])))
+            self.lu.append((gpu.pinned(lu[0]), gpu.pinned(lu[1])))      # pinned: ~80x faster copies back
             del lu
             gpu.free()
 
@@ -687,6 +688,8 @@ class Coarse:
     def __init__(self, dev, V):
         self.dev, self.V = dev, V
         self.blk = slab_blocks(dev, V)
+        if gpu.on:                  # block_solve copies every block to the device per energy: keep them pinned
+            self.blk = {k: [gpu.pinned(M) for M in L] for k, L in self.blk.items()}
         self.PL, self.PR = V[0][dev.bL], V[-1][dev.bR - dev.sb[-2]]
         self.off = np.concatenate([[0], np.cumsum([v.shape[1] for v in V])])
         self.N = int(self.off[-1])

@@ -1939,7 +1939,8 @@ class StreamBlockTridiag:
     """GPU block-tridiagonal LU of a sparse device matrix for devices whose dense blocks do not fit on the GPU
     (ported from the release, qtx_modespace.core.StreamBlockTridiag, 2026-11-17): the diagonal blocks are densified
     one at a time, the couplings stay sparse on the device, and the LU factor of every Schur-complemented diagonal
-    block is moved to host memory (copied back per solve). Peak GPU memory ~5 dense blocks; host memory one dense
+    block is moved to pinned host memory (copied back per solve at bus speed; pageable copies ran at 4.4 GB/s on
+    GH200 and made the 6 nm exact solve copy-bound). Peak GPU memory ~5 dense blocks; host memory one dense
     block per slab. solve(B) takes and returns cupy arrays."""
 
     def __init__(self, dev, A):
@@ -1958,7 +1959,7 @@ class StreamBlockTridiag:
                 Dt = gpu.csr_dense(A[b[s + 1]:b[s + 2], b[s + 1]:b[s + 2]], np.complex128)
                 Dt -= self.Lo[s] @ W
                 del W
-            self.lu.append((cp.asnumpy(lu[0]), cp.asnumpy(lu[1])))
+            self.lu.append((gpu.pinned(lu[0]), gpu.pinned(lu[1])))      # pinned: ~80x faster copies back
             del lu
             gpu.free()
 
