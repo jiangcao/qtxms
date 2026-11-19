@@ -275,3 +275,16 @@
 # 2026-11-19 (user): 6 nm relaunched with --merge-eig sketch (logs reuse_6nm_y4_sketch_*), gated by a 2808a check of the
 # host Nystrom path (mergeeig_2808a_sketch_host.log) (attelas2):
 #   setsid nohup results_ms/gpu/mlevel/run_sketch_host_check.sh > results_ms/gpu/mlevel/run_sketch_host_check.out 2>&1 &
+# 2026-11-19 (user): 6 nm sketch build stopped (level 2, batch 10/82). dmc selection (--l1 dmc:1e-2: eigenvectors of the
+# core / pair block of the local rho) on 2808a, 9072a, grid settings, Ec+0.05, 0.15, 0.3, 0.45 vs dm (grid_*_y2.log):
+#   setsid nohup results_ms/gpu/mlevel/run_dmc_grid.sh > results_ms/gpu/mlevel/run_dmc_grid.out 2>&1 &   (attelas2)
+#   dmc at 1e-2 keeps ~78 vectors per core and fails (maxit); 9072a stopped. Cut 1e-4 at every level (same script):
+#   CUT=1e-4 setsid nohup results_ms/gpu/mlevel/run_dmc_grid.sh > results_ms/gpu/mlevel/run_dmc1e-4_grid.out 2>&1 &
+#   dmc 1e-4: works, ~1.5x the fine its of dm at ~0.5x the coarse sizes; level-1 counts 483..500 per core, maybe capped by
+#   the 1e-4 window-DM cache. Window DM files now record their keep (rebuilt when larger, filtered when smaller):
+#   CUT=1e-5 DMKEEP=1e-6 setsid nohup results_ms/gpu/mlevel/run_dmc_grid.sh > results_ms/gpu/mlevel/run_dmc1e-5_grid.out 2>&1 &
+#   dmc 1e-5 / keep 1e-6 on 2808a: N1 7335, N3 1776, its 11..23 (= dm at N3 2581): the 1e-4 cache capped level 1.
+# 2026-11-19 (user): Schur folding of the window into the core / pair block for dmc (qtx_ms.mlevel --schur, SchurRho:
+# complex64 environment LU + refinement, optional probes + Nystrom; the single-shot msbasis tile-contour techniques), same
+# cut / keep, queued after the reference run (attelas2):
+#   CUT=1e-5 DMKEEP=1e-6 SCHUR=single:1 setsid nohup results_ms/gpu/mlevel/run_dmc_grid.sh > results_ms/gpu/mlevel/run_dmc1e-5_schur_grid.out 2>&1 &

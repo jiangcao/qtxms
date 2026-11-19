@@ -154,6 +154,88 @@ def select(rho, rows, cut, kind, eig="full"):
     return xp.ascontiguousarray(V[:, ev > cut][:, ::-1])
 
 
+def nystrom(Om, Y):
+    """Nystrom of a Hermitian PSD rho from Y = rho Om: rho ~ F F^H, F = Y (Om^H Y)^(-1/2) (pseudo-inverse square root,
+    eigenvalues below 1e-10 of the largest dropped). Returns X, lam (left singular vectors of F, squared singular values,
+    descending) and F."""
+    xp = gpu.xp_of(Y)
+    C = Om.conj().T @ Y
+    d, V = xp.linalg.eigh(0.5 * (C + C.conj().T))
+    ok = d > 1e-10 * d.max()
+    F = Y @ (V[:, ok] / xp.sqrt(d[ok]))
+    X, sv, _ = xp.linalg.svd(F, full_matrices=False)
+    return X, sv ** 2, F
+
+
+class SchurRho:
+    """Contour accumulation of the block P (core / pair rows) of a window Green's function by folding the rest of the
+    window E into P (the single-shot msbasis tile_rho_contour "schur" path): per point
+      G_PP(z) = S_P(z)^-1,  S_P = A_PP - A_PE A_EE^-1 A_EP,  A = M(z) (dense window matrix),
+    only the m = |P| columns A_EP are solved with the environment. prec "single": A_EE LU in complex64 and `refine`
+    steps of iterative refinement of X = A_EE^-1 A_EP in complex128; the Schur complement and its solve in complex128.
+    probes r > 0: G_PP Omega and G_PP^H Omega (LU of S_P, two solves) instead of the inverse; rho_PP Omega -> Nystrom.
+    add(z, dz, M) per point; result() -> (occ, V) of rho_PP (descending; V orthonormal, m x k)."""
+
+    def __init__(self, P, n, prec="single", refine=1, probes=0, seed=0):
+        xp = _xp()
+        self.xp, self.prec, self.refine = xp, prec, int(refine)
+        mask = np.zeros(n, bool)
+        mask[np.asarray(gpu.asnumpy(P))] = True
+        self.p, self.e = xp.asarray(np.where(mask)[0]), xp.asarray(np.where(~mask)[0])
+        m = len(self.p)
+        self.Om = None
+        if probes and probes < m:
+            rs = xp.random.RandomState(seed)
+            self.Om = (rs.standard_normal((m, probes)) + 1j * rs.standard_normal((m, probes))) / np.sqrt(2)
+            self.acc, self.acch = xp.zeros((m, probes), complex), xp.zeros((m, probes), complex)
+        else:
+            self.acc = xp.zeros((m, m), complex)
+
+    def add(self, z, dz, M):
+        xp, p, e = self.xp, self.p, self.e
+        Me = M[e]
+        AEE, AEP = Me[:, e], Me[:, p]
+        del Me
+        Mp = M[p]
+        APP, APE = Mp[:, p], Mp[:, e]
+        del Mp
+        if len(e):
+            if self.prec == "single":
+                lu = gpu.lu_factor(AEE.astype(np.complex64))
+                X = gpu.lu_solve(lu, AEP.astype(np.complex64)).astype(complex)
+                for _ in range(self.refine):
+                    X += gpu.lu_solve(lu, (AEP - AEE @ X).astype(np.complex64))
+            else:
+                lu = gpu.lu_factor(AEE)
+                X = gpu.lu_solve(lu, AEP)
+            del lu, AEE, AEP
+            Sp = APP - APE @ X
+            del X
+        else:
+            Sp = APP.copy()
+        del APP, APE
+        if self.Om is None:
+            self.acc += dz * xp.linalg.inv(Sp)
+        else:
+            lu = gpu.lu_factor(Sp)
+            self.acc += dz * gpu.lu_solve(lu, self.Om)
+            self.acch += np.conj(dz) * gpu.lu_solve(lu, self.Om, trans=2)
+            del lu
+        del Sp
+
+    def result(self):
+        xp = self.xp
+        if self.Om is None:
+            ev, V = xp.linalg.eigh(rho_of(self.acc))
+            o = xp.argsort(-ev)
+            occ, V = ev[o], V[:, o]
+        else:
+            X, occ, _ = nystrom(self.Om, -((self.acc - self.acch) / 2j) / np.pi)
+            V = X
+        self.acc = self.acch = None
+        return occ, V
+
+
 class Timed:
     """Callable / operator wrapper: column applications and wall time (GPU synchronized)."""
 
@@ -369,7 +451,7 @@ class Hierarchy:
 
     def __init__(self, dev, inp, sw, l1_cap=None, l1_ramp="dist", l1_lu="c64", l1_solver="rows", batch_gb=24.0,
                  mem_frac=0.5, halo_smooth="same", host_blocks=False, stream_gb=None, l1_free=False, merge_eig="full",
-                 sketch_prec="c128", log=log):
+                 sketch_prec="c128", core=None, log=log):
         assert l1_ramp in ("dist", "plane") and l1_lu in ("c64", "c128") and l1_solver in ("rows", "lu")
         assert halo_smooth in ("same", "full") and merge_eig in ("full", "rand", "sketch")
         self.dev, self.inp, self.sw, self.log = dev, inp, sw, log
@@ -377,6 +459,8 @@ class Hierarchy:
         # Omega from a probe block (one LU + 2 solves per contour point, no window rho), Nystrom (_sketch_batch)
         self.merge_eig = merge_eig
         self.sketch_prec = sketch_prec
+        # core = dict(prec, refine, probes): dmc blocks by Schur folding of the window into the core / pair (SchurRho)
+        self.core = core
         # host_blocks: the S, H Galerkin blocks of every level live in host memory (read only to assemble A_k, the rho
         # windows and the Galerkin products of the next level); 6 nm y-cut level 1: ~44 GB off the GPU
         self.host_blocks = bool(host_blocks) and gpu.on
@@ -677,18 +761,29 @@ class Hierarchy:
             os.replace(tmp, f)
 
     # ------------------------------------------------------------------ level 1
-    def window_dm(self, cache, tag, mu1, mu2, npts, keep=1e-4, batch_gb=16.0):
+    def window_dm(self, cache, tag, mu1, mu2, npts, keep=1e-4, batch_gb=16.0, core=None):
         """Per window k of the fine smoother: occupations (descending, > keep) and the core rows of the eigenvectors of
         the local contour density matrix over [mu1, mu2] (absolute energies) of A_kk(z) + i s P S P (the S0 window
         operator, - Sigma(z) on the lead faces). One file per window in cache/tag (cache None: nothing is stored),
-        built in batches of batch_gb. Returns [(occ, vec)]."""
+        built in batches of batch_gb. Returns [(occ, vec)]. A file records its keep (files without one: 1e-4); a file
+        built with a larger keep than asked for is rebuilt, a smaller one is filtered to occ > keep on load.
+        core = dict(prec, refine, probes): only the core block rho_cc, the rest of the window folded into the core
+        (SchurRho: no window inverse, no window eigh); stores the eigenpairs of rho_cc (dmc only), in <tag>_core_...."""
         xp, dev, sw, nw = self.xp, self.dev, self.sw, self.nw
+        if core:
+            tag = (f"{tag}_core_{core['prec'][0]}{core['refine'] if core['prec'] == 'single' else ''}"
+                   + (f"_p{core['probes']}" if core.get("probes") else ""))
         d = os.path.join(cache, tag) if cache else None
         if d:
             os.makedirs(d, exist_ok=True)
         f = lambda k: os.path.join(d, f"w{k}.npz")
         DM = [None] * nw
-        todo = [k for k in range(nw) if not (d and os.path.exists(f(k)))]
+        def kept(k):                                         # keep of the stored file (None: no file)
+            if not (d and os.path.exists(f(k))):
+                return None
+            with np.load(f(k)) as c:
+                return float(c["keep"]) if "keep" in c.files else 1e-4
+        todo = [k for k in range(nw) if kept(k) is None or kept(k) > keep * (1 + 1e-12)]
         if todo:
             t = time.time()
             zs, dzs = contour_points(mu1, mu2, npts)
@@ -708,9 +803,12 @@ class Hierarchy:
                 cur.append(k)
                 mem += m
             batches.append(cur)
-            self.log(f"  window density matrices: {len(todo)} windows to build in {len(batches)} batches, {npts} points")
+            self.log(f"  window density matrices: {len(todo)} windows to build in {len(batches)} batches, {npts} points"
+                     + (f", core block by Schur folding ({core})" if core else ""))
             for bi, ks in enumerate(batches):
-                acc = {k: xp.zeros((len(sw.idx[k]),) * 2, complex) for k in ks}
+                acc = {k: (SchurRho(np.where(sw.core[k])[0], len(sw.idx[k]), core["prec"], core["refine"],
+                                    core.get("probes", 0), seed=k) if core else
+                           xp.zeros((len(sw.idx[k]),) * 2, complex)) for k in ks}
                 self.mem(f"window rho batch {bi + 1}/{len(batches)}: accumulators of {len(ks)} windows")
                 lead = [k for k in ks if np.isin(sw.idx[k], dev.bL).any() or np.isin(sw.idx[k], dev.bR).any()]
                 for z, dz in zip(zs, dzs):
@@ -727,22 +825,32 @@ class Hierarchy:
                                     M = M - sp.csr_matrix((Sg[np.ix_(jj, jj)].ravel(), (np.repeat(ii, len(ii)),
                                                            np.tile(ii, len(ii)))), shape=M.shape)
                         Mk = gpu.csr_dense(M, np.complex128) if gpu.on else M.toarray()
-                        acc[k] += xp.linalg.inv(Mk) * dz
+                        if core:
+                            acc[k].add(z, dz, Mk)
+                        else:
+                            acc[k] += xp.linalg.inv(Mk) * dz
                         del Mk
                     gpu.free()
                 self.mem(f"window rho batch {bi + 1}/{len(batches)}: contour ({npts} inversions per window)")
                 for k in ks:
-                    rho = rho_of(acc[k])
-                    acc[k] = None
-                    ev, V = xp.linalg.eigh(rho)
-                    del rho
-                    o = xp.argsort(-ev)
-                    ev, V = ev[o], V[:, o]
-                    kp = gpu.asnumpy(ev) > keep
-                    DM[k] = (gpu.asnumpy(ev)[kp], gpu.asnumpy(V[xp.asarray(np.where(sw.core[k])[0])][:, xp.asarray(kp)]))
+                    if core:                                    # eigenpairs of rho_cc (V: core rows already)
+                        ev, V = acc[k].result()
+                        acc[k] = None
+                        kp = gpu.asnumpy(ev) > keep
+                        DM[k] = (gpu.asnumpy(ev)[kp], gpu.asnumpy(V[:, xp.asarray(kp)]))
+                    else:
+                        rho = rho_of(acc[k])
+                        acc[k] = None
+                        ev, V = xp.linalg.eigh(rho)
+                        del rho
+                        o = xp.argsort(-ev)
+                        ev, V = ev[o], V[:, o]
+                        kp = gpu.asnumpy(ev) > keep
+                        DM[k] = (gpu.asnumpy(ev)[kp],
+                                 gpu.asnumpy(V[xp.asarray(np.where(sw.core[k])[0])][:, xp.asarray(kp)]))
                     if d:
                         tmp = f(k) + f".tmp{os.getpid()}.npz"
-                        np.savez(tmp, occ=DM[k][0], vec=DM[k][1])
+                        np.savez(tmp, occ=DM[k][0], vec=DM[k][1], keep=keep)
                         os.replace(tmp, f(k))
                     del V, ev
                     gpu.free()
@@ -751,7 +859,8 @@ class Hierarchy:
         for k in range(nw):
             if DM[k] is None:
                 c = np.load(f(k))
-                DM[k] = (c["occ"], c["vec"])
+                kp = c["occ"] > keep
+                DM[k] = (c["occ"][kp], c["vec"][:, kp])
             assert DM[k][1].shape[0] == len(self.cores[k]), \
                 f"window density matrix {k} in {d} belongs to other windows (core {DM[k][1].shape[0]} != {len(self.cores[k])})"
         self.log(f"  window density matrices" + (f" from {d}" if d else "") + ": trace "
@@ -1057,6 +1166,7 @@ class Hierarchy:
                 m_ += m
             batches.append(cur)
             Nn.U, tr = [None] * nc, np.zeros(nc)
+            schur = kind == "dmc" and self.core is not None and self.merge_eig == "full"
             EIG_STATS.clear()
             U1 = self.LV[1].U
             self.mem(f"{lv}: start of the {axis} merge")
@@ -1071,7 +1181,7 @@ class Hierarchy:
                         Kw += Cw
                     del Cw
                     dat[c] = [self.dense(L, L.Sb, w, w), Kw,
-                              None if self.merge_eig == "sketch" else xp.zeros((nwin[c],) * 2, complex)]
+                              None if self.merge_eig == "sketch" or schur else xp.zeros((nwin[c],) * 2, complex)]
                 self.mem(f"{bt}: S, K, accumulator of {len(ks)} windows")
                 lead = any(isl[c] for c in ks)
                 sf = {c: self.sig_factor(L, win[c]) for c in ks if isl[c]}
@@ -1083,6 +1193,10 @@ class Hierarchy:
                     o = offs(L.r[w])
                     loc = {int(k): q for q, k in enumerate(w)}
                     rows_of[c] = xp.asarray(np.concatenate([np.arange(o[loc[k]], o[loc[k] + 1]) for k in Nn.kids[c]]))
+                if schur:
+                    for c in ks:
+                        dat[c][2] = SchurRho(rows_of[c], nwin[c], self.core["prec"], self.core["refine"],
+                                             self.core.get("probes", 0), seed=1000 + c)
                 if self.merge_eig == "sketch":
                     self._sketch_batch(ks, dat, isl, sf, zs, dzs, U1, rows_of, cut, kind, Nn, tr, bt)
                     del sf, dat
@@ -1093,9 +1207,12 @@ class Hierarchy:
                         M = z * dat[c][0] + dat[c][1]
                         if isl[c]:
                             M -= self.sig_of(sf[c], sg)
-                        M = xp.linalg.inv(M)
-                        M *= dz
-                        dat[c][2] += M
+                        if schur:
+                            dat[c][2].add(z, dz, M)
+                        else:
+                            M = xp.linalg.inv(M)
+                            M *= dz
+                            dat[c][2] += M
                         del M
                     del sg
                     gpu.free()
@@ -1103,6 +1220,14 @@ class Hierarchy:
                 self.mem(f"{bt}: contour ({npts} inversions per window)")
                 for c in ks:
                     rows = rows_of[c]
+                    if schur:                                    # eigenpairs of rho_PP directly (dmc)
+                        occ, V = dat[c][2].result()
+                        dat[c] = None
+                        Nn.U[c] = xp.ascontiguousarray(V[:, occ > cut])
+                        tr[c] = float(xp.real(occ.sum()))
+                        del occ, V
+                        gpu.free()
+                        continue
                     rho = rho_of(dat[c][2])
                     dat[c] = None
                     Nn.U[c] = select(rho, rows, cut, kind, self.merge_eig)
@@ -1314,6 +1439,14 @@ def main(argv=None):
     p.add_argument("--sketch-prec", default="c128", choices=["c128", "c64", "lu64"], help="--merge-eig sketch: "
                    "c64: pencil LU, probes and solves in complex64; lu64: LU in complex128, factors down-cast to "
                    "complex64 for the solves (accumulation and Nystrom in complex128)")
+    p.add_argument("--schur", action="store_true", help="dmc: the core (level 1) / pair (merges) block of the window rho "
+                   "by Schur folding of the window into the block (as the single-shot msbasis tile contour): no window "
+                   "inverse or eigh; window DM cache in <tag>_core_...")
+    p.add_argument("--schur-prec", default="single", choices=["single", "double"],
+                   help="--schur: environment LU in complex64 + refinement (single) or complex128")
+    p.add_argument("--schur-refine", type=int, default=1, help="--schur single: refinement steps of A_EE^-1 A_EP")
+    p.add_argument("--schur-probes", type=int, default=0, help="--schur: r random probes, rho_PP Omega + Nystrom "
+                   "(0: the full inverse of the Schur complement)")
     p.add_argument("--sweep", default="fine,exact,top")
     p.add_argument("--counts", default="32,128,256", help="top-level sizes (multiples of the slow m)")
     p.add_argument("--slow", default="32,3", help="slow modes per round m, subspace steps q")
@@ -1361,10 +1494,14 @@ def main(argv=None):
     log(f"{name}: device {n} orbitals, slabs {dev.ns}; Ec {Ec:.4f} eV")
     sw = CapSchwarz(dev, inp, w_, s_, d_, spacing=a.cap_spacing, solver=a.cap_solver, workers=a.workers, split=split,
                     tov=a.cap_tov, stream_gb=a.stream_gb)
+    core = None
+    if a.schur:
+        assert a.l1.startswith("dmc:"), "--schur: dmc only (the core / pair block of rho; dm needs the window modes)"
+        core = dict(prec=a.schur_prec, refine=a.schur_refine, probes=a.schur_probes)
     h = Hierarchy(dev, inp, sw, l1_cap=tuple(float(v) for v in a.l1_cap.split(",")) if a.l1_cap else None,
                   l1_ramp=a.l1_ramp, l1_lu=a.l1_lu, l1_solver=a.l1_solver, batch_gb=a.batch_gb, mem_frac=a.mem_frac,
                   halo_smooth=a.halo_smooth, host_blocks=a.host_blocks, stream_gb=a.stream_gb, l1_free=a.free_levels,
-                  merge_eig=a.merge_eig, sketch_prec=a.sketch_prec)
+                  merge_eig=a.merge_eig, sketch_prec=a.sketch_prec, core=core)
     sweeps = a.sweep.split(",")
     counts = [int(v) for v in a.counts.split(",")]
     sm, sq = (int(v) for v in a.slow.split(","))
@@ -1377,7 +1514,8 @@ def main(argv=None):
     if a.basis_cache != "none":
         h.basis_dir = a.basis_cache or (os.path.join(a.dm_cache, tag + "_levels") if a.dm_cache else None)
     s1_, d1_ = h.s1, h.d1
-    keys, chain = [], f"{name}|{tag}|l1 {a.l1}|cap {s1_:g},{d1_:g},{a.l1_ramp}"
+    keys, chain = [], f"{name}|{tag}|l1 {a.l1}|cap {s1_:g},{d1_:g},{a.l1_ramp}" + (
+        f"|schur {a.schur_prec} {a.schur_refine} p{a.schur_probes} k{a.dm_keep:g}" if a.schur else "")
     for axis, cut, m1, m2, npts, halo in ups:                    # key of each level = everything its rho depends on
         chain += (f"|{axis}:{cut:g}:{m1:g}:{m2:g}:{npts or a.npts}:h{'all' if halo is None else halo}"
                   + ("" if a.merge_eig == "full" else f"|eig {a.merge_eig}")
@@ -1456,7 +1594,8 @@ def main(argv=None):
             slow_sweep("two-level (slow modes on the fine level)", Aop, sw, lambda top: gcycle(A0, S0, top, a.gamma),
                        (S0, A0))
         if DM is None:
-            DM = h.window_dm(a.dm_cache or None, tag, Ec + mu[0], Ec + mu[1], a.npts, a.dm_keep, a.dm_batch_gb)
+            DM = h.window_dm(a.dm_cache or None, tag, Ec + mu[0], Ec + mu[1], a.npts, a.dm_keep, a.dm_batch_gb,
+                             core=core)
         if U1 is None:
             U1 = h.basis1(DM, kind, cut1)                         # energy independent: built once
         tb = time.time()
