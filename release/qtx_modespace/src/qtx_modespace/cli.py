@@ -44,7 +44,7 @@ import numpy as np
 
 from .quatrex import read_quatrex, lead_bands
 from . import gpu
-from .core import Device, Coarse, exact_solve, injection, rho_contour, top_modes, eigh, log
+from .core import Device, Coarse, exact_solve, exact_last_slab, injection, rho_contour, top_modes, eigh, log
 from .clean import LeadCell, clean_slab
 from .level1 import build_level1, partition
 from .schwarz import CapSchwarz, SlowCoarse, fgmres_block, operator, two_level
@@ -90,6 +90,27 @@ def slab_modes(a, dev, mu, npts, neig, nmodes):
     log(f"window [{mu[0]:.4f}, {mu[1]:.4f}] eV: N {[X.shape[1] for _, X in eig]}; smallest kept occupation / "
         f"largest {[f'{lam[-1] / lam[0]:.1e}' for lam, _ in eig]}")
     return eig
+
+
+def sigma_pass(a, dev, Ec, cache):
+    """--sigma-pass: all lead self-energies of the run (level-1 contour points with --basis l1, the --dE energies with
+    --transmission) into the Sigma cache first, so the lead OBC and the level-1 / transport GPU memory never overlap."""
+    assert cache, "--sigma-pass needs a Sigma cache"
+    zs = []
+    if a.basis == "l1" and not a.modes:
+        from .level1 import contour_points
+        w = [Ec + float(x) for x in (a.l1_mu or a.mu.split(";")[0]).split(",")]
+        zs += list(contour_points(w[0], w[1], a.l1_npts or int(str(a.npts).split(",")[0]))[0])
+    if a.transmission or a.fgmres:
+        EcT = Ec if a.Ec is None else a.Ec
+        zs += [EcT + dE + 1j * a.eta for dE in energies(a.dE)]
+    t = time.time()
+    for i, z in enumerate(zs):
+        t1 = time.time()
+        dev.sigma(z)
+        log(f"  Sigma pass {i + 1}/{len(zs)}: z = {complex(z).real:.4f}{complex(z).imag:+.4f}i, {time.time() - t1:.1f} s")
+        gpu.free()
+    log(f"Sigma pass: {len(zs)} points, {time.time() - t:.0f} s")
 
 
 def level1_basis(a, inp, dev, Ec):
@@ -200,6 +221,7 @@ def level2_on_level1(a, inp, dev, Ec, t0):
         sel = [np.arange(len(lam)) < n for lam, _ in eig]
     eig = [(lam[m], X[:, m]) for (lam, X), m in zip(eig, sel)]
     V = [v1 @ X for v1, (_, X) in zip(V1, eig)]
+    del V1                                           # the level-1 basis is not needed once U = U1 V exists
     log(f"level 2 on level 1: N2 {[v.shape[1] for v in V]}, total {sum(v.shape[1] for v in V)} (N1 {sum(N1)}); "
         f"occupation range per slab {[f'{lam[0]:.2f}..{lam[-1]:.1e}' for lam, _ in eig]}")
     info = dict(device=dict(inp["meta"], n=dev.n, slabs=dev.ns), basis="l2 on l1", l1_modes=a.l1_modes, N1=N1,
@@ -267,10 +289,9 @@ def solve_fgmres(a, dev, c, sw, A, b, E, SL, SR, Xms, Tof):
                 log(f"    FGMRES chunk {k // ch + 1}/{-(-nc // ch)} it {i + 1}: residual est max {e.max():.2e} median "
                     f"{np.median(e):.2e}, {(e > a.fgmres_tol).sum()}/{len(e)} active, {time.time() - t:.0f} s")
         xk, ik, rk = fgmres_block(A, b[:, k:k + ch], x0[:, k:k + ch], prec, a.fgmres_tol, a.fgmres_maxit, cb=cb)
-        xs.append(gpu.asnumpy(xk)), its.append(np.asarray(ik)), res.append(np.asarray(gpu.asnumpy(rk)))
+        xs.append(xk), its.append(np.asarray(ik)), res.append(np.asarray(gpu.asnumpy(rk)))
         hist = [max(u, v) for u, v in zip(hist, hk)] + hk[len(hist):] if hist else hk
-        del xk
-    x, its, res = np.concatenate(xs, axis=1), np.concatenate(its), np.concatenate(res)
+    x, its, res = gpu.xp_of(xs[0]).concatenate(xs, axis=1), np.concatenate(its), np.concatenate(res)
     tit = time.time() - t
     sw.free()
     if slow is not None:
@@ -367,10 +388,15 @@ def psi_errors(dev, c, A, b, X, Xms):
     the exact solution: Frobenius over all channels (psi), worst channel (psi_max), S norm (psi_S), the right end
     slab (psi_last; T is read off there) and each slab (psi_slab); psi_best = |X - U U^H X| / |X| is the error of
     the best plain-norm approximation in range(U); res = |b - A Xms| / |b|."""
+    xp = gpu.xp_of(X)                                    # cupy in GPU mode: all norms on the device
+    if xp is not np and not hasattr(dev, "_S_gpu"):
+        dev._S_gpu = gpu.csr(dev.S, np.complex128)
+    S = dev._S_gpu if xp is not np else dev.S
+    Xms = xp.asarray(Xms)
     E, b_ = Xms - X, dev.sb
-    fro = lambda M: float(np.linalg.norm(M))
-    sn = lambda M: float(np.sqrt(max(np.real(np.vdot(M, dev.S @ M)), 0.0)))
-    col = np.linalg.norm(E, axis=0) / np.maximum(np.linalg.norm(X, axis=0), 1e-300)
+    fro = lambda M: float(xp.linalg.norm(M))
+    sn = lambda M: float(np.sqrt(max(float(xp.real(xp.vdot(M, S @ M))), 0.0)))
+    col = xp.linalg.norm(E, axis=0) / xp.maximum(xp.linalg.norm(X, axis=0), 1e-300)
     return dict(psi=fro(E) / fro(X), psi_max=float(col.max()), psi_S=sn(E) / sn(X),
                 psi_last=fro(E[b_[-2]:]) / fro(X[b_[-2]:]),
                 psi_slab=[fro(E[b_[s]:b_[s + 1]]) / fro(X[b_[s]:b_[s + 1]]) for s in range(len(dev.ns))],
@@ -465,14 +491,18 @@ def main(argv=None):
     g.add_argument("--l1-cache", help="block cache directory (default <out>/level1; 'none' = off)")
     g.add_argument("--l1-gpp", default="schur", choices=["schur", "full"],
                    help="G_PP by the Schur complement of the environment (schur) or one LU of the whole embedding")
-    g.add_argument("--l1-env-prec", default="double", choices=["double", "single"],
-                   help="schur: environment LU precision (single: complex64 + one refinement step)")
+    g.add_argument("--l1-env-prec", default="double", choices=["double", "single", "c64"],
+                   help="schur: environment LU precision (single: complex64 + one refinement step; c64: the whole "
+                        "local-rho point in complex64 on the GPU, no refinement, half the memory)")
     g.add_argument("--l1-workers", type=int, default=1, help="contour points of a block over this many processes")
     g.add_argument("--l1-threads", type=int, default=0, help="BLAS threads per process (needs threadpoolctl; 0: unchanged)")
     g.add_argument("--l1-only", metavar="K,N", help="build only the blocks i with i %% N == K (into the cache), then exit")
     g = p.add_argument_group("transmission")
     g.add_argument("--transmission", action="store_true", help="mode-space T at --dE")
     g.add_argument("--exact", action="store_true", help="also the exact T (sparse direct solve) and the error")
+    g.add_argument("--exact-T", action="store_true",
+                   help="exact T only (no psi errors): forward block elimination to the last slab, no LU factors kept "
+                        "(core.exact_last_slab; ~one dense slab block on the GPU, for devices too big for --exact)")
     g.add_argument("--dE", default="0.02,0.05,0.15,0.3", help="energies - Ec: list or lo:hi:step [eV]")
     g.add_argument("--ms-solve", default="auto", choices=["auto", "gpu", "cpu"],
                    help="mode-space solve: gpu = one streaming block sweep on the GPU (core.block_solve), cpu = block LU "
@@ -480,9 +510,11 @@ def main(argv=None):
     g.add_argument("--Ec", type=float, help="reference edge for --dE (default Ec_lead)")
     g.add_argument("--eta", type=float, default=0.0, help="imaginary part of E for the lead self-energies [eV] (0: real "
                    "axis, qttools OBC; the folded-lead fallback then uses E + 1e-6 i)")
-    g.add_argument("--obc", default="auto", choices=["auto", "qttools", "folded"],
-                   help="real-axis lead OBC: qttools spectral OBC (QuaTrEx) with the folded lead as fallback (auto), "
-                        "qttools only, or the folded lead only")
+    g.add_argument("--obc", default="auto", choices=["auto", "qttools", "folded", "beyn", "beyn-cell"],
+                   help="lead OBC: auto = qttools spectral OBC on the real axis (folded lead as fallback) and the folded "
+                        "lead on contours; qttools / folded only; beyn = own spectral OBC (obc_beyn, Woodbury face fixed "
+                        "point, GPU) of the periodized lead at every z (QuaTrEx's lead model); beyn-cell = same on the "
+                        "lead cell as given")
     g.add_argument("--psi-dir", help="--exact: store / reuse the exact solutions here (psi_<E>.npy, any basis)")
     g = p.add_argument_group("iterative solve (--fgmres)")
     g.add_argument("--fgmres", action="store_true", help="also solve A x = b to --fgmres-tol by FGMRES + CAP-Schwarz")
@@ -536,6 +568,9 @@ def main(argv=None):
                    help="dense parts on the GPU with cupy (lead Sigma, local / slab rho, eigensolves, exact solve, "
                         "Schwarz windows and FGMRES; needs the gpu extra; also QTX_MODESPACE_GPU=1)")
     p.add_argument("--gpu-device", type=int, help="CUDA device number (default: cupy's current device)")
+    p.add_argument("--sigma-pass", action="store_true",
+                   help="compute all lead self-energies of the run into the Sigma cache before the basis / transport "
+                        "(separates the lead OBC from the level-1 GPU memory)")
     p.add_argument("--sigma-cache", help="directory for lead self-energies and lead band edges (default <out>/sigma; 'none' = off)")
     c, _ = p.parse_known_args(argv)
     if c.config:
@@ -546,8 +581,10 @@ def main(argv=None):
             p.error(f"{k} is required (command line or --config)")
     if a.system == "closed" and not a.fgmres:
         p.error("--system closed needs --fgmres")
-    if a.basis == "none" and (a.modes or not a.fgmres or a.fgmres_coarse == "ms"):
-        p.error("--basis none: only with --fgmres --fgmres-coarse slow|none and without --modes")
+    if a.basis == "none" and (a.modes or (a.fgmres and a.fgmres_coarse == "ms")
+                              or not (a.fgmres or (a.transmission and (a.exact or a.exact_T)))):
+        p.error("--basis none: only with --fgmres --fgmres-coarse slow|none, or --transmission --exact / --exact-T "
+                "(exact T only), and without --modes")
 
     if a.gpu or os.environ.get("QTX_MODESPACE_GPU", "").lower() in ("1", "true", "yes", "on"):
         gpu.enable(device=a.gpu_device)
@@ -564,6 +601,8 @@ def main(argv=None):
     dev = Device(inp, sigma_cache=cache, obc=a.obc)
     nsl = len(dev.ns)
     log(f"device {dev.n} orbitals, slabs {dev.ns}; Ec {Ec:.4f}, Ev {Ev:.4f} eV")
+    if a.sigma_pass:
+        sigma_pass(a, dev, Ec, cache)
 
     if a.basis == "none":
         V, info = None, dict(N=[0] * nsl)
@@ -613,26 +652,49 @@ def main(argv=None):
         t = time.time()
         SL, SR = dev.sigma(E + 1j * a.eta)
         ts = time.time() - t
-        B = dev.inject(SL)
+        # GPU mode: injection B, right-hand sides b and every solution vector (MS, exact, FGMRES) stay cupy arrays;
+        # only Sigma (cache / lead OBC), T and the error norms are on the host (2026-11-18)
+        xp = gpu.cp if gpu.on else np
+        B = dev.inject(SL, device=gpu.on)
         GR = 1j * (SR - SR.conj().T)
-        b = np.zeros((dev.n, B.shape[1]), complex)
-        b[dev.bL] = B
-        Tof = lambda x: float(np.real(np.einsum("ic,ij,jc->", x[dev.bR].conj(), GR, x[dev.bR])))
+        GRx, bLx, bRx = xp.asarray(GR), xp.asarray(dev.bL), xp.asarray(dev.bR)
+        b = xp.zeros((dev.n, B.shape[1]), complex)
+        b[bLx] = B
+
+        def Tface(xR):                                  # T from psi on the right lead face (rows bR)
+            G = GRx if gpu.xp_of(xR) is not np else GR
+            return float(gpu.xp_of(xR).real(gpu.xp_of(xR).einsum("ic,ij,jc->", xR.conj(), G, xR)))
+
+        Tof = lambda x: Tface(x[bRx] if gpu.xp_of(x) is not np else x[dev.bR])
         t = time.time()
         Xms = None
         r.update(E=E, channels=int(B.shape[1]), t_sigma=ts)
         if c is not None:
+            # T only (no --exact / --fgmres): b lives on the lead face of slab 0 and T needs psi only on the lead face of
+            # the last slab, so restrict / prolong reduce to PL^H B and PR Y_last. The full V^H b / V Y over all slabs
+            # ran on the host (numpy, 22 x 33k x 5.9k x channels each) and took most of the ~30-57 s per energy on
+            # 12 nm (tile4y, N 121 022) with the GPU mostly idle; 2026-11-18.
+            full = a.exact or a.fgmres
+            Bc = c.restrict(b) if full else xp.vstack([c.P("L", xp).conj().T @ B,
+                                                       xp.zeros((c.N - c.off[1], B.shape[1]), complex)])
             if a.ms_solve == "gpu" or (a.ms_solve == "auto" and gpu.on):
-                Xms = c.prolong(c.solve(E, SL, SR, c.restrict(b)))
+                Y = c.solve(E, SL, SR, Bc)
             else:
-                Xms = gpu.asnumpy(c.prolong(c.Ac(E, SL, SR, device=False).solve(c.restrict(b))))
-            r.update(T_ms=Tof(Xms), t_ms=time.time() - t)
+                Y = xp.asarray(gpu.asnumpy(c.Ac(E, SL, SR, device=False).solve(gpu.asnumpy(Bc))))
+            if full:
+                Xms = c.prolong(Y)
+                r.update(T_ms=Tof(Xms))
+            else:
+                r.update(T_ms=Tface(c.P("R", xp) @ Y[c.off[-2]:]))
+            r.update(t_ms=time.time() - t)
         A, X = None, None
         if a.exact and ("T_exact" not in r or "err_psi" not in r or a.fgmres):
             A = dev.A(E, SL, SR)
+            Ax = gpu.csr(A, np.complex128) if gpu.on else A
             fpsi = a.psi_dir and os.path.join(a.psi_dir, f"psi_{E:+.8f}_{a.eta:.2e}.npy")
-            X = np.load(fpsi) if fpsi and os.path.exists(fpsi) else None
-            if X is not None and (X.shape != b.shape or np.linalg.norm(b - A @ X) > 1e-8 * np.linalg.norm(b)):
+            X = xp.asarray(np.load(fpsi)) if fpsi and os.path.exists(fpsi) else None
+            if X is not None and (X.shape != b.shape or
+                                  float(xp.linalg.norm(b - Ax @ X)) > 1e-8 * float(xp.linalg.norm(b))):
                 log(f"  {fpsi} does not solve this system, recomputed")
                 X = None
             if X is None:
@@ -641,10 +703,20 @@ def main(argv=None):
                 r.update(res_exact=res_ex, t_exact=time.time() - t, exact_on="gpu" if gpu.on else "cpu")
                 if fpsi:
                     os.makedirs(a.psi_dir, exist_ok=True)
-                    np.save(fpsi, X)
+                    np.save(fpsi, gpu.asnumpy(X))
             r["T_exact"] = Tof(X)
             if c is not None:
-                r.update({"err_" + k: v for k, v in psi_errors(dev, c, A, b, X, Xms).items()})
+                r.update({"err_" + k: v for k, v in psi_errors(dev, c, Ax, b, X, Xms).items()})
+            del Ax
+        if a.exact_T and "T_exact" not in r:                 # T only: forward elimination, no factors kept
+            A = dev.A(E, SL, SR)
+            t = time.time()
+            inf = {}
+            XN = exact_last_slab(dev, A, b, info=inf)
+            iR = dev.bR - dev.sb[-2]
+            r.update(T_exact=Tface(XN[xp.asarray(iR)] if gpu.xp_of(XN) is not np else XN[iR]),
+                     t_exact=time.time() - t, exact_on="gpu (last slab)" if gpu.on else "cpu (last slab)",
+                     exact_peak_gb=inf.get("peak_gb"))
         if r.get("T_exact", 0) > 0 and "T_ms" in r:
             r["err"] = (r["T_ms"] - r["T_exact"]) / r["T_exact"]
         if a.fgmres:
@@ -653,14 +725,17 @@ def main(argv=None):
             if r.get("T_exact", 0) > 0:
                 fg["err_T"] = (fg["T"] - r["T_exact"]) / r["T_exact"]
             if X is not None:
-                fg["err_psi"] = float(np.linalg.norm(fg.pop("x") - X) / np.linalg.norm(X))
+                xf = fg.pop("x")
+                xq = gpu.xp_of(X)
+                fg["err_psi"] = float(xq.linalg.norm(xq.asarray(xf) - X) / xq.linalg.norm(X))
             fg.pop("x", None)
             log(f"  FGMRES ({a.fgmres_coarse}): its {min(fg['its'])}..{max(fg['its'])}, residual {max(fg['res']):.1e}, "
                 f"T {fg['T']:.6f}" + (f" (err {fg['err_T']:+.1e})" if "err_T" in fg else "")
                 + (f", psi err {fg['err_psi']:.1e}" if "err_psi" in fg else "")
                 + f"; factor {fg['t_factor']:.0f} s + iterations {fg['t_iter']:.0f} s")
         log(f"E = Ec {dE:+.3f}: {r['channels']} channels" + (f", T_MS {r['T_ms']:.5f}" if "T_ms" in r else "")
-            + (f", T_exact {r['T_exact']:.5f} ({100 * r['err']:+.4f}%)" if "err" in r else "")
+            + (f", T_exact {r['T_exact']:.5f} ({100 * r['err']:+.4f}%)" if "err" in r
+               else f", T_exact {r['T_exact']:.6e}" if "T_exact" in r else "")
             + (f"; psi error {r['err_psi']:.2e} (max channel {r['err_psi_max']:.2e}, S {r['err_psi_S']:.2e}, "
                f"last slab {r['err_psi_last']:.2e}, best in U {r['err_psi_best']:.2e}), residual {r['err_res']:.1e}"
                if "err_psi" in r else "")

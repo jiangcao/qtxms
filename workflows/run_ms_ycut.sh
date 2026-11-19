@@ -16,6 +16,9 @@ cd "$(dirname "$0")/.."
 R=${R:-results_ms/gpu/ms_ycut}
 DEVS=${DEVS:-6nm 12nm}
 CUT=${CUT:-1e-8}
+# XARGS: extra CLI options, e.g. "--obc beyn --sigma-pass" (own spectral OBC of the periodized lead at every z, Sigma
+# computed first; 2026-11-18, after the 12 nm tile2y run ran out of GPU memory in the folded-lead decimation)
+XARGS=${XARGS:-}
 PART=${PART:-slab}
 DE=${DE:-0:0.5:0.01}
 EXACT_6nm=${EXACT_6nm:-1}
@@ -51,7 +54,7 @@ for d in $DEVS; do
   echo "[$(date +%T)] $t (exact: ${!ex})"
   nice $PY -u -m qtx_modespace $S/prep --gpu --sigma-cache $S/sigma --out $S/$t --basis l1 $P1 --l1-boundary obc \
     --l1-cut $CUT --l1-store-cut 1e-10 --l1-dense-max ${!dm} \
-    --transmission $EX --dE $DE > $R/$t.log 2>&1
+    --transmission $EX --dE $DE $XARGS > $R/$t.log 2>&1
   rc=$?; echo "[$(date +%T)] $t exit $rc"
   mkdir -p $R/$t
   cp $S/$t/transmission.json $S/$t/basis.json $R/$t/ 2>/dev/null

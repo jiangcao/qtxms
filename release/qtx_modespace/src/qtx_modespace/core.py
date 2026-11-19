@@ -1,5 +1,10 @@
 """Device, lead self-energies, sparse / block-tridiagonal solvers and the contour slab density matrix.
 
+obc="beyn" (periodized lead, QuaTrEx's model) / "beyn-cell" (lead cell as given): one lead model for every z, the
+spectral OBC of obc_beyn.BeynLead (Beyn on the primitive cell, Woodbury face fixed point; real axis with the incoming
+Bloch modes as injection, complex z with the decaying modes), numpy or the GPU, no qttools. Cached as
+bsig<p|c>_<Re z>_<Im z>.npz. The default ("auto") is unchanged below: qttools on the real axis, folded lead on contours.
+
 Lead OBC on the real axis (|Im z| <= Device.qtt_eta; the transmission, FGMRES and exact solves at real E): qttools'
 spectral OBC (QuaTrEx) by default, Sigma at E = Re z and the flux-normalized incoming Bloch modes as injection
 (one column per propagating channel, as QuaTrEx's QTBM). qttools is found on sys.path or in $QTTOOLS_SRC (a
@@ -10,6 +15,8 @@ Device: the device blocks of a read_quatrex dict are the slabs; the lead blocks 
 Lead Sigma(z): the lead-cell interior (orbitals not coupled to the neighbouring cells) is folded onto the coupled
 faces F, A_eff(z) = A_FF - A_FI A_II^-1 A_IF with A = z S - H, then Lopez-Sancho decimation of the folded chain
 (complex Hermitian H, any S).
+QTX_SIGMA_PREC=mixed: decimation in complex64 (half the memory), then Newton refinement of g = (A00 - C g C')^-1 with the
+residual in complex128 on the CPU and the correction (a Stein equation, doubling) in complex64 (sancho_mixed).
 """
 import glob, os, sys, time, warnings
 import numpy as np
@@ -119,14 +126,14 @@ def gmres_right(mv, prec, b, x0, tol, maxit):
     return x0 + Z[:, :j + 1] @ y
 
 
-def sancho_both(A00, A01, A10, tol=1e-11, maxit=300):
+def sancho_both(A00, A01, A10, tol=1e-11, maxit=300, dtype=complex):
     """Lopez-Sancho decimation with on-site A00 = z S00 - H00, couplings A01 (cell n -> n+1), A10 (n+1 -> n).
     Returns the surface Green's functions gL (last cell of the left-extending chain) and gR (first cell of the
     right-extending chain). numpy or cupy arrays (the result lives where the input does)."""
     xp = gpu.xp_of(A00)
-    e = A00.astype(complex)
+    e = A00.astype(dtype)
     esR, esL = e.copy(), e.copy()
-    a, b = A01.astype(complex), A10.astype(complex)
+    a, b = A01.astype(dtype), A10.astype(dtype)
     n = len(e)
     for _ in range(maxit):
         X = gpu.solve(e, xp.hstack([a, b]))
@@ -141,6 +148,75 @@ def sancho_both(A00, A01, A10, tol=1e-11, maxit=300):
     else:
         log(f"  sancho_both: no convergence after {maxit} steps")
     return gpu.inv(esL), gpu.inv(esR)
+
+
+def newton_refine(g, A00, C, Cp, tol=1e-11, max_ref=6, on_gpu=None):
+    """Newton refinement of a surface Green's function g = (A00 - C g C')^-1 (g_L: C = A10, C' = A01; g_R: C = A01,
+    C' = A10) from a low-precision start g (e.g. complex64 decimation or complex64 qttools OBC). Per step the residual
+    R = I - X g, X = A00 - C g C', in complex128 on the CPU, and the correction d - P d Q = g R (P = g C, Q = C' g) by
+    doubling in complex64 (GPU when on_gpu, default gpu.on); stops at |R|_max <= tol or when it stops contracting.
+    Returns (G complex128, residual history)."""
+    on_gpu = gpu.on if on_gpu is None else on_gpu
+    c64 = np.complex64
+    to = (lambda M: gpu.asarray(M, c64)) if on_gpu else (lambda M: np.asarray(M, c64))
+    back = gpu.asnumpy if on_gpu else np.asarray
+    G = np.asarray(back(g) if not isinstance(g, np.ndarray) else g).astype(complex)
+    c, cp_ = to(C), to(Cp)
+    xp = gpu.xp_of(c)
+    eye = np.eye(len(A00), dtype=complex)
+    res = []
+    for it in range(max_ref + 1):
+        R = eye - (A00 - C @ (G @ Cp)) @ G
+        res.append(float(np.abs(R).max()))
+        if res[-1] <= tol or it == max_ref:
+            break
+        if not np.isfinite(res[-1]) or (it and res[-1] > 0.5 * res[-2]) or res[-1] > 0.5:
+            break                     # correction not contracting (|Im z| too small for complex64)
+        gd = to(G)
+        Y = gd @ to(R)
+        del R
+        P, Q = gd @ c, cp_ @ gd
+        del gd
+        for _ in range(100):                                    # Y = sum_k P^k (g R) Q^k by doubling
+            T = P @ (Y @ Q)
+            Y += T
+            tm, ym = float(xp.abs(T).max()), float(xp.abs(Y).max())
+            if not np.isfinite(tm) or tm <= 1e-8 * ym:
+                break
+            P, Q = P @ P, Q @ Q
+        del P, Q, T
+        G += back(Y).astype(complex)
+        del Y
+    return G, res
+
+
+def sancho_mixed(A00, A01, A10, tol=1e-11, max_ref=6, on_gpu=None, info=None, fallback_tol=1e-9):
+    """sancho_both in complex64, then Newton refinement per side to |I - X g|_max <= tol, X = A00 - C g C'
+    (g_L: C = A10, C' = A01; g_R: C = A01, C' = A10). Residual and update in complex128 on the CPU (numpy inputs);
+    the correction solves the Stein equation  d - P d Q = g R,  P = g C, Q = C' g  (spectral radii < 1: the decaying
+    Bloch factors) by doubling in complex64, on the GPU when on_gpu (default gpu.on). Returns numpy (g_L, g_R).
+    Conditioning ~ 1/|Im z|: on the real axis (E + 1e-6 i) complex64 cannot converge (residual 0.1 on the 6 nm lead,
+    2026-11-18); when the residual stays above fallback_tol the complex128 decimation runs on the CPU."""
+    on_gpu = gpu.on if on_gpu is None else on_gpu
+    c64 = np.complex64
+    to = (lambda M: gpu.asarray(M, c64)) if on_gpu else (lambda M: np.asarray(M, c64))
+    back = gpu.asnumpy if on_gpu else np.asarray
+    t0 = time.time()
+    gs = [back(g) for g in sancho_both(to(A00), to(A01), to(A10), tol=1e-7, dtype=c64)]
+    t_s = time.time() - t0
+    out, hist = [], []
+    for g, (C, Cp) in zip(gs, ((A10, A01), (A01, A10))):
+        G, res = newton_refine(g, A00, C, Cp, tol=tol, max_ref=max_ref, on_gpu=on_gpu)
+        out.append(G)
+        hist.append(res)
+    fallback = not all(r[-1] <= fallback_tol for r in hist)
+    if fallback:                                  # complex128 decimation on the CPU (no GPU memory)
+        log(f"  sancho_mixed: residual L {hist[0][-1]:.1e}, R {hist[1][-1]:.1e}; "
+            f"complex128 decimation on the CPU instead")
+        out = sancho_both(np.asarray(A00), np.asarray(A01), np.asarray(A10))
+    if info is not None:
+        info.update(sancho_s=t_s, total_s=time.time() - t0, res_L=hist[0], res_R=hist[1], fallback=fallback)
+    return out[0], out[1]
 
 
 class FoldedLead:
@@ -159,17 +235,32 @@ class FoldedLead:
         self.HII, self.SII = H00[I][:, I].tocsr(), S00[I][:, I].tocsr()
         self.H01, self.S01 = H01[F][:, F].toarray(), S01[F][:, F].toarray()
 
+    precision = os.environ.get("QTX_SIGMA_PREC", "double")      # "double" or "mixed" (sancho_mixed)
+    mixed_on_gpu = os.environ.get("QTX_SIGMA_MIXED_DEVICE", "auto") != "cpu"
+
     def surface_gfs(self, z):
         """(g_L, g_R) on F at complex z (numpy). GPU mode: dense LU of the interior and the decimation on the GPU."""
+        if self.precision == "mixed":
+            return self._surface_gfs_mixed(z)
         if gpu.on:
             return self._surface_gfs_gpu(z)
+        return sancho_both(self._aeff_cpu(z), z * self.S01 - self.H01, z * self.S01.conj().T - self.H01.conj().T)
+
+    def _aeff_cpu(self, z):
         Aeff = z * self.SFF - self.HFF
         if len(self.I):
             cs = CSolver(z * self.SII - self.HII)
             X = cs.solve(z * self.SIF - self.HIF)
             cs.free()
             Aeff = Aeff - (z * self.SFI - self.HFI) @ X
-        return sancho_both(Aeff, z * self.S01 - self.H01, z * self.S01.conj().T - self.H01.conj().T)
+        return Aeff
+
+    def _surface_gfs_mixed(self, z):
+        info = {}
+        out = sancho_mixed(self._aeff_cpu(z), z * self.S01 - self.H01, z * self.S01.conj().T - self.H01.conj().T,
+                           on_gpu=gpu.on and self.mixed_on_gpu, info=info)
+        self.last_info = info
+        return out
 
     def _surface_gfs_gpu(self, z):
         d = getattr(self, "_dev", None)
@@ -233,7 +324,18 @@ class QttLead:
     order with the primitive cells contiguous along +x and in the same internal order; qttools reads the periodic
     layer from the outermost primitive cell, cells numbered inwards (+x for the left lead, reversed for the right)."""
 
-    def __init__(self, H00, H01, S00, S01, sections=1, perm=None, **opts):
+    def __init__(self, H00, H01, S00, S01, sections=1, perm=None, nevp=None, beyn=None, **opts):
+        """nevp (default $QTX_QTT_NEVP or "auto"):
+          "beyn"       qttools Beyn on the primitive cell in complex128: contour integral of T(z)^-1 over an annulus,
+                       QuaTrEx defaults r_o 10, r_i 0.8 per lead cell, 20 points, max_decay 1.5 ln r_o; beyn = dict
+                       overriding r_o, r_i, m_0 (default m / 2, doubled up to m when the rank saturates),
+                       num_quad_points;
+          "beyn-mixed" Beyn in complex64 + eigenpairs refined in complex128 (_MixedBeyn); g, fixed-point steps and the
+                       injection stay complex128. 2808a lead (2026-11-18): g within 1e-11 of "beyn", same channels;
+          "auto"       "beyn", or "beyn-mixed" when the memory estimate of "beyn" (beyn_memory) exceeds 80% of the free
+                       memory (GPU in GPU mode, else host);
+          "full"       dense companion eig of the primitive-cell polynomial ((blocks - 1) m: 6 240 for 2808a, 78 s;
+                       25k for the 12 nm lead, hours)."""
         Spectral, Full = qttools_obc()
         n = H00.shape[0]
         assert n % sections == 0, f"lead cell {n} not divisible into {sections}"
@@ -252,11 +354,37 @@ class QttLead:
                 log(f"  qttools lead: primitive cells of the lead cell differ by up to {d:.1e} in {nm}; "
                     f"the OBC uses the outermost cell (as QuaTrEx)")
         kw = dict(num_ref_iterations=4)
-        kw.update(opts)
         self.sections = sections
-        self.solver = Spectral(Full(), block_sections=sections, **kw)
+        nevp = nevp or os.environ.get("QTX_QTT_NEVP", "auto")
+        assert nevp in ("auto", "beyn", "beyn-mixed", "full"), nevp
+        b = dict(r_o=10.0, r_i=0.8, m_0=max(64, m // 2), num_quad_points=20)
+        b.update(beyn or {})
+        if nevp == "auto":
+            need = beyn_memory(m, n, b["num_quad_points"])
+            free = _free_memory()
+            nevp = "beyn" if need["beyn"] <= 0.8 * free else "beyn-mixed"
+            log(f"  qttools lead: Beyn complex128 needs ~{need['beyn'] / 2**30:.1f} GB, complex64 + refinement "
+                f"~{need['beyn-mixed'] / 2**30:.1f} GB, {free / 2**30:.1f} GB free ({'GPU' if gpu.on else 'host'}) "
+                f"-> {nevp}")
+        self.nevp_kind = nevp
+        if nevp in ("beyn", "beyn-mixed"):
+            from qttools.nevp import Beyn
+            kw["max_decay"] = 1.5 * np.log(b["r_o"])
+            kw.update(opts)
+            wrap = _MixedBeyn if nevp == "beyn-mixed" else _RankBeyn
+            self.nevp = wrap(Beyn(r_o=b["r_o"] ** (1 / sections), r_i=b["r_i"] ** (1 / sections), m_0=int(b["m_0"]),
+                                  num_quad_points=int(b["num_quad_points"])))
+            self.beyn = b
+        else:
+            kw.update(opts)
+            self.nevp = Full()
+        self.solver = Spectral(self.nevp, block_sections=sections, **kw)
 
-    def modes(self, E, side):
+    def modes(self, E, side, dtype=complex, refine=False, info=None):
+        """dtype=np.complex64: the NEVP, mode selection and qttools' own refinement in single precision (half the
+        memory); refine=True then Newton-refines g in complex128 on the CPU (newton_refine) with the same (periodized)
+        blocks. The injected modes keep the precision of dtype."""
+        t0 = time.time()
         a00 = E * self.S00 - self.H00
         a01 = E * self.S01 - self.H01
         a10 = E * self.S01.conj().T - self.H01.conj().T
@@ -269,14 +397,180 @@ class QttLead:
         a_ji = a_xx[0][0]
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            g, b = self.solver(a_xx, "", return_injected=True)
+            g, b = self.solver(tuple(x.astype(dtype) for x in a_xx), "", return_injected=True)
         bad = [str(x.message) for x in w if "recursion error" in str(x.message)]
         if bad:
             raise RuntimeError(f"qttools OBC {side} at E = {E}: {bad[0]}")
-        g = g[0]
-        u = g @ (a_ji @ b[0])
+        g = g[0].astype(complex)
+        t1 = time.time()
+        res = None
+        if refine or info is not None:          # info without refine: only the residual of g
+            G, res = newton_refine(g, a_xx[1][0], a_ji, a_xx[2][0], max_ref=6 if refine else 0, on_gpu=False)
+            g = G if refine else g
+        if info is not None:
+            info.update(qtt_s=t1 - t0, refine_s=time.time() - t1, res=res)
+        u = g @ (a_ji @ b[0].astype(complex))
         ip = np.argsort(self.p[side])
         return g[np.ix_(ip, ip)], u[ip]
+
+
+def nevp_residuals(blocks, ws, vs):
+    """Relative residuals |T(w) v| / (sum_j |B_j|_F |w|^(j - off) |v|) of eigenpairs of the qttools polynomial."""
+    B = [np.asarray(b, complex) for b in blocks]
+    off = len(B) // 2
+    ws = np.asarray(ws, complex)
+    vs = np.asarray(vs, complex)
+    num = np.zeros(vs.shape, complex)
+    den = np.zeros(len(ws))
+    for j, b in enumerate(B):
+        nb = np.linalg.norm(b)
+        if nb == 0:
+            continue
+        p = ws ** (j - off)
+        num += (b @ vs) * p
+        den += nb * np.abs(p)
+    return np.linalg.norm(num, axis=0) / (den * np.linalg.norm(vs, axis=0))
+
+
+def refine_nevp_modes(blocks, ws, vs, steps=2, cluster_tol=1e-4, dup_tol=1e-6, pre_tol=1e-3, post_tol=1e-10,
+                      stats=None):
+    """Refine eigenpairs (w, v) of the polynomial T(w) = sum_j B_j w^(j - len(B)//2) (qttools block order, lowest
+    power first) in complex128 from a low-precision start (complex64 Beyn). Eigenvalues within cluster_tol (relative)
+    are refined together: per step one LU of T(w_mean), block inverse iteration X = T^-1 T'(w_mean) V, Rayleigh-Ritz on
+    span(X) (small generalized companion problem), keeping the Ritz values closest to the cluster. Exactly repeated
+    pairs (|dw| <= dup_tol |w|) are merged by an SVD of their vectors. Returns (ws, vs) complex128, columns unit norm.
+    Residual filters (nevp_residuals): pairs above pre_tol before the refinement are dropped (complex64 Beyn keeps
+    hundreds of noise directions above its eps-scaled SVD cut: 2808a lead 618 of 624 vs 167 in complex128), and
+    pairs above post_tol after it."""
+    B = [np.asarray(b, complex) for b in blocks]
+    off = len(B) // 2
+    nz = [j for j, b in enumerate(B) if np.abs(b).max() > 0]
+    j0, j1 = nz[0], nz[-1]
+    T = lambda w: sum(b * w ** (j - off) for j, b in enumerate(B) if j0 <= j <= j1)
+    dT = lambda w: sum((j - off) * b * w ** (j - off - 1) for j, b in enumerate(B) if j0 <= j <= j1 and j != off)
+    ws = np.asarray(ws, complex)
+    vs = np.asarray(vs, complex)
+    r0 = nevp_residuals(B, ws, vs)
+    ok = r0 <= pre_tol
+    if stats is not None:
+        stats.update(n_in=len(ws), res_in=np.quantile(r0, [0, 0.25, 0.5, 0.75, 1]).tolist() if len(r0) else [],
+                     n_pre=int(ok.sum()))
+    ws, vs = ws[ok], vs[:, ok]
+    order = np.argsort(np.abs(ws) + 1e-3 * np.angle(ws))
+    ws, vs = ws[order], vs[:, order]
+    groups, cur = [], [0]
+    for i in range(1, len(ws)):
+        if abs(ws[i] - ws[cur[0]]) <= cluster_tol * abs(ws[cur[0]]):
+            cur.append(i)
+        else:
+            groups.append(cur); cur = [i]
+    groups.append(cur)
+    W, V = [], []
+    for g in groups:
+        Vg, wbar = vs[:, g], ws[g].mean()
+        lam = ws[g]
+        for _ in range(steps):
+            lu = sla.lu_factor(T(wbar), check_finite=False)
+            Q, _ = np.linalg.qr(sla.lu_solve(lu, dT(wbar) @ Vg, check_finite=False))
+            k, d = Q.shape[1], j1 - j0
+            small = [Q.conj().T @ B[j] @ Q for j in range(j0, j1 + 1)]    # sum_i small_i w^i (times w^(j0 - off))
+            A = np.zeros((k * d, k * d), complex)
+            Bm = np.eye(k * d, dtype=complex)
+            A[:-k, k:] = np.eye(k * (d - 1))
+            for i in range(d):
+                A[-k:, i * k:(i + 1) * k] = -small[i]
+            Bm[-k:, -k:] = small[d]
+            lw, Z = sla.eig(A, Bm, check_finite=False)
+            ok = np.isfinite(lw)
+            lw, Z = lw[ok], Z[:, ok]
+            sel = np.argsort(np.abs(lw - wbar))[:k]
+            lam, Vg = lw[sel], Q @ Z[:k, sel]
+            Vg = Vg / np.linalg.norm(Vg, axis=0)
+            wbar = lam.mean()
+        W.append(lam); V.append(Vg)
+    W, V = np.concatenate(W), np.concatenate(V, axis=1)
+    r1 = nevp_residuals(B, W, V)
+    ok = r1 <= post_tol
+    if stats is not None:
+        stats.update(res_out=np.quantile(r1, [0, 0.5, 1]).tolist() if len(r1) else [], n_post=int(ok.sum()))
+    W, V = W[ok], V[:, ok]
+    keep_w, keep_v, used = [], [], np.zeros(len(W), bool)          # merge repeated eigenpairs
+    for i in range(len(W)):
+        if used[i]:
+            continue
+        same = np.where(~used & (np.abs(W - W[i]) <= dup_tol * abs(W[i])))[0]
+        used[same] = True
+        if len(same) == 1:
+            keep_w.append(W[i:i + 1]); keep_v.append(V[:, i:i + 1])
+            continue
+        U, sv, _ = np.linalg.svd(V[:, same], full_matrices=False)
+        r = int((sv > 1e-6 * sv[0]).sum())
+        keep_w.append(np.full(r, W[same].mean())); keep_v.append(U[:, :r])
+    W, V = np.concatenate(keep_w), np.concatenate(keep_v, axis=1)
+    if stats is not None:
+        stats.update(n_out=len(W))
+    return W, V
+
+
+class _MixedBeyn:
+    """qttools Beyn in complex64 on the primitive cell, eigenpairs refined in complex128 (refine_nevp_modes); the
+    caller (Spectral) gets complex128 modes and builds g, its fixed-point refinement and the injection in complex128.
+    .rank = modes Beyn found, .nmodes = after refinement / merging, .t = (beyn s, refine s)."""
+
+    def __init__(self, b):
+        self.b, self.rank, self.nmodes, self.t, self.stats = b, None, None, None, {}
+
+    def __call__(self, a_xx):
+        t0 = time.time()
+        ws, vs = self.b(tuple(x.astype(np.complex64) for x in a_xx))
+        ws, vs = ws[0], vs[0]
+        k = np.abs(ws) > 0
+        self.rank = int(k.sum())
+        t1 = time.time()
+        self.stats = {}
+        w, v = refine_nevp_modes([x[0] for x in a_xx], ws[k], vs[:, k], stats=self.stats)
+        self.nmodes, self.t = len(w), (t1 - t0, time.time() - t1)
+        return w[None], v[None]
+
+
+class _RankBeyn:
+    """qttools Beyn with the subspace rank of the last call (eigenvalues found in the annulus) in .rank. A saturated
+    subspace (rank = m_0 < m) doubles m_0 (up to m) and repeats the call; m_0 then stays at the larger value."""
+
+    def __init__(self, b):
+        self.b, self.rank = b, None
+
+    def __call__(self, a_xx):
+        d = a_xx[0].shape[-1]
+        while True:
+            ws, vs = self.b(a_xx)
+            self.rank = int((abs(ws) > 0).sum())
+            if self.rank < self.b.m_0 or self.b.m_0 >= d:
+                return ws, vs
+            log(f"  qttools Beyn: subspace saturated (rank {self.rank} = m_0); m_0 -> {min(d, 2 * self.b.m_0)}")
+            self.b.m_0 = min(d, 2 * self.b.m_0)
+
+
+def beyn_memory(m, n, nq):
+    """Rough peak bytes of the qttools spectral OBC with Beyn, primitive cell m, lead cell n, nq quadrature points:
+    contour inverses at the outer and inner points (2 nq m^2) + moments / projection (~4 m^2) in the Beyn precision,
+    and ~9 n^2 complex128 for g, the fixed-point inverses and the injection on the lead cell (both variants)."""
+    lead = 16 * 9 * n * n
+    return {"beyn": 16 * (2 * nq + 4) * m * m + lead, "beyn-mixed": 8 * (2 * nq + 4) * m * m + 16 * 2 * m * m + lead}
+
+
+def _free_memory():
+    """Free bytes: GPU (driver free + cupy pool free) in GPU mode, else the host's MemAvailable."""
+    if gpu.on:
+        import cupy as cp
+        free, _ = cp.cuda.Device().mem_info
+        pool = cp.get_default_memory_pool()
+        return free + pool.total_bytes() - pool.used_bytes()
+    try:
+        with open("/proc/meminfo") as f:
+            return next(int(l.split()[1]) * 1024 for l in f if l.startswith("MemAvailable"))
+    except (OSError, StopIteration):
+        return float("inf")
 
 
 def lead_cell_perm(inp, orbs, sections):
@@ -348,8 +642,28 @@ class Device:
         self.cL = [cut(M, oL, dev[self.bL]) for M in (H, S)] + [cut(M, dev[self.bL], oL) for M in (H, S)]
         self.cR = [cut(M, oR, dev[self.bR]) for M in (H, S)] + [cut(M, dev[self.bR], oR) for M in (H, S)]
         self.sigma_cache = sigma_cache
-        assert obc in ("auto", "qttools", "folded"), obc
-        self.obc, self.qtt, self._inj = obc, None, {}
+        assert obc in ("auto", "qttools", "folded", "beyn", "beyn-cell"), obc
+        self.obc, self.qtt, self._inj, self.beyn = obc, None, {}, None
+        if obc in ("beyn", "beyn-cell"):
+            from .obc_beyn import BeynLead
+            sec = int(self.meta.get("cells_per_block", 1)) if obc == "beyn" else 1
+            OL, ORr = O[tr["lead_left_block"]], O[tr["lead_right_block"]]
+            perm = lead_cell_perm(inp, OL, sec) if sec > 1 else None
+            # two leads: one BeynLead per side (own layers, coupling basis, device copies and info); the right lead
+            # is lead_right when given, else the same lead matrices
+            rl = ld if lr is None else lr
+            # memory lean by default (no accuracy cost): primitive layers and the fixed-point operands on the host;
+            # QTX_BEYN_LU=mixed: complex64 LU of a_ii + iterative refinement (~1e-11 in Sigma, 2x time, -1.5 GB at 12 nm)
+            bo = dict(layers_on="host", fp_store="host", lu_prec=os.environ.get("QTX_BEYN_LU", "double"))
+            bl = BeynLead(ld["H00"], ld["H01"], ld["S00"], ld["S01"], sec, perm, sides="L", **bo)
+            br = BeynLead(rl["H00"], rl["H01"], rl["S00"], rl["S01"], sec, perm, sides="R", **bo)
+            self.beyn = {"L": bl, "R": br}
+            scut = lambda M, r, c: M[r][:, c].tocsr()
+            self.bcpl = {"L": [scut(M, OL, dev[self.bL]) for M in (H, S)] + [scut(M, dev[self.bL], OL) for M in (H, S)],
+                         "R": [scut(M, ORr, dev[self.bR]) for M in (H, S)] + [scut(M, dev[self.bR], ORr) for M in (H, S)]}
+            log(f"  lead OBC: spectral OBC (obc_beyn, {'periodized lead, %d primitive cells' % sec if sec > 1 else 'lead cell as given'}"
+                f", {bl.method}) at every z")
+            return
         if obc != "folded" and qttools_obc() is not None:
             sec = int(self.meta.get("cells_per_block", 1))
             OL, ORr = O[tr["lead_left_block"]], O[tr["lead_right_block"]]
@@ -368,7 +682,7 @@ class Device:
             raise RuntimeError(f"obc 'qttools': {QTT_ERROR or 'qttools does not import'} (install it or set QTTOOLS_SRC)")
         elif obc == "auto" and QTT_ERROR and os.environ.get("QTTOOLS_SRC"):
             log(f"  qttools OBC not used: {QTT_ERROR}")
-        log(f"  lead OBC on the real axis: {'qttools spectral OBC' if self.qtt is not None else 'folded lead (decimation) at E + %g i' % self.fallback_eta}")
+        log(f"  lead OBC on the real axis: {'qttools spectral OBC (%s)' % self.qtt.nevp_kind if self.qtt is not None else 'folded lead (decimation) at E + %g i' % self.fallback_eta}")
 
     def uses_qttools(self, z):
         return self.qtt is not None and abs(complex(z).imag) <= self.qtt_eta
@@ -378,6 +692,8 @@ class Device:
         are kept for inject(); cached as qsig_<E>_<Im z>.npz, any such file at the same E is reused), or the folded
         lead at E + i fallback_eta without qttools. Complex z: folded lead (sig_<Re z>_<Im z>.npz)."""
         z = complex(z)
+        if self.beyn is not None:
+            return self._sigma_beyn(z)
         if self.uses_qttools(z):
             try:
                 return self._sigma_qtt_cached(z.real)
@@ -390,11 +706,13 @@ class Device:
         self._inj = {}
         return self._sigma_folded(z)
 
-    def inject(self, Sg, tol=1e-4):
+    def inject(self, Sg, tol=1e-4, device=False):
         """Injection columns for the Sigma_L Sg of the last sigma(): the qttools incoming modes when they came with
-        it, else the Gamma_L eigenchannels above tol (injection())."""
+        it, else the Gamma_L eigenchannels above tol (injection()). device (GPU mode): a cupy array."""
         B = self._inj.get(id(Sg))
-        return injection(Sg, tol) if B is None else B
+        if B is None:
+            return injection(Sg, tol, device=device)
+        return gpu.cp.asarray(B) if device and gpu.on else B
 
     def _sigma_qtt_cached(self, E):
         d = self.sigma_cache
@@ -416,6 +734,34 @@ class Device:
         if d:
             os.makedirs(d, exist_ok=True)
             savez_atomic(os.path.join(d, f"qsig_{E:+.8f}_{0.0:.8e}.npz"), SL=out[0], SR=out[1], BL=inj[0], BR=inj[1])
+        return out
+
+    def _sigma_beyn(self, z):
+        """obc beyn / beyn-cell: Sigma and (real axis, |Im z| <= qtt_eta, taken at E = Re z) the incoming modes."""
+        if abs(z.imag) <= self.qtt_eta:
+            z = complex(z.real, 0.0)
+        tag = "p" if self.obc == "beyn" else "c"
+        f = None
+        if self.sigma_cache:
+            f = os.path.join(self.sigma_cache, f"bsig{tag}_{z.real:+.8f}_{z.imag:.8e}.npz")
+            if os.path.exists(f):
+                c = np.load(f)
+                out = c["SL"], c["SR"]
+                self._inj = {id(out[0]): c["BL"], id(out[1]): c["BR"]}
+                return out
+        out, inj = [], []
+        for side in "LR":
+            Hld, Sld, Hdl, Sdl = self.bcpl[side]
+            Sg, B = self.beyn[side].sigma(z, side, z * Sdl - Hdl, z * Sld - Hld)
+            if gpu.on:
+                gpu.free()                       # release the left lead's cached blocks before the right lead
+            out.append(Sg)
+            inj.append(B)
+        out = tuple(out)
+        self._inj = {id(out[0]): inj[0], id(out[1]): inj[1]} if z.imag == 0 else {}
+        if f:
+            os.makedirs(self.sigma_cache, exist_ok=True)
+            savez_atomic(f, SL=out[0], SR=out[1], BL=inj[0], BR=inj[1])
         return out
 
     def _sigma_folded(self, z):
@@ -450,8 +796,16 @@ class Device:
         return (E * self.S - self.H - Sig).tocsr()
 
 
-def injection(SL, tol=1e-4):
-    """Columns B with Gamma_L ~ B B^H (eigenvectors of Gamma_L above tol [eV]: propagating channels)."""
+def injection(SL, tol=1e-4, device=False):
+    """Columns B with Gamma_L ~ B B^H (eigenvectors of Gamma_L above tol [eV]: propagating channels). device (GPU
+    mode): eigensolve and result stay on the device (cupy)."""
+    if device and gpu.on:
+        cp = gpu.cp
+        G = cp.asarray(SL)
+        G = 1j * (G - G.conj().T)
+        lam, X = cp.linalg.eigh(0.5 * (G + G.conj().T))     # ascending
+        k = lam > tol
+        return X[:, k] * cp.sqrt(lam[k])
     G = 1j * (SL - SL.conj().T)
     lam, X = eigh(0.5 * (G + G.conj().T))                    # GPU mode: on the device
     lam, X = lam[::-1], X[:, ::-1]                           # ascending, as numpy's eigh
@@ -482,16 +836,19 @@ def _slab_blocks_gpu(dev, V):
     cp = gpu.cp
     b, n = dev.sb, len(dev.ns)
     out = dict(HD=[], SD=[], HU=[], SU=[])
-    Vd = [cp.asarray(v, dtype=complex) for v in V]
-    for M, kD, kU in ((dev.H, "HD", "HU"), (dev.S, "SD", "SU")):
-        for s in range(n):
-            X = Vd[s].conj().T @ (gpu.csr(M[b[s]:b[s + 1], b[s]:b[s + 1]], np.complex128) @ Vd[s])
+    # only V_s and V_{s+1} on the device (all V_s at once: ~60 GB for the 12 nm tile4y level 1, N 121 022; 2026-11-18)
+    Vs = cp.asarray(V[0], dtype=complex)
+    for s in range(n):
+        Vn = cp.asarray(V[s + 1], dtype=complex) if s < n - 1 else None
+        for M, kD, kU in ((dev.H, "HD", "HU"), (dev.S, "SD", "SU")):
+            X = Vs.conj().T @ (gpu.csr(M[b[s]:b[s + 1], b[s]:b[s + 1]], np.complex128) @ Vs)
             out[kD].append(gpu.asnumpy(0.5 * (X + X.conj().T)))
-            if s < n - 1:
-                X = gpu.csr(M[b[s]:b[s + 1], b[s + 1]:b[s + 2]], np.complex128) @ Vd[s + 1]
-                out[kU].append(gpu.asnumpy(Vd[s].conj().T @ X))
-    del Vd, X
-    gpu.free()
+            if Vn is not None:
+                X = gpu.csr(M[b[s]:b[s + 1], b[s + 1]:b[s + 2]], np.complex128) @ Vn
+                out[kU].append(gpu.asnumpy(Vs.conj().T @ X))
+            del X
+        Vs = Vn
+        gpu.free()
     return out
 
 
@@ -562,7 +919,8 @@ def block_solve(blk, z, SL1, SR1, B, host_frac=0.4):
     if gpu.on:
         need = 16 * sum(sz[s] * sz[s + 1] for s in range(n - 1))
         keep = need < host_frac * gpu.cp.cuda.Device().mem_info[0]
-    B = np.asarray(B)
+    dev_out = gpu.on and gpu.xp_of(B) is not np          # cupy right-hand sides: the solution stays on the device
+    B = B if dev_out else np.asarray(B)
     Dt = z * put(blk["SD"][0]) - put(blk["HD"][0]) - put(SL1)
     Yt = put(B[o[0]:o[1]].astype(complex))
     C, Z = [], []
@@ -588,7 +946,9 @@ def block_solve(blk, z, SL1, SR1, B, host_frac=0.4):
     for s in range(n - 2, -1, -1):
         X[s] = Z[s] - put(C[s]) @ X[s + 1]
         C[s] = None
-    X = gpu.asnumpy(xp.concatenate(X))
+    X = xp.concatenate(X)
+    if not dev_out:
+        X = gpu.asnumpy(X)
     gpu.free()
     return X
 
@@ -651,6 +1011,84 @@ class StreamBlockTridiag:
         return cp.concatenate(X)
 
 
+def exact_last_slab(dev, A, B, chunk=None, info=None):
+    """psi on the last slab of A X = B (B nonzero on the first slab only, as the QTBM injection) by the forward block
+    elimination alone: Z_0 = D~_0^-1 B_0, Z_s = D~_s^-1 (-A_{s,s-1} Z_{s-1}), X_N = Z_N. No LU factor is kept, so
+    nothing grows with the number of slabs (exact T without the back-substitution; 2026-11-18).
+    Schur update D~_{s+1} = A_{s+1,s+1} - A_{s+1,s} D~_s^-1 A_{s,s+1} only on the coupled orbitals f of slab s+1 (the
+    nonzero rows of A_{s+1,s} / columns of A_{s,s+1}), in column chunks; the |f| x |f| update is staged on the host
+    while the LU of slab s is freed, so the GPU holds ~one dense block (+ chunks) at a time. Complex128, no refinement.
+    GPU (gpu.on) or numpy. Returns X_N (n_N x columns, numpy)."""
+    # column chunk of the Schur update (each chunk: 2 x n_s x chunk complex on the device; 2048 at 33k orbitals = 2 x
+    # 1.1 GB): QTX_EXACT_CHUNK for a GPU shared with other jobs
+    chunk = chunk or int(os.environ.get("QTX_EXACT_CHUNK", 2048))
+    A, b, n = sp.csr_matrix(A), dev.sb, len(dev.ns)
+    dev_out = gpu.on and gpu.xp_of(B) is not np          # cupy B: X_N returned on the device
+    B = B.reshape(A.shape[0], -1) if dev_out else np.asarray(B).reshape(A.shape[0], -1)
+    assert not bool(abs(B[b[1]:]).any()), "exact_last_slab: B must vanish outside the first slab"
+    on = gpu.on
+    xp = gpu.cp if on else np
+    # Fortran order: the (cupyx / scipy) LU then factors in place (C order costs a second dense block)
+    # scattered from the COO entries into an F-order zero block: exactly one dense block (cupyx toarray goes through a
+    # second dense array)
+    def dense(M):
+        if not on:
+            return np.asfortranarray(M.toarray().astype(complex))
+        M = M.tocoo()
+        D = xp.zeros(M.shape, complex, order="F")
+        step = 1 << 24                                  # entries per scatter (~0.4 GB of indices + values on the device)
+        for i in range(0, M.nnz, step):
+            j = min(M.nnz, i + step)
+            D[xp.asarray(M.row[i:j].astype(np.int32)), xp.asarray(M.col[i:j].astype(np.int32))] = \
+                xp.asarray(M.data[i:j].astype(complex))
+        gpu.free()
+        return D
+    tocsr = (lambda M: gpu.csr(M, np.complex128)) if on else (lambda M: M.astype(complex))
+    host = (lambda X: X.get()) if on else (lambda X: X)
+    pool = gpu.cp.get_default_memory_pool() if on else None
+    peak, t0 = 0, time.time()
+    Dt = dense(A[b[0]:b[1], b[0]:b[1]])
+    Y = xp.asarray(B[b[0]:b[1]]).astype(complex)
+    for s in range(n):
+        lu = gpu.lu_factor(Dt)
+        del Dt
+        Z = gpu.lu_solve(lu, Y)
+        if s == n - 1:
+            break
+        Up = A[b[s]:b[s + 1], b[s + 1]:b[s + 2]].tocsc()                  # slab s x slab s+1
+        Lo = A[b[s + 1]:b[s + 2], b[s]:b[s + 1]].tocsr()                  # slab s+1 x slab s
+        f = np.union1d(np.unique(Up.nonzero()[1]), np.unique(Lo.nonzero()[0]))
+        Lof = tocsr(Lo[f])                                                 # |f| x slab s
+        Xff = np.empty((len(f), len(f)), complex)                          # A_{s+1,s} D~_s^-1 A_{s,s+1} on f x f
+        for c0 in range(0, len(f), chunk):
+            c1 = min(len(f), c0 + chunk)
+            Wc = gpu.lu_solve(lu, gpu.csr(Up[:, f[c0:c1]], np.complex128).toarray() if on
+                              else Up[:, f[c0:c1]].toarray().astype(complex))
+            Xff[:, c0:c1] = host(Lof @ Wc)
+            if pool is not None:
+                peak = max(peak, pool.total_bytes())
+            del Wc
+        Y = -(tocsr(Lo) @ Z)                                               # right-hand side of slab s+1
+        del lu, Z, Lof
+        if on:
+            gpu.free()
+        Dt = dense(A[b[s + 1]:b[s + 2], b[s + 1]:b[s + 2]])
+        fx = xp.asarray(f)
+        for c0 in range(0, len(f), chunk):
+            c1 = min(len(f), c0 + chunk)
+            Dt[fx[:, None], fx[None, c0:c1]] -= xp.asarray(Xff[:, c0:c1])
+        del Xff
+        if pool is not None:
+            peak = max(peak, pool.total_bytes())
+    X = Z if dev_out else host(Z)
+    del lu, Z
+    if on:
+        gpu.free()
+    if info is not None:
+        info.update(peak_gb=peak / 2**30, t=time.time() - t0)
+    return X
+
+
 def exact_solve(dev, A, B, n_ref=2, tol=1e-12):
     """Exact solution of the sparse device system A X = B (numpy in, numpy out) and the max relative residual.
     CPU: CSolver (PARDISO / SuperLU + refinement + GMRES). GPU: dense block-tridiagonal LU over the slabs (the device
@@ -668,7 +1106,8 @@ def exact_solve(dev, A, B, n_ref=2, tol=1e-12):
     else:
         bt = BlockTridiag.from_blocks(*device_blocks(dev, A, cp))
     Ad = gpu.csr(A, np.complex128)
-    Bd = cp.asarray(np.asarray(B).reshape(len(B), -1), dtype=complex)
+    dev_out = gpu.xp_of(B) is not np                     # cupy B: X returned on the device
+    Bd = cp.asarray(B, dtype=complex).reshape(B.shape[0], -1)
     X = bt.solve(Bd)
     for _ in range(n_ref):
         X += bt.solve(Bd - Ad @ X)
@@ -676,10 +1115,11 @@ def exact_solve(dev, A, B, n_ref=2, tol=1e-12):
     res = float((cp.linalg.norm(Bd - Ad @ X, axis=0) / bn).max()) if Bd.shape[1] else 0.0
     if res > tol:
         log(f"  exact_solve (GPU block LU): residual {res:.1e} after {n_ref} refinement steps")
-    X = gpu.asnumpy(X)
+    if not dev_out:
+        X = gpu.asnumpy(X)
     del bt, Ad, Bd
     gpu.free()
-    return (X.reshape(B.shape) if np.ndim(B) == 1 else X), res
+    return (X.reshape(B.shape) if B.ndim == 1 else X), res
 
 
 class Coarse:
@@ -693,6 +1133,15 @@ class Coarse:
         self.PL, self.PR = V[0][dev.bL], V[-1][dev.bR - dev.sb[-2]]
         self.off = np.concatenate([[0], np.cumsum([v.shape[1] for v in V])])
         self.N = int(self.off[-1])
+        if gpu.on:
+            # V in pinned host memory, replaced in place in the caller's list (no second host copy): restrict / prolong
+            # of host arrays then stream V_s to the device slab by slab at bus speed and multiply there (12 nm tile4y:
+            # V ~70 GB, does not fit next to the solve; the numpy products took most of the time per energy)
+            try:
+                for s in range(len(V)):
+                    V[s] = gpu.pinned(V[s])
+            except Exception as e:                          # pinned allocation refused: plain host arrays still work
+                log(f"  Coarse: V not pinned ({e}); restrict / prolong stream pageable memory")
 
     def to_gpu(self):
         """Keep device copies of the blocks and of V: Ac() then factors on the GPU, prolong / restrict take and return
@@ -722,12 +1171,47 @@ class Coarse:
             return self._g["V"]
         return self.V
 
+    def _stream(self):
+        """GPU mode without to_gpu(): products on the device with V_s streamed from pinned memory slab by slab."""
+        return gpu.on and not hasattr(self, "_g")
+
+    def P(self, side, xp=np):
+        """V_0 on the left lead face / V_last on the right lead face (cupy copy cached for xp = cupy)."""
+        if xp is np:
+            return self.PL if side == "L" else self.PR
+        if not hasattr(self, "_Pd"):
+            self._Pd = {"L": gpu.cp.asarray(self.PL), "R": gpu.cp.asarray(self.PR)}
+        return self._Pd[side]
+
     def prolong(self, Y):
+        """U Y (GPU mode: on the device; cupy Y -> cupy result, numpy Y -> numpy result)."""
+        if self._stream():
+            cp, xp = gpu.cp, gpu.xp_of(Y)
+            dt = np.result_type(Y.dtype, self.V[0].dtype, np.complex64)
+            out = xp.empty((self.dev.sb[len(self.V)],) + Y.shape[1:], dt)
+            b = self.dev.sb
+            for s, v in enumerate(self.V):
+                r = cp.asarray(v) @ cp.asarray(Y[self.off[s]:self.off[s + 1]])
+                out[b[s]:b[s + 1]] = r if xp is not np else r.get()
+            gpu.free()
+            return out
         V = self._Vs(Y)
         return gpu.xp_of(Y).vstack([V[s] @ Y[self.off[s]:self.off[s + 1]] for s in range(len(V))])
 
     def restrict(self, X):
-        b, V = self.dev.sb, self._Vs(X)
+        """U^H X (GPU mode: on the device, as prolong). Slabs where X vanishes are skipped."""
+        b = self.dev.sb
+        if self._stream():
+            cp, xp = gpu.cp, gpu.xp_of(X)
+            out = xp.zeros((self.N,) + X.shape[1:], np.result_type(X.dtype, self.V[0].dtype, np.complex64))
+            for s, v in enumerate(self.V):
+                Xs = X[b[s]:b[s + 1]]
+                if bool(Xs.any()):
+                    r = cp.asarray(v).conj().T @ cp.asarray(Xs)
+                    out[self.off[s]:self.off[s + 1]] = r if xp is not np else r.get()
+            gpu.free()
+            return out
+        V = self._Vs(X)
         return gpu.xp_of(X).vstack([V[s].conj().T @ X[b[s]:b[s + 1]] for s in range(len(V))])
 
 
@@ -736,20 +1220,35 @@ def is_real(blk):
     return all(not np.iscomplexobj(M) or not np.abs(M.imag).any() for k in ("HD", "SD", "HU", "SU") for M in blk[k])
 
 
-def g_diag(blk, z, SL, SR, iL, iR, sym=False):
+def g_diag(blk, z, SL, SR, iL, iR, sym=False, host=None):
     """Diagonal blocks G_ss of G = A(z)^-1, A = z S - H - Sigma_L - Sigma_R (Sigma_L on rows / columns iL of the first
     slab, Sigma_R on iR of the last), by left-connected block recursion:
         forward   g_s = (D_s - Y_{s-1} U_{s-1})^-1,  Y_s = L_s g_s
         backward  G_ss = g_s + X_s G_{s+1,s+1} Y_s,  X_s = g_s U_s
     (D_s, U_s, L_s = diagonal / upper / lower blocks of A). sym (real H and S: L_s = U_s^T, g_s = g_s^T) uses
-    X_s = Y_s^T: 4 block products per slab instead of 5 (6 in the 0.1.0 recursion)."""
+    X_s = Y_s^T: 4 block products per slab instead of 5 (6 in the 0.1.0 recursion).
+    host (GPU streaming, 2026-11-18): dict(g=[...], Y=[...]) of preallocated pinned host buffers; blk then holds host
+    (pinned) blocks that are copied to the device when used, g_s / Y_s go to the host buffers in the forward sweep and
+    come back in the backward sweep, G_ss is returned as host arrays. Device peak ~6 blocks instead of all blocks +
+    2 per slab (12 nm level 2 on tile4y level 1 cut 1e-8: N1 ~5 500 per slab, ~42 GB of blocks)."""
     ns = len(blk["HD"])
-    xp = gpu.xp_of(blk["HD"][0])                             # numpy, or cupy for blocks on the GPU
-    Up = lambda s: z * blk["SU"][s] - blk["HU"][s]
-    Lo = lambda s: z * blk["SU"][s].conj().T - blk["HU"][s].conj().T
+    if host is not None:
+        xp = gpu.cp
+        put = lambda M: gpu.cp.asarray(M)
+        def keep(M, buf):
+            M.get(out=buf)
+            return buf
+        out_ = lambda M: gpu.asnumpy(M)
+    else:
+        xp = gpu.xp_of(blk["HD"][0])                         # numpy, or cupy for blocks on the GPU
+        put = keep = lambda M, *_: M
+        out_ = lambda M: M
+    Up = lambda s: z * put(blk["SU"][s]) - put(blk["HU"][s])
+    Lo = lambda s: z * put(blk["SU"][s]).conj().T - put(blk["HU"][s]).conj().T
     gl, Y = [None] * ns, [None] * (ns - 1)
+    Yp = gs = None
     for s in range(ns):
-        D = z * blk["SD"][s] - blk["HD"][s]
+        D = z * put(blk["SD"][s]) - put(blk["HD"][s])
         if s == 0:
             ix = xp.ix_(xp.asarray(iL), xp.asarray(iL))
             D[ix] = D[ix] - xp.asarray(SL)
@@ -757,17 +1256,24 @@ def g_diag(blk, z, SL, SR, iL, iR, sym=False):
             ix = xp.ix_(xp.asarray(iR), xp.asarray(iR))
             D[ix] = D[ix] - xp.asarray(SR)
         if s > 0:
-            D -= Y[s - 1] @ Up(s - 1)
-        gl[s] = xp.linalg.inv(D)
+            D -= Yp @ Up(s - 1)
+        gs = xp.linalg.inv(D)
         del D
+        gl[s] = keep(gs, host["g"][s] if host else None)
         if s < ns - 1:
-            Y[s] = Lo(s) @ gl[s]
+            Yp = Lo(s) @ gs
+            Y[s] = keep(Yp, host["Y"][s] if host else None)
+    Yp = None
     out = [None] * ns
-    out[-1] = G = gl[-1]
+    G = gs
+    out[-1] = out_(G)
     for s in range(ns - 2, -1, -1):
-        X = Y[s].T if sym else gl[s] @ Up(s)
-        out[s] = G = gl[s] + X @ (G @ Y[s])
+        g_, Y_ = put(gl[s]), put(Y[s])
+        X = Y_.T if sym else g_ @ Up(s)
+        G = g_ + X @ (G @ Y_)
+        out[s] = out_(G)
         gl[s] = Y[s] = None
+        del g_, Y_, X
     return out
 
 
@@ -783,8 +1289,19 @@ def rho_contour(dev, mu1, mu2, npts, log=log, V=None):
     if sym:
         for k in ("HD", "SD", "HU", "SU"):
             blk[k] = [np.ascontiguousarray(np.real(M)) for M in blk[k]]
+    host = None
     if gpu.on:
-        blk = {k: [gpu.asarray(M) for M in L] for k, L in blk.items()}
+        nb = sum(M.nbytes for L in blk.values() for M in L)
+        free = gpu.cp.cuda.Device().mem_info[0]
+        if nb + 16 * 3 * sum(len(h) ** 2 for h in blk["HD"]) < 0.6 * free:
+            blk = {k: [gpu.asarray(M) for M in L] for k, L in blk.items()}
+        else:                                   # stream: blocks and g_s / Y_s in pinned host memory (g_diag host=)
+            blk = {k: [gpu.pinned(M) for M in L] for k, L in blk.items()}
+            n_ = [len(h) for h in blk["HD"]]
+            host = dict(g=[gpu.pinned(np.empty((m, m), complex)) for m in n_],
+                        Y=[gpu.pinned(np.empty((n_[s + 1], n_[s]), complex)) for s in range(len(n_) - 1)])
+            log(f"  rho_contour: blocks {nb / 2**30:.1f} GB, GPU free {free / 2**30:.1f} GB -> blocks and recursion "
+                f"in pinned host memory, streamed per slab")
     iL, iR = dev.bL, dev.bR - dev.sb[-2]                     # lead faces in the end slabs
     proj = lambda SL, SR: (SL, SR)
     if V is not None:                                        # Sigma on the whole end-slab level-1 blocks
@@ -802,7 +1319,7 @@ def rho_contour(dev, mu1, mu2, npts, log=log, V=None):
         t1 = time.time()
         SL, SR = proj(*dev.sigma(z))
         t2 = time.time()
-        for a, G in zip(acc, g_diag(blk, z, SL, SR, iL, iR, sym)):
+        for a, G in zip(acc, g_diag(blk, z, SL, SR, iL, iR, sym, host=host)):
             a += gpu.asnumpy(G) * dz
         log(f"    contour point {ip + 1}/{npts}, {time.time() - t0:.0f} s (sigma {t2 - t1:.0f} s, "
             f"recursion {time.time() - t2:.0f} s)")

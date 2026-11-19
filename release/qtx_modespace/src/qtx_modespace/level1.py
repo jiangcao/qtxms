@@ -255,20 +255,28 @@ class GpuEmbedding:
     def accumulate(self, z, dz, acc, env_prec="double", refine=1, R=None):
         """acc += G_PP(z) dz (cupy m x m), or G_PP(z) R dz for probe columns R (cupy m x r)."""
         cp, m = gpu.cp, self.m
-        Sg = [cp.asarray(M) for M in self.obc.sigma(z)] if self.has_sigma else []
-        Sp = self._sub((z * self.PP[0] - self.PP[1]).toarray(), z, Sg, self.fP, self.fP)
+        # env_prec "c64" (2026-11-18, for GPU memory): the whole point (A_EE, A_EP, X, S_P, its LU and solves) in
+        # complex64, built from complex64 CSR (no complex128 dense copy), no refinement; acc stays complex128.
+        # Half the peak memory; fine for basis cuts >= ~1e-7 (check: results_ms/gpu/ms_ycut/check_c64_rho.sh).
+        c64 = env_prec == "c64"
+        dt = np.complex64 if c64 else np.complex128
+        dense = (lambda M: M.astype(dt).toarray()) if c64 else (lambda M: M.toarray())
+        Sg = [cp.asarray(M, dtype=dt) for M in self.obc.sigma(z)] if self.has_sigma else []
+        Sp = self._sub(dense(z * self.PP[0] - self.PP[1]), z, Sg, self.fP, self.fP)
         for g in self.env:
             nE = len(g["idx"])
-            AEE = self._sub((z * g["EE"][0] - g["EE"][1]).toarray(), z, Sg, g["f"], g["f"])
+            AEE = self._sub(dense(z * g["EE"][0] - g["EE"][1]), z, Sg, g["f"], g["f"])
             if env_prec == "single":
                 lu = gpu.lu_factor(AEE.astype(np.complex64))
             else:
                 lu, AEE = gpu.lu_factor(AEE), None                  # overwrites A_EE
             APE = z * g["PE"][0] - g["PE"][1]
+            if c64:
+                APE = APE.astype(dt)
             k = max(1, min(m, int(self.chunk_bytes // (16 * 3 * max(nE, 1)))))
             for j0 in range(0, m, k):
                 j1 = min(m, j0 + k)
-                AEP = cp.ascontiguousarray((z * g["EPT"][0][j0:j1] - g["EPT"][1][j0:j1]).toarray().T)
+                AEP = cp.ascontiguousarray(dense(z * g["EPT"][0][j0:j1] - g["EPT"][1][j0:j1]).T)
                 for (ro, sr), (co, sc), G in zip(g["f"], self.fP, Sg):       # Sigma on (E rows, P columns in chunk)
                     sel = (co >= j0) & (co < j1)
                     if len(ro) and bool(sel.any()):
@@ -290,12 +298,12 @@ class GpuEmbedding:
         lu = gpu.lu_factor(Sp)                                      # overwrites S_P
         del Sp
         if R is not None:
-            acc += gpu.lu_solve(lu, R) * dz
+            acc += gpu.lu_solve(lu, R.astype(dt)) * dz
             return
         k = max(1, min(m, int(self.chunk_bytes // (16 * 2 * m))))
         for j0 in range(0, m, k):
             j1 = min(m, j0 + k)
-            I = cp.zeros((m, j1 - j0), complex)
+            I = cp.zeros((m, j1 - j0), dt)
             I[cp.arange(j0, j1), cp.arange(j1 - j0)] = 1.0
             acc[:, j0:j1] += gpu.lu_solve(lu, I) * dz
             del I
@@ -306,7 +314,9 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
               dense_max=30000, chunk_bytes=4e9):
     """rho_PP of the embedding e over contour = (mu1, mu2, npts) [absolute eV]; returns (rho, seconds).
     gpp "schur": G_PP = (A_PP - A_PE A_EE^-1 A_EP)^-1 (env_prec "single": A_EE LU in complex64 + `refine` steps of
-    iterative refinement); "full": one LU of the whole embedding with m right-hand sides.
+    iterative refinement; "c64": on the GPU every dense block of the point in complex64, no refinement, half the
+    memory; on the CPU the A_EE LU in complex64 without refinement); "full": one LU of the whole embedding with m
+    right-hand sides.
     workers > 1: the contour points over forked processes with `threads` BLAS threads each (needs threadpoolctl).
     GPU mode (gpu.on, dense embeddings): every point on the GPU (blocks built there from the CSR matrix, LU, solves,
     Schur complement and its inverse), rho accumulated on the device; points one after another (workers ignored).
@@ -316,7 +326,7 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
     He, Se, W, pidx = e["He"], e["Se"], e["W"], e["pidx"]
     n, m = He.shape[0], len(pidx)
     dense = (He + Se).nnz > dense_fill * n * n and n <= dense_max
-    cdt = np.complex64 if env_prec == "single" else np.complex128
+    cdt = np.complex64 if env_prec in ("single", "c64") else np.complex128
     eidx = np.setdiff1d(np.arange(n), pidx)
     on_gpu = gpu.on and dense
 
@@ -374,7 +384,9 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
                 point_gpu(k, acc)
             else:
                 acc += point(k) * dzs[k]
-        return gpu.asnumpy(acc)
+        out = gpu.asnumpy(acc)                      # the accumulated rho goes to the host; device copy dropped
+        del acc
+        return out
 
     def limited(f, nthr):
         if not nthr:
@@ -386,6 +398,8 @@ def local_rho(e, contour, gpp="schur", env_prec="double", refine=1, workers=1, t
     t0 = time.time()
     if gpu.on:                                       # no fork after CUDA initialization: one process
         acc = limited(lambda: run(range(len(zs))), threads)
+        if on_gpu and gpp != "full":
+            del ge                                   # device copies of the embedding blocks, before the pool is freed
         gpu.free()
     elif workers <= 1:
         acc = limited(lambda: run(range(len(zs))), threads)
@@ -434,6 +448,8 @@ def build_level1(inp, dev, contour, kind="slab", tile_orbs=2500, xsplit=1, bound
         par.update(tsplit=[int(x) for x in tsplit], tile_orbs=None)
     if xlen:
         par.update(xlen=float(xlen), xsplit=None)
+    if env_prec == "c64":                           # own cache (double caches keep their hash)
+        par.update(env_prec="c64")
     cdir = None
     if cache:
         h = hashlib.sha1(json.dumps(par, sort_keys=True).encode()).hexdigest()[:10]
@@ -465,10 +481,14 @@ def build_level1(inp, dev, contour, kind="slab", tile_orbs=2500, xsplit=1, bound
         e = embedding(inp, geo, tree, b["atoms"], d_emb, d_cap, eta_cap, dev if boundary == "obc" else None)
         rho, trho = local_rho(e, contour, gpp, env_prec, workers=workers, threads=threads, dense_max=dense_max)
         lam, X = eigh(rho)
+        del rho                                     # the local rho is not needed once its eigenpairs exist
         k = int((lam > keep_cut).sum())
-        res[i] = (X[:, :k], lam)
+        U = np.ascontiguousarray(X[:, :k])          # a copy: X[:, :k] would keep the whole m x m X per block alive
+        del X
+        res[i] = (U, lam)
         if f:
-            savez_atomic(f, U=X[:, :k], s=lam, atoms=b["atoms"], cut=keep_cut)
+            savez_atomic(f, U=U, s=lam, atoms=b["atoms"], cut=keep_cut)
+        del U
         log(f"  block {i} (slab {b['slab']}): {len(b['orbs'])} orbitals, embedding {len(e['oe'])} "
             f"(CAP {e['ncap']}, lead faces {e['nface']}), trace {lam.sum():.2f}, occupations > {cut:g}: "
             f"{int((lam > cut).sum())}; {trho:.0f} s")

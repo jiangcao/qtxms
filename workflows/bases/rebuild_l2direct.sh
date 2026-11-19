@@ -18,7 +18,7 @@ echo "[$(date +%T)] run_l2_clean -> $OUT"
 nice -n 10 .venv/bin/python -u -m qtx_ms.run_l2_clean --inputs inputs/mos2_hfo2 --out $OUT --nmodes 100,200,400,800 \
   --no-res --dE 0.02,0.05,0.15,0.3 --exact-from results_ms/mos2_hfo2_leadcms/results.json \
   --sigma-cache ${SIGMA:-$OUT/sigma} > $OUT/rebuild.log 2>&1
-echo "[$(date +%T)] exit $?"
+rc=$?; echo "[$(date +%T)] exit $rc"
 [ "$OUT" = results_ms/mos2_hfo2_l2direct ] && exit 0
 .venv/bin/python workflows/bases/compare_l2_clean.py $OUT/results_clean.ref.json \
   $OUT/results_clean_mu-0.15_0.6_n100_n200_n400_n800.json

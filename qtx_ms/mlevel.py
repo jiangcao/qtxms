@@ -970,7 +970,7 @@ def main(argv=None):
     from qtx_ms.prep.inputs import read_inputs
     from qtx_ms.schwarz import CapSchwarz, SlowCoarse, fgmres_block, operator
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--inputs", required=True)
+    p.add_argument("--inputs", required=True, help="qtx_ms input set or a release prep folder (prep.json)")
     p.add_argument("--dE", default="0.15", help="energies - Ec_lead [eV] (comma list)")
     p.add_argument("--Ec", type=float, help="reference edge for --dE, --mu (default Ec_lead of the inputs)")
     p.add_argument("--eta", type=float, default=1e-6, help="Im z of the lead Sigma on the real axis [eV]")
@@ -1029,7 +1029,13 @@ def main(argv=None):
     gpu.track_peak()
     t00 = time.time()
     name = os.path.basename(os.path.normpath(a.inputs))
-    inp = read_inputs(a.inputs)
+    if os.path.exists(os.path.join(a.inputs, "prep.json")):  # release prep (python -m qtx_modespace.prep), e.g. the 6 / 12 nm Si sheets
+        from qtx_modespace.quatrex import load_inputs                 # (needs PYTHONPATH=release/qtx_modespace/src)
+        inp = load_inputs(a.inputs, log=log)
+        if name == "prep":                                            # <dev>/prep -> <dev>
+            name = os.path.basename(os.path.dirname(os.path.normpath(a.inputs)))
+    else:
+        inp = read_inputs(a.inputs)
     dev = mb.Device(inp, obc=a.obc)
     dev.sigma_cache = a.sigma_cache or os.path.join("results_ms", "sigma", name)
     n = dev.n
