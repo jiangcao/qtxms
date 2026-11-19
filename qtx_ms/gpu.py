@@ -144,6 +144,71 @@ def free():
         cp.get_default_pinned_memory_pool().free_all_blocks()
 
 
+class Streamer:
+    """Host -> device streaming of a sequence of items with the copy of item k + 1 overlapped with the compute on item
+    k (user, 2026-11-19; the generalisation of the release CapSchwarz._streamed). An item is a tuple of C-contiguous
+    host arrays (pinned: copies at bus speed); two device slots of the largest item, a non-blocking copy stream and
+    events: fn(k, views) is enqueued on the current stream once item k is in its slot, the copy of item k + 1 waits
+    only for the compute that last used its slot (k - 1). Per pass: max(copy, compute) instead of the sum; on the
+    GH200 the copy runs at ~300-350 GB/s pinned vs ~3-4 TB/s from device memory, so the overlap hides the copy only
+    when every streamed byte serves enough columns. Device memory: 2 x the largest item.
+    CPU mode: fn(k, items[k]) on the host arrays."""
+
+    def __init__(self, items):
+        self.items = [tuple(np.ascontiguousarray(a) if not a.flags.c_contiguous else a for a in it) for it in items]
+        self.nbytes = sum(a.nbytes for it in self.items for a in it)
+        if not on or not self.items:
+            return
+        m = len(self.items[0])
+        self.slot = [max(it[j].nbytes for it in self.items) for j in range(m)]
+        self.buf = [[cp.empty(max(b, 1), cp.uint8) for b in self.slot] for _ in range(2)]
+        self.cstream = cp.cuda.Stream(non_blocking=True)
+
+    @property
+    def dev_bytes(self):
+        return 2 * sum(self.slot) if on and self.items else 0
+
+    def run(self, fn):
+        if not on:
+            for k, it in enumerate(self.items):
+                fn(k, it)
+            return
+        cur = cp.cuda.get_current_stream()
+        freed = [cp.cuda.Event(), cp.cuda.Event()]               # the compute that last used slot s is done
+        freed[0].record(cur), freed[1].record(cur)
+
+        def load(k):
+            s = k % 2
+            self.cstream.wait_event(freed[s])
+            views = []
+            for a, b in zip(self.items[k], self.buf[s]):
+                d = cp.ndarray(a.shape, a.dtype, memptr=b.data)
+                d.set(a, stream=self.cstream)
+                views.append(d)
+            ev = cp.cuda.Event()
+            ev.record(self.cstream)
+            return views, ev
+        n = len(self.items)
+        nxt = load(0) if n else None
+        for k in range(n):
+            views, ev = nxt
+            cur.wait_event(ev)
+            fn(k, views)
+            freed[k % 2] = cp.cuda.Event()
+            freed[k % 2].record(cur)
+            if k + 1 < n:
+                nxt = load(k + 1)                                # its slot is free once compute k - 1 is done
+        # no synchronize: the next pass's first copy waits for the freed events recorded on the current stream
+
+    def free(self):
+        self.items, self.buf = [], None
+
+
+def pin_all(arrays):
+    """Pinned host copies of a list of arrays (numpy or cupy)."""
+    return [pinned(a) for a in arrays]
+
+
 def mem_used():
     """Bytes held by cupy's memory pool (0 on CPU)."""
     return int(cp.get_default_memory_pool().used_bytes()) if on else 0

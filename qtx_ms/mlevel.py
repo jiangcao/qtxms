@@ -39,7 +39,7 @@ h.merge(axis, cut, kind, mu1, mu2, npts, halo, bkey) per further level; prec, ti
         --dm-cache DIR [--cap 16,2,2 --cap-split 2,1 --cap-tov 6 --cap-solver rows64] --l1 dm:1e-2 \\
         --up y:1e-2,x:1e-2:0.05:0.25 [--halo 1 --halo-smooth same] [--sweep fine,exact,top --counts 32,128,256]
 """
-import argparse, hashlib, json, os, time
+import argparse, gc, hashlib, json, os, time
 import numpy as np
 import scipy.sparse as sp
 
@@ -86,12 +86,65 @@ def nrm2(B, its=12):
     return float(xp.linalg.norm(B @ v))
 
 
-def select(rho, rows, cut, kind):
+EIG_STATS = []          # per rand_top_eig call: (n, l, k, rounds, fallback); summarized and reset by merge
+
+
+def rand_top_eig(rho, cut, q=2, f=0.5, p=32, l0=256, lmax_frac=0.6, seed=0):
+    """Eigenpairs of the Hermitian rho with eigenvalue > cut, by a randomized range finder (Halko, Martinsson, Tropp):
+    Q = orth((rho)^(2q+1) Omega), grown in blocks until the Rayleigh-Ritz spectrum of Q^H rho Q has at most l - p
+    values above f * cut (the subspace then reaches below the cut, so the kept vectors converge at the rate
+    (f cut / lambda)^(2q+1)). Memory n x l instead of the ~11 n^2 workspace of the dense eigh. When l would pass
+    lmax_frac * n: dense eigh (on the host when on the GPU: no workspace limit). Returns (ev, V) ascending, ev > cut."""
+    xp = gpu.xp_of(rho)
+    n = rho.shape[0]
+    rs = xp.random.RandomState(seed)
+    Q = xp.zeros((n, 0), complex)
+    l, rounds = min(n, l0), 0
+
+    def orth(Y):                                           # Y orthogonal to Q (block Gram-Schmidt twice), then QR
+        for _ in range(2):
+            if Q.shape[1]:
+                Y -= Q @ (Q.conj().T @ Y)
+        return xp.linalg.qr(Y)[0]
+
+    while True:
+        m = l - Q.shape[1]
+        Y = rs.standard_normal((n, m)) + 1j * rs.standard_normal((n, m))
+        Y = rho @ Y
+        for _ in range(q):
+            Y = rho @ orth(Y)
+        Q = xp.concatenate([Q, orth(Y)], axis=1)
+        del Y
+        rounds += 1
+        ev, W = xp.linalg.eigh(Q.conj().T @ (rho @ Q))
+        nb = int((ev > f * cut).sum())
+        if nb + p <= l or l >= n:
+            break
+        lnew = min(n, max(2 * l, nb + 2 * p))
+        if lnew > lmax_frac * n:                               # the range is most of the window: dense eigh
+            del Q, W
+            gpu.free()
+            if gpu.on:
+                ev, V = np.linalg.eigh(gpu.asnumpy(rho))
+                ev, V = xp.asarray(ev), xp.asarray(V)
+            else:
+                ev, V = np.linalg.eigh(rho)
+            k = int((ev > cut).sum())
+            EIG_STATS.append((n, n, k, rounds, True))
+            return ev[n - k:], V[:, n - k:]
+        l = lnew
+    k = int((ev > cut).sum())
+    EIG_STATS.append((n, l, k, rounds, False))
+    return ev[l - k:], Q @ W[:, l - k:]
+
+
+def select(rho, rows, cut, kind, eig="full"):
     """Modes on `rows` of a local rho: dm = eigenvectors of the whole window rho with occupation > cut, restricted to
-    rows, SVD; dmc = eigenvectors of rho[rows, rows] with occupation > cut. Returns U (orthonormal columns)."""
+    rows, SVD; dmc = eigenvectors of rho[rows, rows] with occupation > cut. Returns U (orthonormal columns).
+    eig "rand": the dm eigenvectors by the randomized range finder (rand_top_eig), not the dense eigh."""
     xp = gpu.xp_of(rho)
     if kind == "dm":
-        ev, V = xp.linalg.eigh(rho)
+        ev, V = rand_top_eig(rho, cut) if eig == "rand" else xp.linalg.eigh(rho)
         k = int((ev > cut).sum())
         if not k:
             return xp.zeros((len(rows), 0), complex)
@@ -128,33 +181,45 @@ class BlockOp:
     """Block-sparse level matrix: dense blocks B[i][q] for the coupled blocks (i, cols[i][q]); A_k @ Y = one GEMM per
     block row."""
 
-    def __init__(self, off, rows, cols, blocks):
+    def __init__(self, off, rows, cols, blocks, host=False):
         xp = _xp()
         self.off, self.N = off, int(off[-1])
         self.shape = (self.N, self.N)
         self.rows, self.cols, self.blocks = rows, cols, blocks      # per block row: row block, its columns, [B_ij]
-        self.R = []
+        # host: the block rows live in pinned host memory and every product streams them (gpu.Streamer: the copy of
+        # row i + 1 overlaps the GEMM of row i); take / dense / sub copy the rows they need
+        self.host = bool(host) and gpu.on
+        self.R, self.st = [], None
         for i in range(len(rows)):
-            Ri = xp.hstack(blocks[i])
+            Ri = (gpu.pinned(np.hstack([gpu.asnumpy(b_) for b_ in blocks[i]])) if self.host
+                  else xp.hstack(blocks[i]))
             co = offs([b_.shape[1] for b_ in blocks[i]])
             # the block list now points into the block row: A_k is stored once (in place: the caller's list too)
             blocks[i][:] = [Ri[:, co[q]:co[q + 1]] for q in range(len(co) - 1)]
             self.R.append(Ri)
         self.C = [xp.asarray(np.concatenate([np.arange(off[j], off[j + 1]) for j in cols[i]])) for i in range(len(rows))]
+        if self.host:
+            self.st = gpu.Streamer([(Ri,) for Ri in self.R])
+        self.gb = sum(Ri.nbytes for Ri in self.R) / 2 ** 30
 
     def __matmul__(self, Y):
         xp = _xp()
         one = Y.ndim == 1
         Y = Y[:, None] if one else Y
         out = xp.empty((self.N, Y.shape[1]), complex)
-        for i in range(len(self.rows)):
-            out[self.off[i]:self.off[i + 1]] = self.R[i] @ Y[self.C[i]]
+        if self.st is not None:
+            def fn(i, v):
+                out[self.off[i]:self.off[i + 1]] = v[0] @ Y[self.C[i]]
+            self.st.run(fn)
+        else:
+            for i in range(len(self.rows)):
+                out[self.off[i]:self.off[i + 1]] = self.R[i] @ Y[self.C[i]]
         return out[:, 0] if one else out
 
     def dense(self):
         D = _xp().zeros(self.shape, complex)
         for i in range(len(self.rows)):
-            D[self.off[i]:self.off[i + 1], self.C[i]] = self.R[i]
+            D[self.off[i]:self.off[i + 1], self.C[i]] = _xp().asarray(self.R[i])
         return D
 
     def take(self, wr, wc):
@@ -168,13 +233,55 @@ class BlockOp:
             co = offs([self.off[int(j) + 1] - self.off[int(j)] for j in self.cols[i]])
             for q, j in enumerate(self.cols[i]):
                 if int(j) in loc:
-                    D[orow[a_]:orow[a_ + 1], ocol[loc[int(j)]]:ocol[loc[int(j)] + 1]] = self.R[i][:, co[q]:co[q + 1]]
+                    D[orow[a_]:orow[a_ + 1], ocol[loc[int(j)]]:ocol[loc[int(j)] + 1]] = _xp().asarray(
+                        self.R[i][:, co[q]:co[q + 1]])
         return D
 
     def sub(self, w):
         """Dense A_k[w, w] for the sorted block list w, and the offsets of the blocks in it."""
         w = [int(k) for k in w]
         return self.take(w, w), offs([self.off[k + 1] - self.off[k] for k in w])
+
+
+class GalerkinOp:
+    """Level operator without stored blocks (user, 2026-11-19; levels 1 .. --free-levels): A_k = U_k^H A_{k-1} U_k
+    exactly (Galerkin, Sigma included), so A_k @ Y = P_k^H (A_{k-1} (P_k Y)) through the operator of the level below
+    (recursively down to the fine A: 13.8 GB sparse vs ~33 GB of dense A_1 blocks on the 6 nm, where level 1
+    compresses only n / N1 ~ 2; A_2 ~10 GB). Dense pieces (take / sub: windows of the smoother of A_k, block pairs of
+    the next Galerkin product, SlabLU) are assembled on demand from the level-k S, H blocks and the lead Sigma blocks
+    sig1 (level-k coordinates, lead-face blocks only): E S - H - Sigma, the same entries as the stored A_k."""
+
+    def __init__(self, h, L, A0, E, sig1):
+        self.h, self.L, self.A0, self.E, self.sig1 = h, L, A0, E, sig1
+        self.off, self.N = L.off, int(L.off[-1])
+        self.shape = (self.N, self.N)
+        self.rows, self.cols = list(range(len(L.r))), L.nbr
+        self.R, self.blocks, self.host, self.st, self.gb = [], None, False, None, 0.0
+
+    def __matmul__(self, Y):
+        one = Y.ndim == 1
+        Y = Y[:, None] if one else Y
+        out = self.L.PH(self.A0 @ self.L.P(Y))           # A0: the operator of the level below (fine A for k = 1)
+        return out[:, 0] if one else out
+
+    def take(self, wr, wc):
+        h, L = self.h, self.L
+        wr, wc = [int(k) for k in wr], [int(k) for k in wc]
+        D = self.E * h.dense(L, L.Sb, wr, wc)
+        D -= h.dense(L, L.Hb, wr, wc)
+        orow, ocol = offs(L.r[wr]), offs(L.r[wc])
+        lr, lc = {k: q for q, k in enumerate(wr)}, {k: q for q, k in enumerate(wc)}
+        for (i, j), B in self.sig1.items():
+            if i in lr and j in lc:
+                D[orow[lr[i]]:orow[lr[i] + 1], ocol[lc[j]]:ocol[lc[j] + 1]] -= B
+        return D
+
+    def sub(self, w):
+        w = [int(k) for k in w]
+        return self.take(w, w), offs([self.off[k + 1] - self.off[k] for k in w])
+
+    def dense(self):
+        return self.take(self.rows, self.rows)
 
 
 class SlabLU:
@@ -261,10 +368,23 @@ class Hierarchy:
     halo_smooth "same" | "full": windows of the level smoothers (see the module docstring)."""
 
     def __init__(self, dev, inp, sw, l1_cap=None, l1_ramp="dist", l1_lu="c64", l1_solver="rows", batch_gb=24.0,
-                 mem_frac=0.5, halo_smooth="same", log=log):
+                 mem_frac=0.5, halo_smooth="same", host_blocks=False, stream_gb=None, l1_free=False, merge_eig="full",
+                 sketch_prec="c128", log=log):
         assert l1_ramp in ("dist", "plane") and l1_lu in ("c64", "c128") and l1_solver in ("rows", "lu")
-        assert halo_smooth in ("same", "full")
+        assert halo_smooth in ("same", "full") and merge_eig in ("full", "rand", "sketch")
         self.dev, self.inp, self.sw, self.log = dev, inp, sw, log
+        # "rand": dm eigenvectors of the merge windows by the randomized range finder (rho formed); "sketch": rho
+        # Omega from a probe block (one LU + 2 solves per contour point, no window rho), Nystrom (_sketch_batch)
+        self.merge_eig = merge_eig
+        self.sketch_prec = sketch_prec
+        # host_blocks: the S, H Galerkin blocks of every level live in host memory (read only to assemble A_k, the rho
+        # windows and the Galerkin products of the next level); 6 nm y-cut level 1: ~44 GB off the GPU
+        self.host_blocks = bool(host_blocks) and gpu.on
+        # stream_gb: level operators A_k and level smoothers larger than this live in pinned host memory and are
+        # streamed through the GPU at every application (copy overlapped with the GEMMs; None: everything resident)
+        self.stream_gb = stream_gb if gpu.on else None
+        # l1_free: no stored A_1; products through the fine operator, dense pieces from the S1, H1 blocks (GalerkinOp)
+        self.free_levels = int(l1_free)                  # levels 1 .. free_levels without stored A_k (bool: 0 / 1)
         self.memlog = []
         self.xp = xp = _xp()
         self.n = n = dev.n
@@ -339,12 +459,18 @@ class Hierarchy:
                 return sum(nb(v) for v in o)
             return int(getattr(o, "nbytes", 0))
         g = 2 ** 30
-        self.log(f"    mem | held: fine smoother rows {self.sw.rows_gb:.2f}, core index arrays {nb(self.cores_g) / g:.2f}")
+        self.log(f"    mem | held: fine smoother rows {self.sw.rows_gb:.2f}"
+                 + (" (host, streamed)" if getattr(self.sw, "st", None) is not None else "")
+                 + f", core index arrays {nb(self.cores_g) / g:.2f}")
         for k, L in sorted(self.LV.items()):
             sm = getattr(L, "Sbelow", None)
-            self.log(f"    mem | held: level {k} (N {L.N}): U {nb(L.U) / g:.2f}, S {nb(L.Sb) / g:.2f}, H {nb(L.Hb) / g:.2f}, "
+            self.log(f"    mem | held: level {k} (N {L.N}): U {nb(L.U) / g:.2f}, S {nb(L.Sb) / g:.2f}, H {nb(L.Hb) / g:.2f}"
+                     f"{' (host)' if self.host_blocks else ''}, "
                      f"A list {nb(L.Ab) / g + nb(L.A.blocks) / g:.2f}, A operator (block rows) {nb(L.A.R) / g:.2f}"
-                     + (f", smoother of A{k - 1} {sm.gb:.2f}" if sm is not None else ""))
+                     + (" (host, streamed)" if getattr(L.A, "host", False) else "")
+                     + (f" (none: A{k} through the level below)" if isinstance(L.A, GalerkinOp) else "")
+                     + (f", smoother of A{k - 1} {sm.gb:.2f}" + (" (host, streamed)" if getattr(sm, "streamed", False)
+                                                                  else "") if sm is not None else ""))
 
     def memstr(self):
         return f"GPU {gpu.mem_used() / 2 ** 30:.1f} GB" if gpu.on else "cpu"
@@ -397,14 +523,23 @@ class Hierarchy:
             for q, j in enumerate(nbr[i]):
                 s, e = bnd[j], bnd[j + 1]
                 if e == s:
-                    blocks[i][q] = xp.zeros((U[i].shape[1], U[j].shape[1]), complex)
+                    blocks[i][q] = self.keep(xp.zeros((U[i].shape[1], U[j].shape[1]), complex))
                     continue
                 # stable sort: inside the group the rows are still in CSR order -> indptr from row counts, no COO sort
                 ip = np.concatenate([[0], np.cumsum(np.bincount(rr[s:e], minlength=len(cores[i])))])
                 Rij = sp.csr_matrix((vv[s:e], cc[s:e], ip), shape=(len(cores[i]), len(cores[j])))
                 Rg = gpu.csr(Rij, np.complex128) if gpu.on else Rij
-                blocks[i][q] = U[i].conj().T @ (Rg @ U[j])
+                blocks[i][q] = self.keep(U[i].conj().T @ (Rg @ U[j]))
         return blocks
+
+    def streams(self, gb):
+        """True when an operator of gb GB is streamed from pinned host memory instead of kept on the GPU."""
+        return self.stream_gb is not None and gb > self.stream_gb
+
+    def keep(self, B):
+        """An S / H block as it is stored: on the host (pinned: the windows read them back at bus speed) with
+        host_blocks, else unchanged."""
+        return gpu.pinned(B) if self.host_blocks and gpu.on else B
 
     def sigma1(self, U, SL, SR):
         """{(i, j): U_i^H Sigma U_j} for the lead-face cores i, j (level-1 coordinates)."""
@@ -430,7 +565,7 @@ class Hierarchy:
         for i_, i in enumerate(rows):
             for j, Bk in zip(L.nbr[i], blocks[i]):
                 if int(j) in loc:
-                    D[orow[i_]:orow[i_ + 1], ocol[loc[int(j)]]:ocol[loc[int(j)] + 1]] = Bk
+                    D[orow[i_]:orow[i_ + 1], ocol[loc[int(j)]]:ocol[loc[int(j)] + 1]] = self.xp.asarray(Bk)
         return D
 
     @staticmethod
@@ -640,12 +775,12 @@ class Hierarchy:
                 del Vg, V
         return U
 
-    def level1(self, U, E, SL, SR):
-        """Level 1 at the energy E from the block bases U (drops every level of the previous energy)."""
+    def level1(self, U, E, SL, SR, A0=None):
+        """Level 1 at the energy E from the block bases U (drops every level of the previous energy). With l1_free and
+        the fine operator A0: no stored A_1 (GalerkinOp)."""
         t = time.time()
         xp, dev, nw, nbr = self.xp, self.dev, self.nw, self.nbr
-        self.LV = {}
-        gpu.free()
+        self.free()
         L = Lev()
         L.k, L.parent, L.kids, L.U = 1, None, None, U
         L.r = np.array([u.shape[1] for u in U])
@@ -657,11 +792,20 @@ class Hierarchy:
         self.mem("level 1: block bases U")
         L.Sb, L.Hb = self.core_blocks(dev.S, U), self.core_blocks(dev.H, U)
         self.mem("level 1: S, H blocks")
-        L.Ab = [[E * s__ - h for s__, h in zip(L.Sb[i], L.Hb[i])] for i in range(nw)]
-        for (i, j), Bk in self.sigma1(U, SL, SR).items():
-            L.Ab[i][self.pos[i][j]] = L.Ab[i][self.pos[i][j]] - Bk
-        L.A = BlockOp(L.off, list(range(nw)), nbr, L.Ab)
-        self.mem("level 1: A blocks")
+        L.E = E
+        free = self.free_levels >= 1 and A0 is not None
+        host = not free and self.streams(sum(int(L.r[i]) * int(L.r[j]) for i in range(nw) for j in nbr[i]) * 16 / 2 ** 30)
+        if free:
+            L.Ab, sig1 = None, self.sigma1(U, SL, SR)
+        else:
+            if host:                                                # A1 assembled block by block on the host
+                L.Ab = [[E * gpu.asnumpy(s__) - gpu.asnumpy(h) for s__, h in zip(L.Sb[i], L.Hb[i])] for i in range(nw)]
+            else:
+                L.Ab = [[xp.asarray(E * s__ - h) for s__, h in zip(L.Sb[i], L.Hb[i])] for i in range(nw)]
+            for (i, j), Bk in self.sigma1(U, SL, SR).items():
+                L.Ab[i][self.pos[i][j]] = L.Ab[i][self.pos[i][j]] - (gpu.asnumpy(Bk) if host else Bk)
+            L.A = BlockOp(L.off, list(range(nw)), nbr, L.Ab, host=host)
+            self.mem("level 1: A blocks")
         cores_g = self.cores_g
         n = self.n
 
@@ -672,6 +816,9 @@ class Hierarchy:
             return y
         L.P = P
         L.PH = lambda r: xp.concatenate([U[k].conj().T @ xp.asarray(r)[cores_g[k]] for k in range(nw)])
+        if free:
+            L.A = GalerkinOp(self, L, A0, E, sig1)
+            self.mem("level 1: A1 through the fine operator (no blocks)")
         self.LV = {1: L}
         gb = sum(int(L.r[i]) * int(L.r[j]) for i in range(nw) for j in nbr[i]) * 16 / 2 ** 30
         L.info = dict(level=1, blocks=nw, N=L.N, per_block=L.r.tolist(), A_gb=gb)
@@ -688,7 +835,9 @@ class Hierarchy:
         for i in range(len(L.r)):
             for q, j in enumerate(L.nbr[i]):
                 key = (-1, False) if j == i else (int(abs(ix[i] - ix[j])), bool(iy[i] != iy[j]))
-                grp.setdefault(key, []).append((nrm2(L.Ab[i][q]), nrm2(L.Sb[i][q])))
+                grp.setdefault(key, []).append((nrm2(self.xp.asarray(L.Ab[i][q]) if L.Ab is not None else
+                                                   L.E * self.xp.asarray(L.Sb[i][q]) - self.xp.asarray(L.Hb[i][q])),
+                                              nrm2(self.xp.asarray(L.Sb[i][q]))))
         off = [np.median([v[0] for v in g]) for k, g in grp.items() if k[0] >= 0]
         ref = max(off) if off and max(off) > 0 else 1.0
         self.log(f"  level {L.k} coupling blocks by distance (2-norm, median / max over the blocks; A{L.k} relative to "
@@ -711,6 +860,9 @@ class Hierarchy:
         n_window^2 for the LU; the same correction, since RAS discards the other rows)."""
         xp, cdt = self.xp, self.cdt
         ops, sizes, gb = [], [], 0.0
+        nb_ = lambda ks: int(sum(L.off[k + 1] - L.off[k] for k in ks))
+        est = sum(nb_(wr) * nb_(w) for w, wr in zip(wins, writes)) * np.dtype(cdt).itemsize / 2 ** 30
+        stream = self.l1_solver == "rows" and self.streams(est)    # core rows to pinned host memory window by window
         for c, w in enumerate(wins):
             Aw, o = L.A.sub(np.asarray(w))
             Cw = self.cap_of(L, w)
@@ -729,8 +881,9 @@ class Hierarchy:
                 Ek[pos_, xp.arange(len(pos_))] = 1
                 Ri = xp.ascontiguousarray(gpu.lu_solve(lu, Ek, trans=2).conj().T)
                 del lu, Ek
-                ops.append((rw, None, out, Ri))
                 gb += Ri.nbytes / 2 ** 30
+                ops.append((rw, None, out, gpu.pinned(Ri) if stream else Ri))
+                del Ri
             else:
                 ops.append((rw, pos_, out, gpu.lu_factor(Aw)))
                 gb += int(o[-1]) ** 2 * self.lub / 2 ** 30
@@ -738,13 +891,106 @@ class Hierarchy:
             sizes.append(int(o[-1]))
             gpu.free()
 
+        st = gpu.Streamer([(op,) for _, _, _, op in ops]) if stream else None
+
         def Sm(r):
             y = xp.zeros_like(r)
+            if st is not None:
+                def fn(c, v):
+                    rw, _, out, _ = ops[c]
+                    y[out] = v[0] @ r[rw].astype(cdt)
+                st.run(fn)
+                return y
             for rw, pos_, out, op in ops:
                 y[out] = op @ r[rw].astype(cdt) if pos_ is None else gpu.lu_solve(op, r[rw].astype(cdt))[pos_]
             return y
-        Sm.sizes, Sm.gb = sizes, gb
+        Sm.sizes, Sm.gb, Sm.streamed = sizes, gb, stream
         return Sm
+
+    def _sketch_batch(self, ks, dat, isl, sf, zs, dzs, U1, rows_of, cut, kind, Nn, tr, bt, f=0.5, fill=0.75,
+                      host_frac=0.6):
+        """Bases of the windows ks from a probe block, without the window rho (as msbasis tile sketch): per contour
+        point one LU of the window pencil M(z) and two solves, Y = rho Omega = -(1/pi) (acc - acc^H) Omega / 2i with
+        acc Omega = sum dz M^-1 Omega, acc^H Omega = sum conj(dz) M^-H Omega; Nystrom rho ~ F F^H, F = Y (Omega^H Y)^-1/2
+        (pseudo-inverse square root of the Hermitian core); X, lam = left singular vectors, squares of F. Probes:
+        1.5 x the pair rows + 64 at first, more probe columns (another contour pass for them only) until the number of
+        Nystrom occupations above f * cut is at most fill x the probes, or the probes span the window (exact).
+        Probes above host_frac x n: the Nystrom eigh and SVD on the host (the GPU workspace of a 13k eigh is ~29 GB).
+        self.sketch_prec "c64": pencil, LU, probes and solves in complex64; "lu64": pencil and LU in complex128, the LU
+        factors down-cast to complex64, probes and solves in complex64 (accumulated and Nystrom always in complex128)."""
+        xp = self.xp
+        dt = complex if self.sketch_prec == "c128" else np.complex64
+        n = {c: dat[c][0].shape[0] for c in ks}
+        s_ = {c: min(n[c], int(1.5 * len(rows_of[c])) + 64) for c in ks}
+        Om = {c: xp.zeros((n[c], 0), complex) for c in ks}
+        Y = {c: xp.zeros((n[c], 0), complex) for c in ks}
+        active, rnd, nhost = list(ks), 0, [0]
+        while active:
+            new = {}
+            for c in active:
+                m = s_[c] - Om[c].shape[1]
+                rs = xp.random.RandomState(1000 * c + rnd)
+                O = ((rs.standard_normal((n[c], m)) + 1j * rs.standard_normal((n[c], m))) / np.sqrt(2)).astype(dt)
+                new[c] = [O, xp.zeros((n[c], m), complex), xp.zeros((n[c], m), complex)]
+            lead = any(isl[c] for c in active)
+            for z, dz in zip(zs, dzs):
+                sg = self.sigma1(U1, *self.dev.sigma(z)) if lead else {}
+                for c in active:
+                    M = z * dat[c][0] + dat[c][1]
+                    if isl[c]:
+                        M -= self.sig_of(sf[c], sg)
+                    lu = gpu.lu_factor(M if self.sketch_prec == "lu64" else M.astype(dt, copy=False))
+                    del M
+                    if self.sketch_prec == "lu64":
+                        lu = (lu[0].astype(dt), lu[1])
+                    new[c][1] += dz * gpu.lu_solve(lu, new[c][0])
+                    new[c][2] += np.conj(dz) * gpu.lu_solve(lu, new[c][0], trans=2)
+                    del lu
+                del sg
+                gpu.free()
+            self.mem(f"{bt}: contour round {rnd + 1} ({len(zs)} LUs, 2 solves per window)")
+            done = []
+            for c in active:
+                O, a, ah = new.pop(c)
+                Om[c] = xp.concatenate([Om[c], O.astype(complex)], axis=1)
+                Y[c] = xp.concatenate([Y[c], -((a - ah) / 2j) / np.pi], axis=1)
+                del O, a, ah
+                C = Om[c].conj().T @ Y[c]
+                C = 0.5 * (C + C.conj().T)
+                if gpu.on and s_[c] > host_frac * n[c]:          # the dense eigh / SVD workspace (~11 s^2) on the host
+                    d, V = np.linalg.eigh(gpu.asnumpy(C))
+                    ok = d > 1e-10 * d.max()
+                    F = gpu.asnumpy(Y[c]) @ (V[:, ok] / np.sqrt(d[ok]))
+                    X, sv, _ = np.linalg.svd(F, full_matrices=False)
+                    F, X, sv = xp.asarray(F), xp.asarray(X), xp.asarray(sv)
+                    nhost[0] += 1
+                else:
+                    d, V = xp.linalg.eigh(C)
+                    ok = d > 1e-10 * d.max()
+                    F = Y[c] @ (V[:, ok] / xp.sqrt(d[ok]))
+                    X, sv, _ = xp.linalg.svd(F, full_matrices=False)
+                lam = sv ** 2
+                nb = int((lam > f * cut).sum())
+                if nb <= fill * s_[c] or s_[c] >= n[c]:
+                    rows = rows_of[c]
+                    k = int((lam > cut).sum())
+                    if kind == "dm":
+                        u, sr, _ = xp.linalg.svd(X[rows][:, :k], full_matrices=False)
+                        Nn.U[c] = xp.ascontiguousarray(u[:, :int((sr > 1e-8 * sr[0]).sum())] if k else u[:, :0])
+                    else:                                            # dmc: rho_cc ~ F_c F_c^H
+                        u, sr, _ = xp.linalg.svd(F[rows], full_matrices=False)
+                        Nn.U[c] = xp.ascontiguousarray(u[:, sr ** 2 > cut])
+                    tr[c] = float(xp.linalg.norm(F[rows]) ** 2)
+                    EIG_STATS.append((n[c], s_[c], k, rnd + 1, s_[c] >= n[c]))
+                    done.append(c)
+                    Om[c] = Y[c] = dat[c] = None
+                else:
+                    s_[c] = min(n[c], max(2 * s_[c], int(nb / fill) + 64))
+                del C, d, V, F, X, sv, lam
+                gpu.free()
+            active = [c for c in active if c not in done]
+            rnd += 1
+        self.mem(f"{bt}: block bases from the sketch" + (f" ({nhost[0]} Nystrom steps on the host)" if nhost[0] else ""))
 
     def merge(self, axis, cut, kind, mu1, mu2, npts, halo=None, bkey=None):
         """Append level k + 1 = pairs of blocks of the deepest level L along axis ("x" | "y"); also the smoother of
@@ -799,8 +1045,11 @@ class Hierarchy:
             # per window of a batch: S_w, K_w, accumulator stay (3 n^2); the pencil and its inverse are transient (the
             # largest window once: + 3 n^2 with the LU workspace)
             lim = min(self.batch_gb, self.mem_frac * self.gpu_free_gb()) - 3 * nwin.max() ** 2 * 16 / 2 ** 30
+            # sketch: S_w, K_w + probes, rho Omega and the two solve accumulators of a round (up to 4 n^2 when the
+            # probes span the window): 6 n^2 per window
+            per = 6 if self.merge_eig == "sketch" else 3
             for c in order:
-                m = 3 * nwin[c] ** 2 * 16 / 2 ** 30
+                m = per * nwin[c] ** 2 * 16 / 2 ** 30
                 if cur and m_ + m > lim:
                     batches.append(cur)
                     cur, m_ = [], 0.0
@@ -808,6 +1057,7 @@ class Hierarchy:
                 m_ += m
             batches.append(cur)
             Nn.U, tr = [None] * nc, np.zeros(nc)
+            EIG_STATS.clear()
             U1 = self.LV[1].U
             self.mem(f"{lv}: start of the {axis} merge")
             for bi, ks in enumerate(batches):
@@ -820,12 +1070,23 @@ class Hierarchy:
                     if Cw is not None:
                         Kw += Cw
                     del Cw
-                    dat[c] = [self.dense(L, L.Sb, w, w), Kw, xp.zeros((nwin[c],) * 2, complex)]
+                    dat[c] = [self.dense(L, L.Sb, w, w), Kw,
+                              None if self.merge_eig == "sketch" else xp.zeros((nwin[c],) * 2, complex)]
                 self.mem(f"{bt}: S, K, accumulator of {len(ks)} windows")
                 lead = any(isl[c] for c in ks)
                 sf = {c: self.sig_factor(L, win[c]) for c in ks if isl[c]}
                 if sf:
                     self.mem(f"{bt}: lead Sigma factors of {len(sf)} windows")
+                rows_of = {}
+                for c in ks:
+                    w = win[c]
+                    o = offs(L.r[w])
+                    loc = {int(k): q for q, k in enumerate(w)}
+                    rows_of[c] = xp.asarray(np.concatenate([np.arange(o[loc[k]], o[loc[k] + 1]) for k in Nn.kids[c]]))
+                if self.merge_eig == "sketch":
+                    self._sketch_batch(ks, dat, isl, sf, zs, dzs, U1, rows_of, cut, kind, Nn, tr, bt)
+                    del sf, dat
+                    continue
                 for z, dz in zip(zs, dzs):
                     sg = self.sigma1(U1, *self.dev.sigma(z)) if lead else {}
                     for c in ks:
@@ -841,27 +1102,54 @@ class Hierarchy:
                 del sf
                 self.mem(f"{bt}: contour ({npts} inversions per window)")
                 for c in ks:
-                    w = win[c]
-                    o = offs(L.r[w])
-                    loc = {int(k): q for q, k in enumerate(w)}
-                    rows = xp.asarray(np.concatenate([np.arange(o[loc[k]], o[loc[k] + 1]) for k in Nn.kids[c]]))
+                    rows = rows_of[c]
                     rho = rho_of(dat[c][2])
                     dat[c] = None
-                    Nn.U[c] = select(rho, rows, cut, kind)
+                    Nn.U[c] = select(rho, rows, cut, kind, self.merge_eig)
                     tr[c] = float(xp.real(xp.trace(rho[rows][:, rows])))
                     del rho
                     gpu.free()
                 self.mem(f"{bt}: block bases from rho")
             self.basis_put(bkey, Nn.k, Nn.U, tr)
         t_rho = time.time() - t0
+        eigs = ""
+        if self.merge_eig != "full" and EIG_STATS:
+            st = np.array(EIG_STATS, float)
+            eigs = (f"; {self.merge_eig}{' ' + self.sketch_prec if self.merge_eig == 'sketch' and self.sketch_prec != 'c128' else ''} eig: window n {int(st[:, 0].min())}..{int(np.median(st[:, 0]))}..{int(st[:, 0].max())}, "
+                    f"subspace l {int(st[:, 1].min())}..{int(np.median(st[:, 1]))}..{int(st[:, 1].max())}, "
+                    f"k > cut {int(st[:, 2].min())}..{int(np.median(st[:, 2]))}..{int(st[:, 2].max())}, rounds "
+                    f"{int(st[:, 3].max())} max, " + ("probes = window" if self.merge_eig == "sketch" else "dense fallback")
+                    + f" {int(st[:, 4].sum())} of {len(st)}")
+            EIG_STATS.clear()
         Nn.r = np.array([u.shape[1] for u in Nn.U])
         Nn.off = offs(Nn.r)
         Nn.N = int(Nn.off[-1])
-        gal = lambda X: [[Nn.U[c].conj().T @ (self.dense(L, X, Nn.kids[c], Nn.kids[c2]) @ Nn.U[c2]) for c2 in Nn.nbr[c]]
-                         for c in range(nc)]
-        Nn.Sb, Nn.Hb, Nn.Ab = gal(L.Sb), gal(L.Hb), gal(L.Ab)
-        Nn.A = BlockOp(Nn.off, list(range(nc)), Nn.nbr, Nn.Ab)
-        self.mem(f"{lv}: Galerkin S, H, A blocks")
+        gal = lambda X, f=lambda B: B: [[f(Nn.U[c].conj().T @ (self.dense(L, X, Nn.kids[c], Nn.kids[c2]) @ Nn.U[c2]))
+                                         for c2 in Nn.nbr[c]] for c in range(nc)]
+        Nn.Sb, Nn.Hb = gal(L.Sb, self.keep), gal(L.Hb, self.keep)
+        Nn.E = L.E
+        nfree = Nn.k <= self.free_levels and isinstance(L.A, GalerkinOp)
+        if nfree:                                            # no A_k blocks: Sigma of the lead blocks only
+            Nn.Ab, Nn.A = None, None
+            sigN = {}
+            sg = L.A.sig1
+            lb = {c for c in range(nc) for (i, j) in sg if i in Nn.kids[c] or j in Nn.kids[c]}
+            for c in lb:
+                for c2 in lb:
+                    if any(i in Nn.kids[c] and j in Nn.kids[c2] for (i, j) in sg):
+                        ro, co = offs(L.r[list(Nn.kids[c])]), offs(L.r[list(Nn.kids[c2])])
+                        M = xp.zeros((ro[-1], co[-1]), complex)
+                        for (i, j), B in sg.items():
+                            if i in Nn.kids[c] and j in Nn.kids[c2]:
+                                a_, b_ = Nn.kids[c].index(i), Nn.kids[c2].index(j)
+                                M[ro[a_]:ro[a_ + 1], co[b_]:co[b_ + 1]] = B
+                        sigN[(c, c2)] = Nn.U[c].conj().T @ (M @ Nn.U[c2])
+        else:
+            Nn.Ab = [[Nn.U[c].conj().T @ (L.A.take(Nn.kids[c], Nn.kids[c2]) @ Nn.U[c2]) for c2 in Nn.nbr[c]]   # = gal(L.Ab)
+                     for c in range(nc)]
+            Nn.A = BlockOp(Nn.off, list(range(nc)), Nn.nbr, Nn.Ab,
+                           host=self.streams(sum(int(Nn.r[i]) * int(Nn.r[j]) for i in range(nc) for j in Nn.nbr[i]) * 16 / 2 ** 30))
+        self.mem(f"{lv}: Galerkin S, H" + (" (A free)" if nfree else ", A blocks"))
         rows1 = [xp.asarray(np.concatenate([np.arange(L.off[k], L.off[k + 1]) for k in ks])) for ks in Nn.kids]
 
         def P(c2):
@@ -871,11 +1159,15 @@ class Hierarchy:
             return y
         Nn.P = P
         Nn.PH = lambda r1: xp.concatenate([Nn.U[c].conj().T @ r1[rows1[c]] for c in range(nc)])
+        if nfree:
+            Nn.A = GalerkinOp(self, Nn, L.A, Nn.E, sigN)
         t = time.time()
         # the level below is complete: its S, H blocks and the block list of A are not needed again (L.A keeps the
         # block rows for the matvec, dense() and sub()). Freed before the smoother of L.A is built: 3 x the size of
         # A_L less at the memory peak (21600a y-cut: 33 GB, out of memory on a GH200 otherwise)
-        L.Sb = L.Hb = L.Ab = L.A.blocks = None
+        if not isinstance(L.A, GalerkinOp):                  # a free A_1 keeps reading S1, H1 (smoother, SlabLU)
+            L.Sb = L.Hb = None
+        L.Ab = L.A.blocks = None
         gpu.free()
         self.mem(f"{lv}: S, H blocks and the A block list of level {L.k} freed")
         Nn.Sbelow = self.ras(L, wsm, Nn.kids)                # smoother of L.A formed with the blocks of this level
@@ -892,7 +1184,7 @@ class Hierarchy:
             f"columns; smoother of A{L.k} (halo {allh(hs)}): {nsm.min()}..{int(np.median(nsm))}..{nsm.max()} columns, "
             f"{self.l1_solver} {Nn.Sbelow.gb:.2f} GB (LUs {(nsm.astype(float) ** 2).sum() * self.lub / 2 ** 30:.2f} GB); "
             f"A{Nn.k} {gb:.2f} GB; trace per block {tr.min():.1f}..{np.median(tr):.1f}..{tr.max():.1f}; rho "
-            + (f"{t_rho:.0f} s in {len(batches)} batches" if batches else f"from the store ({t_rho:.0f} s)") + f", smoother {time.time() - t:.0f} s; {self.memstr()}")
+            + (f"{t_rho:.0f} s in {len(batches)} batches" if batches else f"from the store ({t_rho:.0f} s)") + eigs + f", smoother {time.time() - t:.0f} s; {self.memstr()}")
         Nn.info = dict(level=Nn.k, axis=axis, kind=kind, cut=cut, window=[mu1, mu2], npts=int(npts), blocks=nc,
                        N=Nn.N, per_block=Nn.r.tolist(), halo_max=hmax, halo_rho=hu, halo_smoother=hs,
                        rho_windows=nwin.tolist(), smoother_windows=nsm.tolist(), smoother_gb=Nn.Sbelow.gb, A_gb=gb,
@@ -929,7 +1221,13 @@ class Hierarchy:
         return gcycle(A0, S0, tm, gamma), tm
 
     def free(self):
+        """Drop every level. Lev objects are reference cycles (L.P / L.PH close over L): clear them and collect, else
+        the previous energy's levels stay on the GPU until the cyclic GC runs (21600a y-cut sweep: ~35 GB held into
+        the next energy, 0.4 GB free at its level-2 Galerkin step)."""
+        for L in self.LV.values():
+            L.__dict__.clear()
         self.LV = {}
+        gc.collect()
         gpu.free()
 
 
@@ -1000,6 +1298,22 @@ def main(argv=None):
     p.add_argument("--mem-frac", type=float, default=0.5, help="window accumulators of one rho batch: at most this "
                                                                 "fraction of the free GPU memory (and --batch-gb)")
     p.add_argument("--batch-gb", type=float, default=24.0)
+    p.add_argument("--stream-gb", type=float, default=None, help="operators larger than this [GB] (fine A, fine "
+                   "smoother rows, level operators A_k, level smoothers) live in pinned host memory and are streamed "
+                   "through the GPU at every application, copy overlapped with compute (0: all; default: none)")
+    p.add_argument("--l1-free", action="store_true", help="no stored level-1 operator A1: A1 @ y = P^H A P y through "
+                   "the fine operator, windows from the S1, H1 blocks (6 nm: ~33 GB of A1 blocks; implies --host-blocks)")
+    p.add_argument("--free-levels", type=int, default=0, help="levels 1 .. K without stored A_k (A_k @ y = P^H A_{k-1} "
+                   "P y, recursively; --l1-free = 1; implies --host-blocks)")
+    p.add_argument("--host-blocks", action="store_true", help="S, H Galerkin blocks of every level in host memory "
+                   "(GPU memory of the level-1 S, H blocks: 22 GB on the 21600a y-cut, ~44 GB on the 6 nm y-cut)")
+    p.add_argument("--merge-eig", default="full", choices=["full", "rand", "sketch"], help="bases of the merges: "
+                   "dense eigh of the window rho; rand: randomized range finder on the formed rho (n x l memory; dense "
+                   "host eigh past 0.6 n); sketch: rho Omega of a probe block directly from the contour (one LU and two "
+                   "solves per point instead of the inverse), Nystrom, probes grown until they resolve the cut")
+    p.add_argument("--sketch-prec", default="c128", choices=["c128", "c64", "lu64"], help="--merge-eig sketch: "
+                   "c64: pencil LU, probes and solves in complex64; lu64: LU in complex128, factors down-cast to "
+                   "complex64 for the solves (accumulation and Nystrom in complex128)")
     p.add_argument("--sweep", default="fine,exact,top")
     p.add_argument("--counts", default="32,128,256", help="top-level sizes (multiples of the slow m)")
     p.add_argument("--slow", default="32,3", help="slow modes per round m, subspace steps q")
@@ -1020,6 +1334,8 @@ def main(argv=None):
     p.add_argument("--threads", type=int, default=8, help="CPU matvec threads")
     p.add_argument("--out", help="json with the level sizes and the iteration counts (merged across runs)")
     a = p.parse_args(argv)
+    a.free_levels = max(a.free_levels, int(a.l1_free))
+    a.host_blocks = a.host_blocks or a.free_levels > 0
     if a.gpu:
         gpu.enable()
     else:
@@ -1044,10 +1360,11 @@ def main(argv=None):
     split = [int(v) for v in a.cap_split.split(",")] if a.cap_split else None
     log(f"{name}: device {n} orbitals, slabs {dev.ns}; Ec {Ec:.4f} eV")
     sw = CapSchwarz(dev, inp, w_, s_, d_, spacing=a.cap_spacing, solver=a.cap_solver, workers=a.workers, split=split,
-                    tov=a.cap_tov)
+                    tov=a.cap_tov, stream_gb=a.stream_gb)
     h = Hierarchy(dev, inp, sw, l1_cap=tuple(float(v) for v in a.l1_cap.split(",")) if a.l1_cap else None,
                   l1_ramp=a.l1_ramp, l1_lu=a.l1_lu, l1_solver=a.l1_solver, batch_gb=a.batch_gb, mem_frac=a.mem_frac,
-                  halo_smooth=a.halo_smooth)
+                  halo_smooth=a.halo_smooth, host_blocks=a.host_blocks, stream_gb=a.stream_gb, l1_free=a.free_levels,
+                  merge_eig=a.merge_eig, sketch_prec=a.sketch_prec)
     sweeps = a.sweep.split(",")
     counts = [int(v) for v in a.counts.split(",")]
     sm, sq = (int(v) for v in a.slow.split(","))
@@ -1062,7 +1379,9 @@ def main(argv=None):
     s1_, d1_ = h.s1, h.d1
     keys, chain = [], f"{name}|{tag}|l1 {a.l1}|cap {s1_:g},{d1_:g},{a.l1_ramp}"
     for axis, cut, m1, m2, npts, halo in ups:                    # key of each level = everything its rho depends on
-        chain += f"|{axis}:{cut:g}:{m1:g}:{m2:g}:{npts or a.npts}:h{'all' if halo is None else halo}"
+        chain += (f"|{axis}:{cut:g}:{m1:g}:{m2:g}:{npts or a.npts}:h{'all' if halo is None else halo}"
+                  + ("" if a.merge_eig == "full" else f"|eig {a.merge_eig}")
+                  + (f"|{a.sketch_prec}" if a.merge_eig == "sketch" and a.sketch_prec != "c128" else ""))
         keys.append(chain if a.basis_cache != "none" else None)
     DM = U1 = None
     for dE in (float(v) for v in a.dE.split(",")):
@@ -1073,7 +1392,8 @@ def main(argv=None):
         b[dev.bL] = B
         nsel = min(a.ncol, b.shape[1]) if a.ncol else b.shape[1]
         A = dev.A(E, SL, SR).tocsr()
-        Aop = operator(A) if gpu.on else operator(A, a.threads)
+        # the fine operator also carries every A1 product with --l1-free (5 uses per outer iteration): kept resident
+        Aop = (operator(A, stream_gb=None if a.free_levels else a.stream_gb) if gpu.on else operator(A, a.threads))
         GR = xp.asarray(1j * (SR - SR.conj().T))
         bR = xp.asarray(dev.bR)
         Tof = lambda y: float(xp.real(xp.einsum("ic,ij,jc->", y[bR].conj(), GR, y[bR])))
@@ -1140,7 +1460,7 @@ def main(argv=None):
         if U1 is None:
             U1 = h.basis1(DM, kind, cut1)                         # energy independent: built once
         tb = time.time()
-        h.level1(U1, E, SL, SR)
+        h.level1(U1, E, SL, SR, A0=Aop)
         for (axis, cut, m1, m2, npts, halo), key in zip(ups, keys):
             h.merge(axis, cut, kind, Ec + m1, Ec + m2, npts or a.npts, halo, key)
         rec["t_levels"] = time.time() - tb
@@ -1196,6 +1516,9 @@ def main(argv=None):
             del own
         h.free()
         sw.free()
+        del X, bg, GR, Aop, A, S0, A0
+        gc.collect()
+        gpu.free()
         if a.out:
             os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
             res = json.load(open(a.out)) if os.path.exists(a.out) else {"E": {}}

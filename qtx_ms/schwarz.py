@@ -107,8 +107,9 @@ class CapSchwarz:
     outer d Å of that shell (the lead faces are real boundaries and keep Sigma)."""
 
     def __init__(self, dev, inp, width=16.0, s=2.0, d=3.0, spacing=None, solver="dense", dE0=0.0, centres="all",
-                 workers=1, split=None, tov=2.5, tile_orbs=2500, xsplit=1, tile_cut=""):
+                 workers=1, split=None, tov=2.5, tile_orbs=2500, xsplit=1, tile_cut="", stream_gb=None):
         ax = inp["meta"]["axis"]
+        self.stream_gb, self.st = stream_gb, None     # rows solvers on the GPU: core rows in pinned host memory, streamed
         atom = np.repeat(np.arange(len(inp["norb"])), inp["norb"])
         self.x = x = inp["xyz"][atom[dev.dev], ax]
         if centres == "tile":
@@ -234,6 +235,8 @@ class CapSchwarz:
                                                sla.lu_solve(lu, Ek, trans=2, check_finite=False)).conj().T)
                     del lu, Ek
                     self.rows_gb += Ri.nbytes / 2 ** 30
+                    if stream:                                     # to pinned host memory at once: never all on the GPU
+                        return gpu.pinned(Ri), time.time() - t
                     op = (lambda Ri, dt: lambda rj: (Ri @ rj.astype(dt)).astype(complex))(Ri, dt)
                 elif self.gpu:
                     op = (lambda lu, dt: lambda rj: gpu.lu_solve(lu, rj.astype(dt)).astype(complex))(lu, dt)
@@ -242,20 +245,35 @@ class CapSchwarz:
             return op, time.time() - t
         t = time.time()
         ks = range(len(self.idx))
-        self.ops, self.rows_gb = None, 0.0                         # drop the factors of the previous energy first
+        rows_est = sum(int(c.sum()) * len(i) for i, c in zip(self.idx, self.core)) * (8 if self.solver == "rows64" else 16)
+        stream = bool(self.gpu and self.rows and self.stream_gb is not None and rows_est / 2 ** 30 > self.stream_gb)
+        if self.st is not None:
+            self.st.free()
+        self.ops, self.st, self.rows_gb = None, None, 0.0          # drop the factors of the previous energy first
         if self.gpu:
             gpu.free()
         out = list(self.pool.map(factor, ks) if self.pool else map(factor, ks))
         self.ops, self.tfac = [o for o, _ in out], [t for _, t in out]
+        if stream:
+            self.st, self.ops = gpu.Streamer([(R,) for R in self.ops]), None
         self.twall = time.time() - t
         log(f"  factor {self.solver}: wall {self.twall:.1f} s, per window (" +
             ", ".join(f"{len(i)}: {t:.1f}" for i, t in zip(self.idx, self.tfac)) + ")"
             + (f"; core rows {self.rows_gb:.1f} GB (LUs would be "
                f"{sum(len(i) ** 2 for i in self.idx) * (8 if self.solver == 'rows64' else 16) / 2**30:.1f} GB)"
-               if self.rows else ""))
+               if self.rows else "") + (", streamed from pinned host memory" if stream else ""))
         self.ndefl = [0]
 
     def __call__(self, r):
+        if self.st is not None:                                   # streamed core rows: one GEMM per window
+            r = gpu.cp.asarray(r)
+            z = gpu.cp.zeros_like(r)
+            dt = np.complex64 if self.solver == "rows64" else complex
+
+            def fn(k, v):
+                z[self.dout[k]] = (v[0] @ r[self.didx[k]].astype(dt)).astype(complex)
+            self.st.run(fn)
+            return z
         if self.gpu:                                              # r: cupy (host arrays are moved), result cupy
             r = gpu.cp.asarray(r)
             z = gpu.cp.zeros_like(r)
@@ -272,6 +290,9 @@ class CapSchwarz:
 
     def free(self):
         self.ops = None
+        if self.st is not None:
+            self.st.free()
+            self.st = None
         gpu.free()
 
 
@@ -286,8 +307,47 @@ class GpuOp:
         return self.A @ gpu.cp.asarray(X, dtype=complex)
 
 
-def operator(A, threads=4):
-    """FastOp on the CPU, GpuOp in GPU mode (twin of the release schwarz.operator)."""
+class StreamOp:
+    """A @ X on the GPU with A in pinned host memory: row batches of `batch_gb` (CSR data / indices / indptr), streamed
+    with the copy of batch k + 1 overlapped with the SpMM of batch k (gpu.Streamer). Device memory: 2 batches."""
+
+    def __init__(self, A, batch_gb=1.0):
+        A = sp.csr_matrix(A).astype(np.complex128)
+        self.shape, n = A.shape, A.shape[0]
+        per_row = np.diff(A.indptr) * 20.0                        # bytes per row: complex128 data + int32 index
+        cum = np.concatenate([[0], np.cumsum(per_row)])
+        cuts = np.unique(np.concatenate([np.searchsorted(cum, np.arange(0, cum[-1], batch_gb * 2 ** 30)), [n]]))
+        cuts = cuts[cuts > 0] if cuts[0] == 0 else cuts
+        self.rows = list(zip(np.concatenate([[0], cuts[:-1]]), cuts))
+        items = []
+        for a, b in self.rows:
+            B = A[a:b]
+            items.append((gpu.pinned(B.data), gpu.pinned(B.indices.astype(np.int32)),
+                          gpu.pinned(B.indptr.astype(np.int32))))
+        self.st = gpu.Streamer(items)
+        self.gb = self.st.nbytes / 2 ** 30
+
+    def __matmul__(self, X):
+        import cupyx.scipy.sparse as csp
+        cp = gpu.cp
+        X = cp.asarray(X, dtype=complex)
+        one = X.ndim == 1
+        X2 = X[:, None] if one else X
+        Y = cp.empty((self.shape[0], X2.shape[1]), complex)
+
+        def fn(k, v):
+            a, b = self.rows[k]
+            M = csp.csr_matrix((v[0], v[1], v[2]), shape=(b - a, self.shape[1]), copy=False)
+            Y[a:b] = M @ X2
+        self.st.run(fn)
+        return Y[:, 0] if one else Y
+
+
+def operator(A, threads=4, stream_gb=None):
+    """FastOp on the CPU, GpuOp in GPU mode (twin of the release schwarz.operator); StreamOp when the CSR (complex128
+    data + int32 indices) is larger than stream_gb GB."""
+    if gpu.on and stream_gb is not None and sp.csr_matrix(A).nnz * 20 / 2 ** 30 > stream_gb:
+        return StreamOp(A)
     return GpuOp(A) if gpu.on else FastOp(A, threads)
 
 

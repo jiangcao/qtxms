@@ -219,3 +219,56 @@
 # S_P^-1 into the accumulator; check: results_ms/gpu/ms_ycut/check_lean_rho.sh, 2808a block 1 = cached block to 1.3e-8).
 # The 6 nm wrapper was stopped (python 2336043 keeps running); queue (attelas2):
 #   setsid nohup results_ms/gpu/ms_ycut/queue_12nm.sh 2336043 >> results_ms/gpu/ms_ycut/run.out 2>&1 &
+# 2026-11-18 12 nm with the own spectral OBC (obc_beyn, Woodbury, lean) + Sigma pre-pass (attelas2, 13:07):
+#   DEVS=12nm PART=tile NY_12nm=2 XARGS="--obc beyn --sigma-pass" setsid nohup workflows/run_ms_ycut.sh > results_ms/gpu/ms_ycut/run_12nm_beyn.out 2>&1 &
+#   setsid nohup results_ms/gpu/ms_ycut/fallback_12nm_4y.sh <pid> >> results_ms/gpu/ms_ycut/run_12nm_beyn.out 2>&1 &   # tile4y if tile2y OOMs
+#   setsid nohup results_ms/gpu/ms_ycut/queue_12nm_exactT.sh >> results_ms/gpu/ms_ycut/run_12nm_exactT.out 2>&1 &      # exact T (--exact-T) after the MS run
+#   setsid nohup results_ms/gpu/ms_ycut/run_12nm_exactT_odd.sh >> results_ms/gpu/ms_ycut/run_12nm_exactT.out 2>&1 &   # 2026-11-18 19:40: exact T at the 25 odd 10 meV energies (0.13, 0.17 first)
+#   .venv/bin/python results_ms/gpu/ms_ycut/plot_T_6nm_12nm.py reports/2026-11-18-ms-ycut-6nm-12nm   # T / T error 6 nm + 12 nm; rerun when the odd 12 nm exact T is done
+#   setsid nohup workflows/run_ms_l2onl1.sh > results_ms/gpu/ms_ycut/run_l2onl1.out 2>&1 &   # 2026-11-18 20:40 (user): slab level 2 on y-cut tile level 1, cuts 1e-6 / 1e-6: 6 nm tile2y, 12 nm tile4y (waits for the exact-T run)
+# 2026-11-18 22:15 (user): OOM reruns (GPU shared with another user's ~60 GB job): 12 nm exact T Ec+0.41..0.49 (chunk 256)
+# then 6 nm tile2y l1 + l2-on-l1; waits for the 12 nm l2onl1 job (pid 2383965) and >= 45 GB free GPU memory (attelas2):
+#   setsid nohup results_ms/gpu/ms_ycut/rerun_oom.sh 2383965 >> results_ms/gpu/ms_ycut/rerun_oom.out 2>&1 &
+#   setsid nohup results_ms/gpu/ms_ycut/rerun_12nm_l2onl1.sh >> results_ms/gpu/ms_ycut/run_l2onl1.out 2>&1 &   # 22:20: 12 nm l2-on-l1 MS solves again (first try: transient cuSOLVER getrs error at Ec+0)
+# 22:45 (user): rerun_oom / rerun_12nm_l2onl1 stopped; the three pending runs in sequence: 12 nm l2-on-l1 with Ec+0 last;
+# 6 nm tile2y l1 with the local rho in complex64 (new --l1-env-prec c64, half the GPU memory; L1ARGS in run_ms_l2onl1.sh)
+# + l2-on-l1, after check_c64_rho.sh (12 nm block 1 c64 vs c128) passes, >= 20 GB free; 12 nm exact T 0.41..0.49, >= 35 GB:
+#   setsid nohup results_ms/gpu/ms_ycut/rerun_seq.sh >> results_ms/gpu/ms_ycut/rerun_seq.out 2>&1 &   (attelas2)
+# 23:10 c64 check FAILED (results_ms/gpu/ms_ycut/check_c64_rho.out): complex64 local rho has a ~1e-4 occupation noise floor
+# (cut 1e-6: 686 vs 402 vectors, subspaces unrelated); 6 nm skipped; rerun_seq.sh now only waits for the 12 nm exact T.
+# 23:15 (user): 12 nm slab level 2 on tile4y level 1, cuts 1e-8 / 1e-8 (level-2 recursion streamed from pinned host memory):
+#   setsid nohup results_ms/gpu/ms_ycut/run_12nm_l2onl1_1e-8.sh >> results_ms/gpu/ms_ycut/run_12nm_l2onl1_1e-8.out 2>&1 &   (attelas2)
+#   .venv/bin/python results_ms/gpu/ms_ycut/plot_T_12nm.py   # 2026-11-19: 12 nm T / T error, all 51 exact energies, tile4y l1 1e-8 + l2-on-l1 1e-6, 1e-8 -> figures/T_err_12nm.png
+# 2026-11-19 (user): 6 nm slab level 2 on tile2y level 1, cuts 1e-8 / 1e-8 (folded lead, exact T from cached psi; Ec+0 last) (attelas2):
+#   DEVS=6nm C1=1e-8 C2=1e-8 DE=0.01,...,0.50,0 setsid nohup workflows/run_ms_l2onl1.sh > results_ms/gpu/ms_ycut/run_6nm_l2onl1_1e-8.out 2>&1 &
+# 2026-11-19 (user): FGMRES with the multi-level density-matrix hierarchy on the 6 nm, 21600a y-cut basis-reuse settings
+# (y split 4,1 = same strip width, UP y,y,x,x,x,x at 1e-2, halo 1 full, exact levels <= 1e5, new qtx_ms.mlevel
+# --host-blocks; --inputs now also takes a release prep); exact psi Ec+0.58/0.7, build at Ec+0.15, then the 8-energy
+# sweep from the stored bases; queued behind the 6 nm l2-on-l1 run (attelas2):
+#   setsid nohup results_ms/gpu/mlevel/run_mlevel_6nm_reuse.sh > results_ms/gpu/mlevel/run_mlevel_6nm_reuse.out 2>&1 &
+# 2026-11-19 (user): before the 6 nm, the multi-level DM FGMRES over the exact-T grid (Ec+0.01..0.50) on 2808a, 9072a,
+# 21600a, 21600a y-cut reuse settings (y 2,1; 2808a y,x; 9072a / 21600a y,x,x,x,x), exact psi from ms_cuts/<dev>/psi;
+# 9072a / 21600a wait for the 6 nm l2-on-l1 run. qtx_ms/mlevel.py: Lev reference cycles freed per energy (gc), the
+# 21600a sweep held ~35 GB of the previous energy. 6 nm queue (run_mlevel_6nm_reuse.sh) stopped until the comparison:
+#   setsid nohup results_ms/gpu/mlevel/run_mlevel_grid.sh > results_ms/gpu/mlevel/run_mlevel_grid.out 2>&1 &   (attelas2)
+# 2026-11-19 (user): streaming of the large operators (qtx_ms gpu.Streamer: pinned host memory, copy of item k + 1
+# overlapped with the compute of item k; --stream-gb G in qtx_ms.mlevel: fine A (schwarz.StreamOp), fine smoother rows
+# (CapSchwarz), A_k block rows (BlockOp host), level smoothers (ras) above G GB). 2808a, everything streamed: same its /
+# errors (results_ms/gpu/mlevel/stream_2808a_{stream0,resident}.log); benchmark 360 GB/s, copy-bound. 6 nm queue
+# relaunched with --stream-gb 4 --chunk 20, after the grid runs:
+#   setsid nohup results_ms/gpu/mlevel/run_mlevel_6nm_reuse.sh > results_ms/gpu/mlevel/run_mlevel_6nm_reuse.out 2>&1 &   (attelas2)
+# 2026-11-19 (user): matrix-free level 1 (qtx_ms.mlevel --l1-free, GalerkinOp: A1 @ y = P^H A P y through the fine
+# operator, dense windows / Galerkin pairs from the pinned S1, H1 blocks; 2808a identical: results_ms/gpu/mlevel/
+# l1free_2808a.log). 6 nm queue relaunched with --l1-free --stream-gb 8 --chunk 20 (after the grid runs), same command.
+#   .venv/bin/python results_ms/gpu/mlevel/plot_mlevel_grid.py reports/2026-11-19-mlevel-grid   # 2026-11-19: its + plain-MS T err per level vs E, 2808a / 9072a / 21600a
+# 2026-11-19 (user): 6 nm mlevel contour window widened to Ec-0.15..Ec+0.8 (MU in run_mlevel_6nm_reuse.sh, --mu at every
+# level); wrapper relaunched (waits for the running psi rebuild), same command.
+# 2026-11-19 (user): --free-levels K in qtx_ms.mlevel (A_1 .. A_K without stored blocks, recursive Galerkin products;
+# 2808a K = 2, 3 identical: results_ms/gpu/mlevel/free{2,3}_2808a.log); 6 nm relaunched with --free-levels 2 (same command).
+# 2026-11-19 (user): merge bases without the dense window eigh (the 6 nm build ran out of GPU memory in the level-3
+# eigh: cusolver syevd asked 29 GB for a 13k window). qtx_ms.mlevel --merge-eig full | rand (randomized range finder on
+# the formed rho) | sketch (rho Omega of a probe block straight from the contour: one LU + 2 solves per point, Nystrom,
+# probes grown until they resolve the cut; as the msbasis tile sketch). 2808a comparison, Ec+0.05, 0.15 (attelas2):
+#   setsid nohup results_ms/gpu/mlevel/run_mergeeig_2808a.sh > results_ms/gpu/mlevel/run_mergeeig_2808a.out 2>&1 &
+#   MODES=sketch:c64 setsid nohup results_ms/gpu/mlevel/run_mergeeig_2808a.sh >> results_ms/gpu/mlevel/run_mergeeig_2808a.out 2>&1 &   # LU, probes, solves in complex64 (--sketch-prec c64)
+#   MODES=sketch:lu64 (same command)   # LU in complex128, factors down-cast to complex64 for the solves (--sketch-prec lu64)
