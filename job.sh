@@ -272,3 +272,6 @@
 #   setsid nohup results_ms/gpu/mlevel/run_mergeeig_2808a.sh > results_ms/gpu/mlevel/run_mergeeig_2808a.out 2>&1 &
 #   MODES=sketch:c64 setsid nohup results_ms/gpu/mlevel/run_mergeeig_2808a.sh >> results_ms/gpu/mlevel/run_mergeeig_2808a.out 2>&1 &   # LU, probes, solves in complex64 (--sketch-prec c64)
 #   MODES=sketch:lu64 (same command)   # LU in complex128, factors down-cast to complex64 for the solves (--sketch-prec lu64)
+# 2026-11-19 (user): 6 nm relaunched with --merge-eig sketch (logs reuse_6nm_y4_sketch_*), gated by a 2808a check of the
+# host Nystrom path (mergeeig_2808a_sketch_host.log) (attelas2):
+#   setsid nohup results_ms/gpu/mlevel/run_sketch_host_check.sh > results_ms/gpu/mlevel/run_sketch_host_check.out 2>&1 &
