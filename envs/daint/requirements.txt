@@ -1,0 +1,10 @@
+# versions of .venv-aarch64 (attelas GH200), 2026-11-24
+numpy==2.5.4
+scipy==1.18.1
+h5py==3.16.0
+matplotlib==3.11.2
+numba==0.68.1
+threadpoolctl==3.8.0
+pytest==9.2.0
+cupy-cuda13x[ctk]==14.2.0
+cuda-toolkit==13.2.*   # daint driver: CUDA 13.2 (2026-11)
