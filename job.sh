@@ -288,3 +288,20 @@
 # complex64 environment LU + refinement, optional probes + Nystrom; the single-shot msbasis tile-contour techniques), same
 # cut / keep, queued after the reference run (attelas2):
 #   CUT=1e-5 DMKEEP=1e-6 SCHUR=single:1 setsid nohup results_ms/gpu/mlevel/run_dmc_grid.sh > results_ms/gpu/mlevel/run_dmc1e-5_schur_grid.out 2>&1 &
+# 2026-11-19 (user): 21600a with dmc 1e-5 / keep 1e-6, Schur (single, 1 step); exact levels <= 50000 (shared GPU) (attelas2):
+#   DEVS=21600a CUT=1e-5 DMKEEP=1e-6 SCHUR=single:1 EXMAX=50000 setsid nohup results_ms/gpu/mlevel/run_dmc_grid.sh > results_ms/gpu/mlevel/run_dmc1e-5_21600a.out 2>&1 &
+#   Single precision + refinement is slower than double on GH200 above n_E ~ 4k (bench_lu_prec.py: 0.63-0.67x; FP64
+#   tensor cores ~ FP32 rate); --rho-eig rand on 2808a: same N / its, slower (k/n ~ 0.5, dense fallback in most blocks).
+#   21600a relaunched in double, dense eigh:
+#   DEVS=21600a CUT=1e-5 DMKEEP=1e-6 SCHUR=double:0 EXMAX=50000 setsid nohup results_ms/gpu/mlevel/run_dmc_grid.sh > results_ms/gpu/mlevel/run_dmc1e-5_21600a.out 2>&1 &
+#   21600a dmc 1e-5 (double Schur): N 58649/38665/14184/10766/7212/5507 (dm 79285 .. 9189); its flat at depth (Ec+0.45
+#   deep levels 48-55, dm 59-60 = maxit).
+# 2026-11-19 (user): 6 nm with dmc 1e-5 (keep 1e-6, Schur double), merges y,x,y,x,x,x (attelas2):
+#   setsid nohup results_ms/gpu/mlevel/run_mlevel_6nm_dmc.sh > results_ms/gpu/mlevel/run_mlevel_6nm_dmc.out 2>&1 &
+# 2026-11-24 (user): daint.alps dev env (envs/daint/: setup.sh, activate.sh, test.sbatch; account lp82, normal queue) and
+# 2808a check run, settings of run_mergeeig_2808a.sh MODES=full, fresh sigma / dm caches in cache_daint/:
+#   sbatch envs/daint/mlevel_2808a.sbatch   (daint, repo root) -> .tools/mlevel_2808a-5445893.out, results_ms/daint/
+# 2026-11-24 (user): the larger devices on daint after the 2808a check (reference 9072a / 21600a: grid_*_y2.log; 6 nm dmc):
+#   sbatch --time=0:30:00 --job-name=mlevel-9072a  envs/daint/mlevel_dev.sbatch 9072a
+#   sbatch --time=1:00:00 --job-name=mlevel-21600a envs/daint/mlevel_dev.sbatch 21600a
+#   sbatch --time=4:00:00 --job-name=mlevel-6nm    envs/daint/mlevel_dev.sbatch 6nm
