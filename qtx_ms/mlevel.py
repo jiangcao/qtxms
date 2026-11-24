@@ -89,12 +89,13 @@ def nrm2(B, its=12):
 EIG_STATS = []          # per rand_top_eig call: (n, l, k, rounds, fallback); summarized and reset by merge
 
 
-def rand_top_eig(rho, cut, q=2, f=0.5, p=32, l0=256, lmax_frac=0.6, seed=0):
+def rand_top_eig(rho, cut, q=2, f=0.5, p=32, l0=256, lmax_frac=0.6, seed=0, dense_gpu_max=8192):
     """Eigenpairs of the Hermitian rho with eigenvalue > cut, by a randomized range finder (Halko, Martinsson, Tropp):
     Q = orth((rho)^(2q+1) Omega), grown in blocks until the Rayleigh-Ritz spectrum of Q^H rho Q has at most l - p
     values above f * cut (the subspace then reaches below the cut, so the kept vectors converge at the rate
     (f cut / lambda)^(2q+1)). Memory n x l instead of the ~11 n^2 workspace of the dense eigh. When l would pass
-    lmax_frac * n: dense eigh (on the host when on the GPU: no workspace limit). Returns (ev, V) ascending, ev > cut."""
+    lmax_frac * n: dense eigh (on the GPU up to n = dense_gpu_max, on the host above: no workspace limit). Returns
+    (ev, V) ascending, ev > cut."""
     xp = gpu.xp_of(rho)
     n = rho.shape[0]
     rs = xp.random.RandomState(seed)
@@ -124,7 +125,7 @@ def rand_top_eig(rho, cut, q=2, f=0.5, p=32, l0=256, lmax_frac=0.6, seed=0):
         if lnew > lmax_frac * n:                               # the range is most of the window: dense eigh
             del Q, W
             gpu.free()
-            if gpu.on:
+            if gpu.on and n > dense_gpu_max:                   # the GPU eigh workspace (~11 n^2) only for small n
                 ev, V = np.linalg.eigh(gpu.asnumpy(rho))
                 ev, V = xp.asarray(ev), xp.asarray(V)
             else:
@@ -176,9 +177,10 @@ class SchurRho:
     probes r > 0: G_PP Omega and G_PP^H Omega (LU of S_P, two solves) instead of the inverse; rho_PP Omega -> Nystrom.
     add(z, dz, M) per point; result() -> (occ, V) of rho_PP (descending; V orthonormal, m x k)."""
 
-    def __init__(self, P, n, prec="single", refine=1, probes=0, seed=0):
+    def __init__(self, P, n, prec="single", refine=1, probes=0, seed=0, eig="full", cut=0.0):
         xp = _xp()
         self.xp, self.prec, self.refine = xp, prec, int(refine)
+        self.eig, self.cut = eig, cut                    # eig "rand": rho_PP eigenpairs > cut by rand_top_eig
         mask = np.zeros(n, bool)
         mask[np.asarray(gpu.asnumpy(P))] = True
         self.p, self.e = xp.asarray(np.where(mask)[0]), xp.asarray(np.where(~mask)[0])
@@ -226,7 +228,10 @@ class SchurRho:
     def result(self):
         xp = self.xp
         if self.Om is None:
-            ev, V = xp.linalg.eigh(rho_of(self.acc))
+            rho = rho_of(self.acc)
+            self.acc = None
+            ev, V = rand_top_eig(rho, self.cut) if self.eig == "rand" else xp.linalg.eigh(rho)
+            del rho
             o = xp.argsort(-ev)
             occ, V = ev[o], V[:, o]
         else:
@@ -451,7 +456,7 @@ class Hierarchy:
 
     def __init__(self, dev, inp, sw, l1_cap=None, l1_ramp="dist", l1_lu="c64", l1_solver="rows", batch_gb=24.0,
                  mem_frac=0.5, halo_smooth="same", host_blocks=False, stream_gb=None, l1_free=False, merge_eig="full",
-                 sketch_prec="c128", core=None, log=log):
+                 sketch_prec="c128", core=None, rho_eig="full", log=log):
         assert l1_ramp in ("dist", "plane") and l1_lu in ("c64", "c128") and l1_solver in ("rows", "lu")
         assert halo_smooth in ("same", "full") and merge_eig in ("full", "rand", "sketch")
         self.dev, self.inp, self.sw, self.log = dev, inp, sw, log
@@ -461,6 +466,9 @@ class Hierarchy:
         self.sketch_prec = sketch_prec
         # core = dict(prec, refine, probes): dmc blocks by Schur folding of the window into the core / pair (SchurRho)
         self.core = core
+        # rho_eig "rand": the eigenpairs of the level-1 window rho / Schur core block (> keep) and of the Schur pair
+        # blocks (> cut) by the randomized range finder (rand_top_eig) instead of the dense eigh
+        self.rho_eig = rho_eig
         # host_blocks: the S, H Galerkin blocks of every level live in host memory (read only to assemble A_k, the rho
         # windows and the Galerkin products of the next level); 6 nm y-cut level 1: ~44 GB off the GPU
         self.host_blocks = bool(host_blocks) and gpu.on
@@ -770,6 +778,9 @@ class Hierarchy:
         core = dict(prec, refine, probes): only the core block rho_cc, the rest of the window folded into the core
         (SchurRho: no window inverse, no window eigh); stores the eigenpairs of rho_cc (dmc only), in <tag>_core_...."""
         xp, dev, sw, nw = self.xp, self.dev, self.sw, self.nw
+        if self.rho_eig == "rand":
+            tag += "_rr"
+        EIG_STATS.clear()
         if core:
             tag = (f"{tag}_core_{core['prec'][0]}{core['refine'] if core['prec'] == 'single' else ''}"
                    + (f"_p{core['probes']}" if core.get("probes") else ""))
@@ -807,7 +818,7 @@ class Hierarchy:
                      + (f", core block by Schur folding ({core})" if core else ""))
             for bi, ks in enumerate(batches):
                 acc = {k: (SchurRho(np.where(sw.core[k])[0], len(sw.idx[k]), core["prec"], core["refine"],
-                                    core.get("probes", 0), seed=k) if core else
+                                    core.get("probes", 0), seed=k, eig=self.rho_eig, cut=keep) if core else
                            xp.zeros((len(sw.idx[k]),) * 2, complex)) for k in ks}
                 self.mem(f"window rho batch {bi + 1}/{len(batches)}: accumulators of {len(ks)} windows")
                 lead = [k for k in ks if np.isin(sw.idx[k], dev.bL).any() or np.isin(sw.idx[k], dev.bR).any()]
@@ -841,7 +852,7 @@ class Hierarchy:
                     else:
                         rho = rho_of(acc[k])
                         acc[k] = None
-                        ev, V = xp.linalg.eigh(rho)
+                        ev, V = rand_top_eig(rho, keep) if self.rho_eig == "rand" else xp.linalg.eigh(rho)
                         del rho
                         o = xp.argsort(-ev)
                         ev, V = ev[o], V[:, o]
@@ -856,6 +867,13 @@ class Hierarchy:
                     gpu.free()
                 self.mem(f"window rho batch {bi + 1}/{len(batches)}: eigh")
                 self.log(f"    batch {bi + 1}/{len(batches)}: {len(ks)} windows ({time.time() - t:.0f} s)")
+            if EIG_STATS:
+                st = np.array(EIG_STATS, float)
+                self.log(f"    rand eig: n {int(st[:, 0].min())}..{int(np.median(st[:, 0]))}..{int(st[:, 0].max())}, "
+                         f"subspace l {int(st[:, 1].min())}..{int(np.median(st[:, 1]))}..{int(st[:, 1].max())}, "
+                         f"k > keep {int(st[:, 2].min())}..{int(np.median(st[:, 2]))}..{int(st[:, 2].max())}, "
+                         f"dense fallback {int(st[:, 4].sum())} of {len(st)}")
+                EIG_STATS.clear()
         for k in range(nw):
             if DM[k] is None:
                 c = np.load(f(k))
@@ -1196,7 +1214,7 @@ class Hierarchy:
                 if schur:
                     for c in ks:
                         dat[c][2] = SchurRho(rows_of[c], nwin[c], self.core["prec"], self.core["refine"],
-                                             self.core.get("probes", 0), seed=1000 + c)
+                                             self.core.get("probes", 0), seed=1000 + c, eig=self.rho_eig, cut=cut)
                 if self.merge_eig == "sketch":
                     self._sketch_batch(ks, dat, isl, sf, zs, dzs, U1, rows_of, cut, kind, Nn, tr, bt)
                     del sf, dat
@@ -1238,9 +1256,9 @@ class Hierarchy:
             self.basis_put(bkey, Nn.k, Nn.U, tr)
         t_rho = time.time() - t0
         eigs = ""
-        if self.merge_eig != "full" and EIG_STATS:
+        if (self.merge_eig != "full" or self.rho_eig == "rand") and EIG_STATS:
             st = np.array(EIG_STATS, float)
-            eigs = (f"; {self.merge_eig}{' ' + self.sketch_prec if self.merge_eig == 'sketch' and self.sketch_prec != 'c128' else ''} eig: window n {int(st[:, 0].min())}..{int(np.median(st[:, 0]))}..{int(st[:, 0].max())}, "
+            eigs = (f"; {self.merge_eig if self.merge_eig != 'full' else 'rho rand'}{' ' + self.sketch_prec if self.merge_eig == 'sketch' and self.sketch_prec != 'c128' else ''} eig: window n {int(st[:, 0].min())}..{int(np.median(st[:, 0]))}..{int(st[:, 0].max())}, "
                     f"subspace l {int(st[:, 1].min())}..{int(np.median(st[:, 1]))}..{int(st[:, 1].max())}, "
                     f"k > cut {int(st[:, 2].min())}..{int(np.median(st[:, 2]))}..{int(st[:, 2].max())}, rounds "
                     f"{int(st[:, 3].max())} max, " + ("probes = window" if self.merge_eig == "sketch" else "dense fallback")
@@ -1447,6 +1465,9 @@ def main(argv=None):
     p.add_argument("--schur-refine", type=int, default=1, help="--schur single: refinement steps of A_EE^-1 A_EP")
     p.add_argument("--schur-probes", type=int, default=0, help="--schur: r random probes, rho_PP Omega + Nystrom "
                    "(0: the full inverse of the Schur complement)")
+    p.add_argument("--rho-eig", default="full", choices=["full", "rand"], help="eigenpairs of the level-1 window rho / "
+                   "Schur core block (> --dm-keep) and the Schur pair blocks (> cut): dense eigh or the randomized range "
+                   "finder (rand_top_eig; dense past 0.6 n). Window-DM cache in <tag>_rr...")
     p.add_argument("--sweep", default="fine,exact,top")
     p.add_argument("--counts", default="32,128,256", help="top-level sizes (multiples of the slow m)")
     p.add_argument("--slow", default="32,3", help="slow modes per round m, subspace steps q")
@@ -1501,7 +1522,8 @@ def main(argv=None):
     h = Hierarchy(dev, inp, sw, l1_cap=tuple(float(v) for v in a.l1_cap.split(",")) if a.l1_cap else None,
                   l1_ramp=a.l1_ramp, l1_lu=a.l1_lu, l1_solver=a.l1_solver, batch_gb=a.batch_gb, mem_frac=a.mem_frac,
                   halo_smooth=a.halo_smooth, host_blocks=a.host_blocks, stream_gb=a.stream_gb, l1_free=a.free_levels,
-                  merge_eig=a.merge_eig, sketch_prec=a.sketch_prec, core=core)
+                  merge_eig=a.merge_eig, sketch_prec=a.sketch_prec, core=core,
+                  rho_eig=a.rho_eig)
     sweeps = a.sweep.split(",")
     counts = [int(v) for v in a.counts.split(",")]
     sm, sq = (int(v) for v in a.slow.split(","))
@@ -1515,7 +1537,8 @@ def main(argv=None):
         h.basis_dir = a.basis_cache or (os.path.join(a.dm_cache, tag + "_levels") if a.dm_cache else None)
     s1_, d1_ = h.s1, h.d1
     keys, chain = [], f"{name}|{tag}|l1 {a.l1}|cap {s1_:g},{d1_:g},{a.l1_ramp}" + (
-        f"|schur {a.schur_prec} {a.schur_refine} p{a.schur_probes} k{a.dm_keep:g}" if a.schur else "")
+        f"|schur {a.schur_prec} {a.schur_refine} p{a.schur_probes} k{a.dm_keep:g}" if a.schur else "") + (
+        "|rho rand" if a.rho_eig == "rand" else "")
     for axis, cut, m1, m2, npts, halo in ups:                    # key of each level = everything its rho depends on
         chain += (f"|{axis}:{cut:g}:{m1:g}:{m2:g}:{npts or a.npts}:h{'all' if halo is None else halo}"
                   + ("" if a.merge_eig == "full" else f"|eig {a.merge_eig}")
