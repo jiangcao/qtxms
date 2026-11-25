@@ -305,3 +305,33 @@
 #   sbatch --time=0:30:00 --job-name=mlevel-9072a  envs/daint/mlevel_dev.sbatch 9072a
 #   sbatch --time=1:00:00 --job-name=mlevel-21600a envs/daint/mlevel_dev.sbatch 21600a
 #   sbatch --time=4:00:00 --job-name=mlevel-6nm    envs/daint/mlevel_dev.sbatch 6nm
+# 2026-11-24 (user): energy sweep Ec + 0.01..0.50 (10 meV) on daint with the stored bases, 2808a (GPU 0) and 9072a (GPUs 1-3):
+#   sbatch envs/daint/mlevel_grid.sbatch   (daint, repo root) -> job 5446160, results_ms/daint/grid_{2808a,9072a_1..3}_5446160.{log,json}
+# 2026-11-24 (user): 12 nm on daint: prep (debug queue), then the hierarchy at Ec + 0.15 (7 merges, no exact psi; mlevel-12nm, 12 h):
+#   P=$(sbatch --parsable envs/daint/prep_12nm.sbatch); sbatch --dependency=afterok:$P envs/daint/mlevel_12nm.sbatch   -> 5448056, 5448057
+# 2026-11-24 (user): 12 nm memory test in the debug queue first (2 contour points; GPU 0 free-levels 2, GPU 1 all streamed); 5448057 waits for it:
+#   sbatch --dependency=afterok:<prep> envs/daint/memtest_12nm.sbatch   -> 5448063, results_ms/daint/memtest_12nm_5448063*
+# 2026-11-24 (user): domain decomposition (mlevel --dist nccl) test on 4 GPUs, debug: sbatch envs/daint/dist_test.sbatch -> 5448143; code copy dist_dev/ on daint
+#   12 nm job 5448057 held (scontrol release 5448057); memory test 5448063 out of memory at level 8.
+# 2026-11-24 (user): 5448057 cancelled; 4-GPU version (--dist nccl): 6 nm in debug (5448244), 12 nm in normal after it (5448245):
+#   A=$(sbatch --parsable -p debug -t 00:30:00 envs/daint/mlevel_wide_dist.sbatch 6nm); sbatch --dependency=afterany:$A envs/daint/mlevel_wide_dist.sbatch 12nm
+# 2026-11-24 (user): two-node test of --dist (contour points over ranks, DistSlabLU), code copy dist_dev2/ on daint, debug:
+#   sbatch envs/daint/mn_test.sbatch   -> 5448357 (failed: libmpi.so.12 not found, cray library has another name), resubmitted below
+#   sbatch envs/daint/mn_test.sbatch   -> 5448425 (cancelled: the wheel took the venv MPICH, 8 one-rank runs), 5448430 (MPI ok on 2 nodes, NCCL fails), 5448488 (NCCL probes), results_ms/daint/mn_*
+# 2026-11-24 (user): dmc 1e-5 + Schur double on 2808a / 9072a / 21600a, 4 GPUs (read "2808 - 12k" as this trio), after 5448488:
+#   sbatch --dependency=afterany:5448488 envs/daint/dmc_dist.sbatch   -> 5448557, results_ms/daint/dmc1e-5_schur_*
+# 2026-11-24 (user): 6 nm, shared contour points + distributed bottom solve on / off, 4 GPUs, after 5448557:
+#   sbatch --dependency=afterany:5448557 envs/daint/onoff_6nm.sbatch   -> 5448594, results_ms/daint/onoff_6nm_*
+# 2026-11-25 (user): 12 nm 4-GPU job 5448245 ran out of host memory at setup (4 private copies of H, S). Device store: H, S sliced
+# by slab on disk, every rank holds only its own rows (qtx_ms.devstore, mlevel --dev-store; code copy dist_dev3/ on daint);
+# 2808a check, full matrices vs store, 4 GPUs, debug:
+#   sbatch envs/daint/devstore_test.sbatch   -> 5452393 (N, its, T equal), results_ms/daint/devstore_2808a_{ref,store}_5452393.*
+# 2026-11-25 (user): 6 nm on 4 GPUs with the device store (fresh window rho and bases, --no-share-points), debug:
+#   sbatch -p debug -t 00:30:00 --job-name=mlevel-6nm-store envs/daint/mlevel_wide_dist.sbatch 6nm   -> 5452416 (T 0.9074057, 675 s, host peak ~196 GiB), results_ms/daint/mlevel_6nm_4g_5452416.*
+# 2026-11-25 (user): S_k, H_k formed from sparse fine core-pair blocks on the GPU (mlevel --fine-blocks K, code copy dist_dev4/):
+# strip tests on 4 GPUs (nccl) + 2808a K = 0, 1, 2, debug:
+#   sbatch envs/daint/fine_blocks_test.sbatch   -> 5453053 (PASS, its and T equal), results_ms/daint/fine_blocks_2808a_k{0,1,2}_5453053.*
+# 2026-11-25 (user): A_ij = E S_ij - H_ij directly, dense S_k, H_k pairs kept on the GPU during the basis build, smoothers (rows and LU)
+# streamed (--stream-smoother-gb 0): strip tests (nccl) + 2808a, 5 variants, code copy dist_dev5/, debug:
+#   sbatch envs/daint/fine_blocks_test2.sbatch   -> 5453937, results_ms/daint/fine_blocks2_2808a_*_5453937.*
+#   the strip test alone with A_k spectra (entries differ by a block gauge): sbatch envs/daint/strip_test.sbatch   -> 5454029 (PASS)
