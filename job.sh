@@ -335,3 +335,10 @@
 # streamed (--stream-smoother-gb 0): strip tests (nccl) + 2808a, 5 variants, code copy dist_dev5/, debug:
 #   sbatch envs/daint/fine_blocks_test2.sbatch   -> 5453937, results_ms/daint/fine_blocks2_2808a_*_5453937.*
 #   the strip test alone with A_k spectra (entries differ by a block gauge): sbatch envs/daint/strip_test.sbatch   -> 5454029 (PASS)
+# 2026-11-25 (user): 6 nm, --fine-blocks 1 (level 1 S_k, H_k never stored), smoothers by the --stream-gb rule, fresh dm cache, code dist_dev5/, debug:
+#   FB=1 DMW=$PWD/cache_daint/6nm_store/dmw_fb1 sbatch -p debug -t 00:30:00 --job-name=mlevel-6nm-fb1 envs/daint/mlevel_wide_dist.sbatch 6nm   -> 5454090 (T 0.9074057, 727 s, GPU peak 49.8 GB), results_ms/daint/mlevel_6nm_4g_5454090.*
+# 2026-11-25 (user): single-purpose drivers mlbasis / mlsolve / mlmode / mlexact on 2808a, 4 GPUs, exact-T grid Ec + 0.01 .. 0.50 (against
+# job 5446160 and results_ms/exact), code copy dist_dev6/, two debug jobs (5454430, normal queue, cancelled before its start):
+#   A=$(PART=a sbatch --parsable envs/daint/drivers_2808a.sbatch); PART=b sbatch --dependency=afterany:$A envs/daint/drivers_2808a.sbatch   -> 5454441 (exact, dm), 5454442 (dmc), results_ms/daint/drivers_2808a_<job>*
+# 2026-11-25 (user): 6 nm with mlbasis (fresh cache dmw_drv), then mlsolve K = 2, streamed smoothers, 8 energies with exact T, two debug jobs, dist_dev6/:
+#   A=$(MODE=basis sbatch --parsable envs/daint/drivers_6nm.sbatch); MODE=solve sbatch --dependency=afterok:$A envs/daint/drivers_6nm.sbatch   -> 5454677, 5454678, results_ms/daint/drivers_6nm_<mode>_<job>*

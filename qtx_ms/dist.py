@@ -283,8 +283,12 @@ class ThreadComm(Comm):
             except BaseException as e:                            # noqa: BLE001
                 err.append(e)
                 sh["bar"].abort()
-        th = [threading.Thread(target=go, args=(r,)) for r in range(size)]
-        [t.start() for t in th]
+        old = threading.stack_size(256 << 20)                     # the threaded complex64 LU of OpenBLAS overflows the default thread stack
+        try:
+            th = [threading.Thread(target=go, args=(r,)) for r in range(size)]
+            [t.start() for t in th]
+        finally:
+            threading.stack_size(old)
         [t.join() for t in th]
         if err:
             raise [e for e in err if not isinstance(e, threading.BrokenBarrierError)][0] \

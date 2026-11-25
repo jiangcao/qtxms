@@ -956,7 +956,7 @@ class Hierarchy:
     def __init__(self, dev, inp, sw, l1_cap=None, l1_ramp="dist", l1_lu="c64", l1_solver="rows", batch_gb=24.0,
                  mem_frac=0.5, halo_smooth="same", host_blocks=False, stream_gb=None, l1_free=False, merge_eig="full",
                  sketch_prec="c128", core=None, rho_eig="full", log=log, comm=None, keep_max=np.inf,
-                 bottom="dist", share_points=True, fine_blocks=0, stream_smoother_gb=None):
+                 bottom="dist", share_points=True, fine_blocks=0, stream_smoother_gb=None, smoothers=True, keep_levels=()):
         assert l1_ramp in ("dist", "plane") and l1_lu in ("c64", "c128") and l1_solver in ("rows", "lu")
         assert halo_smooth in ("same", "full") and merge_eig in ("full", "rand", "sketch")
         self.dev, self.inp, self.sw, self.log = dev, inp, sw, log
@@ -966,6 +966,9 @@ class Hierarchy:
         # distributed: a free level larger than keep_max is never solved exactly (--exact-max): its S, H blocks are read
         # only by the merge above it and dropped after it (12 nm: ~84 GB of level 1, ~104 GB of level 2 on the host)
         self.keep_max = keep_max
+        # smoothers False: no smoothers of the levels (mode space only: qtx_ms.mlmode); S, H of a level then stay only for the
+        # levels in keep_levels (and the deepest one)
+        self.smoothers, self.keep_levels = bool(smoothers), set(keep_levels)
         # bottom "dist": the deepest level solved by DistSlabLU (domains of slabs over the ranks), "repl": the same LU on
         # every rank (GatherSolve). share_points: contour points of the merge windows balanced over the ranks
         assert bottom in ("dist", "repl"), bottom
@@ -1084,7 +1087,7 @@ class Hierarchy:
             sm = getattr(L, "Sbelow", None)
             self.log(f"    mem | held: level {k} (N {L.N}): U {nb(L.U) / g:.2f}, S {nb(L.Sb) / g:.2f}, H {nb(L.Hb) / g:.2f}"
                      f"{' (host)' if self.host_blocks else ''}, "
-                     f"A list {nb(L.Ab) / g + nb(L.A.blocks) / g:.2f}, A operator (block rows) {nb(list(L.A.R.values()) if isinstance(L.A.R, dict) else L.A.R) / g:.2f}"
+                     f"A list {nb(L.Ab) / g + nb(L.A.blocks) / g:.2f}, A operator (block rows) {sum(nb(v) for v in (L.A.R.values() if isinstance(L.A.R, dict) else L.A.R)) / g:.2f}"
                      + (" (host, streamed)" if getattr(L.A, "host", False) else "")
                      + (f" (none: A{k} through the level below)" if is_free(L.A) else "")
                      + (f", smoother of A{k - 1} {sm.gb:.2f}" + (" (host, streamed)" if getattr(sm, "streamed", False)
@@ -1396,6 +1399,11 @@ class Hierarchy:
                 self.ubank[key] = ([c[f"u{i}"] for i in range(int(c["nb"]))], c["tr"])
                 return self.ubank[key]
         return None
+
+    def basis_stored(self, key, k):
+        """The bases of level k under this key are in the store: memory or file, not read (the same answer on every rank)."""
+        f = os.path.join(self.basis_dir or "", f"l{k}_{hashlib.sha1(str(key).encode()).hexdigest()[:16]}.npz")
+        return bool(self.comm.bcast(key is not None and (key in self.ubank or (bool(self.basis_dir) and os.path.exists(f)))))
 
     def basis_put(self, key, k, U, tr):
         if key is None:
@@ -1801,11 +1809,41 @@ class Hierarchy:
             rnd += 1
         self.mem(f"{bt}: block bases from the sketch" + (f" ({nhost[0]} Nystrom steps on the host)" if nhost[0] else ""))
 
-    def merge(self, axis, cut, kind, mu1, mu2, npts, halo=None, bkey=None):
+    def sigma_up(self, L, Nn, sg):
+        """Lead Sigma blocks {(i, j): B} of level L -> level L + 1 (Nn): U_c^H B U_c2; rows of the blocks of other ranks on the host."""
+        xp, rank, owner, sigN = self.xp, self.comm.rank, Nn.owner, {}
+        lb = {c for c in range(len(Nn.kids)) for (i, j) in sg if i in Nn.kids[c] or j in Nn.kids[c]}
+        for c in lb:
+            for c2 in lb:
+                if any(i in Nn.kids[c] and j in Nn.kids[c2] for (i, j) in sg):
+                    ro, co = offs(L.r[list(Nn.kids[c])]), offs(L.r[list(Nn.kids[c2])])
+                    M = xp.zeros((ro[-1], co[-1]), complex)
+                    for (i, j), B in sg.items():
+                        if i in Nn.kids[c] and j in Nn.kids[c2]:
+                            a_, b_ = Nn.kids[c].index(i), Nn.kids[c2].index(j)
+                            M[ro[a_]:ro[a_ + 1], co[b_]:co[b_ + 1]] = xp.asarray(B)
+                    Bn = xp.asarray(Nn.U[c]).conj().T @ (M @ xp.asarray(Nn.U[c2]))
+                    sigN[(c, c2)] = Bn if owner[c] == rank else gpu.asnumpy(Bn)
+        return sigN
+
+    def shift(self, E, SL, SR):
+        """Every level at another energy, all of them free (no stored A_k): only E and the projected Sigma change. The
+        smoothers are not updated (smoothers=False)."""
+        assert not self.smoothers and all(is_free(L.A) for L in self.LV.values())
+        sg = self.sigma1(self.LV[1].U, SL, SR, host=self.dd)
+        for k in sorted(self.LV):
+            L = self.LV[k]
+            if k > 1:
+                sg = self.sigma_up(L.parent, L, sg)
+            L.E = L.A.E = E
+            L.A.sig1 = sg
+
+    def merge(self, axis, cut, kind, mu1, mu2, npts, halo=None, bkey=None, basis_only=False):
         """Append level k + 1 = pairs of blocks of the deepest level L along axis ("x" | "y"); also the smoother of
         L.A with these pairs as blocks. mu1, mu2: absolute energy window of the contour rho; halo: x halo of the
         windows in blocks of L (None: every coupled block); bkey: the bases of this level are taken from / stored in
-        the basis store under bkey (energy independent: no contour rho when stored). Returns the new level."""
+        the basis store under bkey (energy independent: no contour rho when stored); basis_only: no Galerkin S, H of the
+        new level (the last one of qtx_ms.mlbasis; needs free levels, no smoothers). Returns the new level."""
         assert axis in ("x", "y") and kind in ("dm", "dmc")
         xp, log = self.xp, self.log
         L = self.LV[len(self.LV)]
@@ -1851,7 +1889,8 @@ class Hierarchy:
         mine = [c for c in range(nc) if rank in pts[c]]                     # windows this rank integrates (part of)
         helped = [c for c in range(nc) if len(pts[c]) > 1]
         # S, H rows of the windows of own blocks (rho, smoother) and of the windows helped with (rho)
-        self.ghost_rows(L, {int(b) for c in own for b in full[c]} | {int(b) for c in mine for b in win[c]})
+        self.ghost_rows(L, {int(b) for c in own for b in (full[c] if self.smoothers else win[c])}
+                        | {int(b) for c in mine for b in win[c]})
         if stored is not None:
             near = (owner == rank) | (Nn.G[owner == rank].any(0) if own else False)
             Nn.U = [xp.asarray(u) if near[c] else u for c, u in enumerate(stored[0])]
@@ -2026,7 +2065,10 @@ class Hierarchy:
         gal = lambda X, f=lambda B: B: [[f(Nn.U[c].conj().T @ (self.dense(L, X, Nn.kids[c], Nn.kids[c2]) @
                                                                xp.asarray(Nn.U[c2]))) for c2 in Nn.nbr[c]]
                                         if owner[c] == rank else None for c in range(nc)]
-        if Nn.k <= self.fine_blocks:
+        if basis_only:
+            assert not self.smoothers and Nn.k <= self.free_levels and is_free(L.A)
+            Nn.Sb = Nn.Hb = None
+        elif Nn.k <= self.fine_blocks:
             Nn.Sb, Nn.Hb = FineMat("S"), FineMat("H")
         else:
             Nn.Sb, Nn.Hb = gal(L.Sb, self.keep), gal(L.Hb, self.keep)
@@ -2034,20 +2076,7 @@ class Hierarchy:
         nfree = Nn.k <= self.free_levels and is_free(L.A)
         if nfree or dd:                                      # no A_k blocks (or built below): Sigma of the lead blocks
             Nn.Ab, Nn.A = None, None
-            sigN = {}
-            sg = L.A.sig1
-            lb = {c for c in range(nc) for (i, j) in sg if i in Nn.kids[c] or j in Nn.kids[c]}
-            for c in lb:
-                for c2 in lb:
-                    if any(i in Nn.kids[c] and j in Nn.kids[c2] for (i, j) in sg):
-                        ro, co = offs(L.r[list(Nn.kids[c])]), offs(L.r[list(Nn.kids[c2])])
-                        M = xp.zeros((ro[-1], co[-1]), complex)
-                        for (i, j), B in sg.items():
-                            if i in Nn.kids[c] and j in Nn.kids[c2]:
-                                a_, b_ = Nn.kids[c].index(i), Nn.kids[c2].index(j)
-                                M[ro[a_]:ro[a_ + 1], co[b_]:co[b_ + 1]] = xp.asarray(B)
-                        Bn = xp.asarray(Nn.U[c]).conj().T @ (M @ xp.asarray(Nn.U[c2]))
-                        sigN[(c, c2)] = Bn if owner[c] == rank else gpu.asnumpy(Bn)
+            sigN = self.sigma_up(L, Nn, L.A.sig1)
         else:                                                # one rank
             Nn.Ab = [[Nn.U[c].conj().T @ (L.A.take(Nn.kids[c], Nn.kids[c2]) @ Nn.U[c2]) for c2 in Nn.nbr[c]]   # = gal(L.Ab)
                      for c in range(nc)]
@@ -2094,10 +2123,13 @@ class Hierarchy:
         # the level below is complete: its S, H blocks and the block list of A are not needed again (L.A keeps the
         # block rows for the matvec, dense() and sub()). Freed before the smoother of L.A is built: 3 x the size of
         # A_L less at the memory peak (21600a y-cut: 33 GB, out of memory on a GH200 otherwise)
+        drop = (L.N > self.keep_max or not self.smoothers) and not isinstance(L.Sb, FineMat) and L.k not in self.keep_levels
+        Nn.Sbelow = None
         if dd:                                               # the windows below are assembled from S, H
-            Nn.Sbelow = self.ras(L, [w if owner[c] == rank else None for c, w in enumerate(wsm)], Nn.kids)
+            if self.smoothers:
+                Nn.Sbelow = self.ras(L, [w if owner[c] == rank else None for c, w in enumerate(wsm)], Nn.kids)
             self.drop_ghosts(L)
-            if L.N > self.keep_max and not isinstance(L.Sb, FineMat):
+            if drop:
                 L.Sb = L.Hb = None
         if not is_free(L.A):                  # a free A_1 keeps reading S1, H1 (smoother, SlabLU)
             L.Sb = L.Hb = None
@@ -2105,20 +2137,25 @@ class Hierarchy:
         gpu.free()
         self.mem(f"{lv}: S, H blocks and the A block list of level {L.k} freed")
         if not dd:
-            Nn.Sbelow = self.ras(L, wsm, Nn.kids)            # smoother of L.A formed with the blocks of this level
+            if self.smoothers:
+                Nn.Sbelow = self.ras(L, wsm, Nn.kids)        # smoother of L.A formed with the blocks of this level
+            if drop:
+                L.Sb = L.Hb = None
         gpu.free()
-        self.mem(f"{lv}: smoother of A{L.k} ({len(wsm)} windows)")
+        if self.smoothers:
+            self.mem(f"{lv}: smoother of A{L.k} ({len(wsm)} windows)")
         np_ = np.array([int(L.r[list(ks)].sum()) for ks in Nn.kids])
-        nsm = np.array([v for d_ in self.comm.allgather(Nn.Sbelow.sizes) for v in d_])      # all windows (rank by rank)
-        smgb = sum(self.comm.allgather(Nn.Sbelow.gb))
+        sm = Nn.Sbelow
+        nsm = np.array([v for d_ in self.comm.allgather(sm.sizes) for v in d_] if sm is not None else [0])   # all windows (rank by rank)
+        smgb = sum(self.comm.allgather(sm.gb)) if sm is not None else 0.0
         gb = sum(int(Nn.r[i]) * int(Nn.r[j]) for i in range(nc) for j in Nn.nbr[i]) * 16 / 2 ** 30
         allh = lambda h: f"{h}{' = all' if h == hmax else ''}"
         log(f"  level {Nn.k} ({axis} merge, {kind} cut {cut:g}, E {mu1:+.4f}..{mu2:+.4f}): {nc} blocks, N{Nn.k} {Nn.N} "
             f"(N{L.k} / N{Nn.k} {L.N / max(Nn.N, 1):.2f}, n / N{Nn.k} {self.n / max(Nn.N, 1):.1f}), per block "
             f"{Nn.r.min()}..{int(np.median(Nn.r))}..{Nn.r.max()} of {np_.min()}..{int(np.median(np_))}..{np_.max()} "
             f"level-{L.k} columns; rho windows (halo {allh(hu)}): {nwin.min()}..{int(np.median(nwin))}..{nwin.max()} "
-            f"columns; smoother of A{L.k} (halo {allh(hs)}): {nsm.min()}..{int(np.median(nsm))}..{nsm.max()} columns, "
-            f"{self.l1_solver} {smgb:.2f} GB (LUs {(nsm.astype(float) ** 2).sum() * self.lub / 2 ** 30:.2f} GB); "
+            f"columns; " + ("no smoothers" if sm is None else f"smoother of A{L.k} (halo {allh(hs)}): {nsm.min()}..{int(np.median(nsm))}..{nsm.max()} columns, "
+            f"{self.l1_solver} {smgb:.2f} GB (LUs {(nsm.astype(float) ** 2).sum() * self.lub / 2 ** 30:.2f} GB)") + "; "
             f"A{Nn.k} {gb:.2f} GB; trace per block {tr.min():.1f}..{np.median(tr):.1f}..{tr.max():.1f}; rho "
             + (f"{t_rho:.0f} s in {len(batches)} batches" if batches else f"from the store ({t_rho:.0f} s)") + eigs + f", smoother {time.time() - t:.0f} s; {self.memstr()}")
         Nn.info = dict(level=Nn.k, axis=axis, kind=kind, cut=cut, window=[mu1, mu2], npts=int(npts), blocks=nc,
@@ -2187,6 +2224,62 @@ def parse_up(up, halo, mu):
         m1, m2 = (float(f_[2]), float(f_[3])) if len(f_) > 3 else mu
         out.append((f_[0], float(f_[1]), m1, m2, int(f_[4]) if len(f_) > 4 else None, h))
     return out
+
+
+def cache_keys(a, name, ups, s1, d1):
+    """Tag of the window-rho cache and one basis key per further level = everything its rho depends on (None: no cache)."""
+    tag = (f"dm_w{a.cap.replace(',', '_')}_s{a.cap_split.replace(',', '_') or '1'}_t{a.cap_tov:g}"
+           f"_mu{a.mu.replace(',', '_')}_n{a.npts}")
+    keys, chain = [], f"{name}|{tag}|l1 {a.l1}|cap {s1:g},{d1:g},{a.l1_ramp}" + (
+        f"|schur {a.schur_prec} {a.schur_refine} p{a.schur_probes} k{a.dm_keep:g}" if a.schur else "") + (
+        "|rho rand" if a.rho_eig == "rand" else "")
+    for axis, cut, m1, m2, npts, halo in ups:
+        chain += (f"|{axis}:{cut:g}:{m1:g}:{m2:g}:{npts or a.npts}:h{'all' if halo is None else halo}"
+                  + ("" if a.merge_eig == "full" else f"|eig {a.merge_eig}")
+                  + (f"|{a.sketch_prec}" if a.merge_eig == "sketch" and a.sketch_prec != "c128" else ""))
+        keys.append(chain if a.basis_cache != "none" else None)
+    return tag, keys
+
+
+def start(kind, use_gpu, sweep=None):
+    """Communicator and GPU backend of a driver (kind: --dist); the log of the ranks > 0 goes to <QTX_RANK_LOG>.<rank>."""
+    comm = dist.launch(kind)
+    dd = comm.size > 1
+    if dd and comm.rank:
+        f_ = os.environ.get("QTX_RANK_LOG")
+        sys.stdout = open(f"{f_}.{comm.rank}", "w", buffering=1) if f_ else open(os.devnull, "w")
+    if use_gpu:
+        ndev = 0
+        if dd:
+            import cupy
+            ndev = cupy.cuda.runtime.getDeviceCount()
+        gpu.enable(device=comm.local_rank % ndev if dd else None)
+    else:
+        gpu.from_env()
+    if dd:
+        assert sweep in (None, "exact"), "--dist: --sweep exact (the slow modes of top / fine are not distributed)"
+        if gpu.on:
+            comm.start_nccl()
+        log(f"domain decomposition: {comm.size} ranks ({comm.local_size} on this node), GPU halos through "
+            f"{'NCCL' if comm.nccl is not None else 'MPI (host)'}")
+    return comm
+
+
+def guarded(f):
+    """f() of a driver; on an error: the memory of the failed step, then MPI abort (the other ranks wait in a collective)."""
+    try:
+        f()
+    except BaseException as e_:
+        m_ = gpu.mem_mark()                                          # the step that failed: its peak before the error
+        if m_:
+            log("    mem | failed step: " + ", ".join(f"{k} {v / 2 ** 30:.2f}" for k, v in m_.items()) + " GB")
+        if "mpi4py.MPI" in sys.modules and sys.modules["mpi4py.MPI"].COMM_WORLD.Get_size() > 1 and not (
+                isinstance(e_, SystemExit) and not e_.code):
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush(), sys.stderr.flush()
+            sys.modules["mpi4py.MPI"].COMM_WORLD.Abort(1)
+        raise
 
 
 def load_psi(psi_dir, E, A, b, bL):
@@ -2304,25 +2397,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     a.free_levels = max(a.free_levels, int(a.l1_free), a.fine_blocks)
     a.host_blocks = a.host_blocks or a.free_levels > 0
-    comm = dist.launch(a.dist)
+    comm = start(a.dist, a.gpu, sweep=a.sweep)
     dd = comm.size > 1
-    if dd and comm.rank:
-        f_ = os.environ.get("QTX_RANK_LOG")                      # log of the other ranks: <QTX_RANK_LOG>.<rank>
-        sys.stdout = open(f"{f_}.{comm.rank}", "w", buffering=1) if f_ else open(os.devnull, "w")
-    if a.gpu:
-        ndev = 0
-        if dd:
-            import cupy
-            ndev = cupy.cuda.runtime.getDeviceCount()
-        gpu.enable(device=comm.local_rank % ndev if dd else None)
-    else:
-        gpu.from_env()
-    if dd:
-        assert a.sweep == "exact", "--dist: --sweep exact (the slow modes of top / fine are not distributed)"
-        if gpu.on:
-            comm.start_nccl()
-        log(f"domain decomposition: {comm.size} ranks ({comm.local_size} on this node), GPU halos through "
-            f"{'NCCL' if comm.nccl is not None else 'MPI (host)'}")
     xp = _xp()
     log(f"backend: {gpu.describe()}")
     gpu.track_peak()
@@ -2376,19 +2452,9 @@ def main(argv=None):
     kind, cut1 = a.l1.split(":")[0], float(a.l1.split(":")[1])
     mu = tuple(float(v) for v in a.mu.split(","))
     ups = parse_up(a.up, a.halo, mu)
-    tag = (f"dm_w{a.cap.replace(',', '_')}_s{a.cap_split.replace(',', '_') or '1'}_t{a.cap_tov:g}"
-           f"_mu{a.mu.replace(',', '_')}_n{a.npts}")
+    tag, keys = cache_keys(a, name, ups, h.s1, h.d1)
     if a.basis_cache != "none":
         h.basis_dir = a.basis_cache or (os.path.join(a.dm_cache, tag + "_levels") if a.dm_cache else None)
-    s1_, d1_ = h.s1, h.d1
-    keys, chain = [], f"{name}|{tag}|l1 {a.l1}|cap {s1_:g},{d1_:g},{a.l1_ramp}" + (
-        f"|schur {a.schur_prec} {a.schur_refine} p{a.schur_probes} k{a.dm_keep:g}" if a.schur else "") + (
-        "|rho rand" if a.rho_eig == "rand" else "")
-    for axis, cut, m1, m2, npts, halo in ups:                    # key of each level = everything its rho depends on
-        chain += (f"|{axis}:{cut:g}:{m1:g}:{m2:g}:{npts or a.npts}:h{'all' if halo is None else halo}"
-                  + ("" if a.merge_eig == "full" else f"|eig {a.merge_eig}")
-                  + (f"|{a.sketch_prec}" if a.merge_eig == "sketch" and a.sketch_prec != "c128" else ""))
-        keys.append(chain if a.basis_cache != "none" else None)
     DM = U1 = None
     for dE in (float(v) for v in a.dE.split(",")):
         E = Ec + dE
@@ -2588,16 +2654,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except BaseException as e_:
-        m_ = gpu.mem_mark()                                          # the step that failed: its peak before the error
-        if m_:
-            log("    mem | failed step: " + ", ".join(f"{k} {v / 2 ** 30:.2f}" for k, v in m_.items()) + " GB")
-        if "mpi4py.MPI" in sys.modules and sys.modules["mpi4py.MPI"].COMM_WORLD.Get_size() > 1 and not (
-                isinstance(e_, SystemExit) and not e_.code):
-            import traceback
-            traceback.print_exc()                                # the other ranks wait in a collective: stop them all
-            sys.stdout.flush(), sys.stderr.flush()
-            sys.modules["mpi4py.MPI"].COMM_WORLD.Abort(1)
-        raise
+    guarded(main)
