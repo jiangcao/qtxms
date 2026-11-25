@@ -114,6 +114,17 @@ def lu_factor(a):
     return sla.lu_factor(a, overwrite_a=True, check_finite=False)
 
 
+def lu_host(lu):
+    """LU factors as pinned C-contiguous host arrays for a Streamer item: (F-ordered LU)^T, pivots (lu_view: back)."""
+    f = lu[0] if lu[0].flags.f_contiguous else xp_of(lu[0]).asfortranarray(lu[0])
+    return pinned(f.T), pinned(lu[1])
+
+
+def lu_view(v):
+    """(LU, pivots) for lu_solve from the two arrays of a Streamer item (lu_host): the transpose view, no copy."""
+    return v[0].T, v[1]
+
+
 def lu_solve(lu, b, trans=0):
     if on and isinstance(lu[0], cp.ndarray):
         import cupyx.scipy.linalg as cla

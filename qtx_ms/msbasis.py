@@ -25,6 +25,7 @@ when it imports (on sys.path or in $QTTOOLS_SRC, a QuaTrEx src folder; needs the
 flux-normalized incoming Bloch modes, one column per propagating channel, like QuaTrEx's QTBM.
 """
 import os, sys, time, warnings
+import socket
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
@@ -311,9 +312,12 @@ class Device:
         self.loc = -np.ones(H.shape[0], int)                         # global orbital -> slab-local
         for o in self.slab_orbs:
             self.loc[o] = np.arange(len(o))
-        r, c = (abs(self.H) + abs(self.S)).nonzero()
-        so = np.repeat(np.arange(len(self.ns)), self.ns)
-        assert np.abs(so[r] - so[c]).max() <= 1, "device blocks are not block tridiagonal"
+        for M in (self.H, self.S):                                  # slab by slab: no global |H| + |S| (12 nm: int64)
+            for s, (r0, r1) in enumerate(zip(self.sb[:-1], self.sb[1:])):
+                q = slice(M.indptr[r0], M.indptr[r1])
+                c = M.indices[q]
+                far = (c < self.sb[max(s - 1, 0)]) | (c >= self.sb[min(s + 2, len(self.ns))])
+                assert not (M.data[q][far] != 0).any(), "device blocks are not block tridiagonal"
         self.lead = FoldedLead(inp["lead"]["H00"], inp["lead"]["H01"], inp["lead"]["S00"], inp["lead"]["S01"],
                                fast=fast_lead)
         lr = inp.get("lead_right")                                  # different right lead (e.g. under bias)
@@ -321,12 +325,13 @@ class Device:
                                                              fast=fast_lead)
         oL = O[tr["lead_left_block"]][self.lead.oL]                # lead-cell orbitals carrying g_L, g_R
         oR = O[tr["lead_right_block"]][self.leadR.oR]
-        P = (abs(H) + abs(S)).tocsr()
-        self.bL = np.unique(P[O[tr["lead_left_block"]]][:, dev].nonzero()[1])
-        self.bR = np.unique(P[O[tr["lead_right_block"]]][:, dev].nonzero()[1])
+        # nonzeros (row, device column) of H and S between a lead block and the device
+        nz = {blk: [M[O[tr[blk]]][:, dev].nonzero() for M in (H, S)] for blk in ("lead_left_block", "lead_right_block")}
+        self.bL, self.bR = (np.unique(np.concatenate([c for _, c in nz[blk]]))
+                            for blk in ("lead_left_block", "lead_right_block"))
         assert self.bL.max() < self.sb[1] and self.bR.min() >= self.sb[-2], "leads couple beyond end slabs"
-        for o, b, blk in ((oL, self.bL, "lead_left_block"), (oR, self.bR, "lead_right_block")):
-            rows = O[tr[blk]][np.unique(P[O[tr[blk]]][:, dev].nonzero()[0])]
+        for o, blk in ((oL, "lead_left_block"), (oR, "lead_right_block")):
+            rows = O[tr[blk]][np.unique(np.concatenate([r for r, _ in nz[blk]]))]
             assert np.isin(rows, o).all(), f"{blk}: device couples to lead orbitals off its face"
         cut = lambda M, r, c: M[r][:, c].toarray()
         # A = z S - H blocks between device boundary and lead face: (lead, dev) and (dev, lead)
@@ -387,7 +392,9 @@ class Device:
         self._inj = {id(out[0]): inj[0], id(out[1]): inj[1]} if inj else {}
         if f:
             os.makedirs(self.sigma_cache, exist_ok=True)
-            np.savez(f, SL=out[0], SR=out[1], **(dict(BL=inj[0], BR=inj[1]) if inj else {}))
+            tmp = f"{f}.tmp{socket.gethostname()}-{os.getpid()}.npz"   # several ranks (nodes) may compute the same point
+            np.savez(tmp, SL=out[0], SR=out[1], **(dict(BL=inj[0], BR=inj[1]) if inj else {}))
+            os.replace(tmp, f)
         return out
 
     def _sigma_qtt(self, z):
