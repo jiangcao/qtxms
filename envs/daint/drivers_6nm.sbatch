@@ -4,6 +4,8 @@
 # --fine-blocks 2, smoothers streamed from pinned host memory. Options of mlevel_wide_dist.sbatch 6nm (T 0.9074056942 at
 # Ec + 0.15, its 31-37 at level 7, N 124468 .. 15357, job 5454090). Lead Sigma of the new energies is computed (~10 s each).
 #   A=$(MODE=basis sbatch --parsable envs/daint/drivers_6nm.sbatch); MODE=solve sbatch --dependency=afterok:$A envs/daint/drivers_6nm.sbatch
+# MODE=rerun: the energies that did not converge in job 5454678: mlsolve at Ec + 0.40, 0.50 with --maxit 150, then the study driver (mlevel, exact level 7
+# only, smoothers on the GPU) at 0.50 on the same bases: driver or method?   MODE=rerun sbatch envs/daint/drivers_6nm.sbatch
 #SBATCH --job-name=drivers-6nm
 #SBATCH --account=lp82
 #SBATCH --partition=debug
@@ -45,11 +47,22 @@ B="--inputs $IN --gpu --sigma-cache $SG --dm-cache $DMW --dev-store $ST --dist n
   --up y:1e-5,x:1e-5,y:1e-5,x:1e-5,x:1e-5,x:1e-5 --mu=-0.15,0.8 --fine-blocks 2"
 if [ $MODE = basis ]; then
   X="mlbasis $B"
+elif [ $MODE = rerun ]; then
+  X="mlsolve $B --stream-smoother-gb 0 --stream-gb 40 --dE 0.40,0.50 --chunk 20 --maxit 150 --fgmres-log 10"
 else
   X="mlsolve $B --stream-smoother-gb 0 --stream-gb 40 --dE ${DE:-0.15,0.05,0.50,0.30,0.20,0.10,0.40,0.25} --chunk 20 --maxit 60"
 fi
 QTX_RANK_LOG=$L.rank $R/.venv-daint/bin/mpiexec -launcher fork -n 4 $R/envs/daint/rank.sh python -u -m qtx_ms.$X --out $L.json > $L.log 2>&1
 rc=$?
+if [ $MODE = rerun ]; then
+  echo "mlsolve exit $rc after $SECONDS s"
+  QTX_RANK_LOG=${L}_study.rank $R/.venv-daint/bin/mpiexec -launcher fork -n 4 $R/envs/daint/rank.sh python -u -m qtx_ms.mlevel $B \
+    --cap 16,2,2 --cap-tov 6 --cap-solver rows64 --l1 dmc:1e-5 --dm-keep 1e-6 --schur --schur-prec double --halo 1 --halo-smooth full \
+    --sweep exact --exact-max 16000 --stream-gb 40 --dE 0.50 --chunk 20 --maxit 150 --fgmres-log 10 --out ${L}_study.json > ${L}_study.log 2>&1
+  echo "study driver exit $? after $SECONDS s"
+  grep -E "^Ec|exact level|mode space|levels at|residual est|Error|^done" ${L}_study.log | cut -c1-170
+  grep -E "residual est" $L.log | cut -c1-150
+fi
 kill $MON
 echo "exit $rc"
 grep -E "levels|^Ec|NOT CONV|peak per rank|Error|^done|  N " $L.log | cut -c1-200

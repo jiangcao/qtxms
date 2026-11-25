@@ -342,3 +342,23 @@
 #   A=$(PART=a sbatch --parsable envs/daint/drivers_2808a.sbatch); PART=b sbatch --dependency=afterany:$A envs/daint/drivers_2808a.sbatch   -> 5454441 (exact, dm), 5454442 (dmc), results_ms/daint/drivers_2808a_<job>*
 # 2026-11-25 (user): 6 nm with mlbasis (fresh cache dmw_drv), then mlsolve K = 2, streamed smoothers, 8 energies with exact T, two debug jobs, dist_dev6/:
 #   A=$(MODE=basis sbatch --parsable envs/daint/drivers_6nm.sbatch); MODE=solve sbatch --dependency=afterok:$A envs/daint/drivers_6nm.sbatch   -> 5454677, 5454678, results_ms/daint/drivers_6nm_<mode>_<job>*
+# 2026-11-25 (user): 6 nm, Ec + 0.40, 0.50 (not converged in 5454678) with maxit 150, then the study driver at 0.50 on the same bases, debug:
+#   MODE=rerun sbatch envs/daint/drivers_6nm.sbatch   -> 5454926, results_ms/daint/drivers_6nm_rerun_5454926*
+# 2026-11-25 (user: ways to reduce the smoother time): profile of mlsolve at 6 nm (phase times, window microbenchmark, smoothers kept over energies,
+# A_k windows with halo 1), code copy dist_dev7/ (coupling norms off in mlsolve), debug:
+#   sbatch envs/daint/prof_smoother.sbatch   -> 5455040, results_ms/daint/prof_smoother_5455040_*
+
+# 2026-11-25 fresh minimal hierarchy qtx_ms.hier (daint, 4 GPUs; code copies dist_dev8 / 9 / 10 = commit 91fcd56 + qtx_ms/hier)
+#   MODE=2808a MU=-0.15,0.8 sbatch envs/daint/hier.sbatch       # done (99 s of solver, job 5455491, contour to 0.8): N 7837/4707/2119, its max 22, T err 1.3e-6
+#   MODE=2808a sbatch envs/daint/hier.sbatch                    # done (job 5455514, contour to 0.6 as the old driver): N 7335/4283/1776 = mlsolve, 1.0 s per energy, T err 1.3e-6
+#   MODE=6nm sbatch envs/daint/hier.sbatch                      # done (578 s, job 5455515): T = reference to 10 digits, its 20-115, GPU peak 66.1 GiB
+#   sbatch envs/daint/hier_slices.sbatch                        # done (8 min, job 5455615): rho from several weighted contours, 2808a; weights 1,3,0.3 best
+#   sbatch envs/daint/hier_schwarz.sbatch                       # done (41 min, job 5455652, lp82): FGMRES with the CAP-Schwarz smoother alone
+#   sbatch -A c33 envs/daint/hier_control.sbatch                # done (8 min, job 5455684): equal-N control of the weighted contours, 2808a (account c33, user)
+#   sbatch envs/daint/hier_l3.sbatch                            # done (7:42, job 5456734, c33, debug): 6 nm, cuts of 5455515, stop at level 3, exact block-tridiagonal LU there (hier.run --bottom bt; dist_dev11)
+#   LV=2 sbatch envs/daint/hier_l3.sbatch                       # done (about 6 min, job 5456840, c33, debug): the same stopped at level 2 (N 96281), exact block-tridiagonal LU there
+#   CUT3=1e-6 DE=0.40,0.50 sbatch envs/daint/hier_l3.sbatch     # done (5:34, job 5456861, c33, debug): exact level 3 with its cut at 1e-6 (is the level 3 cut the cause of the its at high E?)
+# 2026-11-25 (user): slow modes of the fine smoother as coarse level, dense exact solve (hier.run --slow M,Q,ROUNDS, qtx_ms/hier/slow.py; dist_dev12, c33, debug)
+#   A=$(MODE=2808a sbatch --parsable envs/daint/hier_slow.sbatch); MODE=6nm sbatch --dependency=afterany:$A envs/daint/hier_slow.sbatch   # done (2:14 and 10:12, jobs 5456903, 5456904)
+# 2026-11-25 (user): 12 nm (714 240 orbitals), hierarchy with exact level 3 (--bottom bt, now the default; dist_dev13), 2 nodes, c33, debug: device store first
+#   A=$(sbatch --parsable envs/daint/store_12nm.sbatch); sbatch --dependency=afterok:$A envs/daint/hier_12nm.sbatch   # submitted 20:22 (jobs 5456968, 5456969)

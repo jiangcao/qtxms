@@ -66,8 +66,12 @@ Standing decisions
 - Galerkin coarse operator A_c = U†AU; exact lead Σ on the fine level only. Minimal-residual coarse solves are worse.
 - Smoother = CAP-Schwarz (RAS) windows ≥ ~16 Å along x with an absorbing layer on the artificial cuts; closed local
   solves amplify the error; in-plane (y) cuts need ≥ 16 Å windows too; post-smoothing is essential; Krylov needed.
-- Solver coarse level = slow modes of the smoother / cycle rebuilt per energy (`--fgmres-coarse slow`); they are
-  energy specific, and mode-space bases keep almost-real spurious Galerkin states (cut states at block faces).
+- Solver (user, 2026-11-25) = density-matrix hierarchy `qtx_ms.hier` stopped at a level that is solved exactly by a
+  block-tridiagonal LU (`--bottom bt`, default): level 3 (level 2 is faster at 6 nm but too large for wider devices),
+  V-cycle in FGMRES. Deeper merged levels cost iterations.
+  Slow modes of the smoother / cycle as the only coarse level (`--slow`, `--fgmres-coarse slow`): enough on 2808a and at
+  low energy, not at 6 nm above Ec + 0.15 (energy specific, their number grows steeply with energy and device size).
+- Mode-space bases keep almost-real spurious Galerkin states (cut states at block faces).
 - Bases are density matrices over a complex contour (level 1 local ρ with CAP + lead Σ embedding, level 2 global ρ);
   label a basis by partition, level and cut. Lead CMS, FEAST probes, Beyn pole bases, tile SCF / iterated tiles, PoU
   and SA-smoothed bases, per-core cuts of slow modes: tried, negative or no gain (see the log).
