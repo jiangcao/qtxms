@@ -192,6 +192,143 @@ def test_slow(env):
     assert np.abs(Q.conj().T @ Q - np.eye(32)).max() < 1e-12
 
 
+def test_beyn(env, tmp_path):
+    """Beyn Sigma of the subdivided lead (3 cells) = folded lead: contour points to 1e-6, real axis up to the eta = 1e-6 of the folded lead;
+    T of both models; the cached files are kept apart; the bases of beyn-real are those of folded."""
+    d, inp, ref = env
+    dev = mb.Device(devstore.read_any(str(d / "dev")), obc="folded")
+    q = {m: obc.OBC(dev, dist.Comm(), log=lambda *x: None, model=m) for m in ("folded", "beyn")}
+    zs = [0.35 + 0.1j, 0.5 + 0.05j, 0.42 + 1e-6j]
+    for o in q.values():
+        o.prepare(zs[:2], zs[2:])
+    inp1 = q["beyn"].dev.inp
+    sec, pm = obc.smallest_cell(inp1, np.where(np.repeat(inp1["blocks"], inp1["norb"]) == inp1["meta"]["transport"]["lead_left_block"])[0])
+    assert sec == 3 and len(pm) == 48 and sorted(q["beyn"]._leads["L"][0].layer["L", "H"]) == [-1, 0, 1]
+    for z in zs:
+        for side in (0, 1):
+            A, B = q["beyn"].sigma(z, side), q["folded"].sigma(z, side)
+            assert np.abs(A - B).max() < (1e-5 if z.imag > 1e-3 else 1e-2) * np.abs(B).max()
+    z = -2.65 + 1e-6j                                                  # more eigenvalues in the annulus than the cell has orbitals
+    for o in q.values():
+        o.prepare([], [z])
+    A, B = q["beyn"].sigma(z, 0), q["folded"].sigma(z, 0)
+    assert q["beyn"].inject(z).shape[1] == q["folded"].inject(z).shape[1] == 2 and np.abs(A - B).max() < 1e-2 * np.abs(B).max()
+    for z in zs[2:]:                                                    # the incoming modes: B B^H = Gamma_L
+        S, B = q["beyn"].sigma(z, 0), q["beyn"].inject(z)
+        G = 1j * (S - S.conj().T)
+        assert 0 < B.shape[1] and np.abs(B @ B.conj().T - G).max() < 1e-5 * np.abs(G).max()
+    r = {m: go(d, None, False, "--obc", m, "--sigma-cache", str(tmp_path / "s"), "--cache", str(tmp_path / "b")) for m in ("folded", "beyn-real", "beyn")}
+    for m in ("beyn-real", "beyn"):
+        for k, v in ref["E"].items():
+            w = r[m]["E"][k]
+            assert w["converged"] and abs(w["T"] - v["T"]) < 1e-2 * abs(v["T"])
+    assert r["beyn-real"]["N"] == r["folded"]["N"]
+    assert len(list((tmp_path / "s").glob("bmode_*"))) == 2 == len(list((tmp_path / "s").glob("inj_*")))
+    assert len(list((tmp_path / "s").glob("bsigL_*"))) == 10 == len(list((tmp_path / "s").glob("bsigR_*")))    # Beyn: one file per side
+    assert len(list((tmp_path / "s").glob("sig_*"))) == 10
+    assert len(list((tmp_path / "b").glob("hier_*"))) == 2
+
+
+def test_contour_sigma_only_for_rho(env, tmp_path):
+    """Beyn at the contour points only when a density matrix is built: not with all bases cached, again when a basis is lost."""
+    d, _, _ = env
+    m = lambda s: ["--obc", "beyn", "--sigma-cache", str(tmp_path / s), "--cache", str(tmp_path / "b")]
+    eq = lambda r: r["N"] == ref["N"] and all(abs(v["T"] - ref["E"][k]["T"]) < 1e-8 and v["converged"] for k, v in r["E"].items())
+    count = lambda s: (len(list((tmp_path / s).glob("bsigL_*"))), len(list((tmp_path / s).glob("sig_*"))))
+    ref = go(d, None, False, *m("s0"))
+    npts = count("s0")[0] - 2
+    assert npts > 0 and count("s0")[1] == 0                            # two energies; every contour point with Beyn
+    assert eq(go(d, None, False, *m("s1")))
+    assert count("s1") == (2, 0)
+    next((tmp_path / "b").glob("hier_*/U2_0.npy")).unlink()
+    assert eq(go(d, None, False, *m("s2")))
+    assert count("s2") == (npts + 2, 0)
+
+
+def test_beyn_ranks(env, tmp_path, monkeypatch):
+    """Beyn tasks per point and side: every (z, side) once, the left lead on the even ranks, the right lead on the odd ranks; T as on one rank;
+    the coupling bases are stored in the basis folder and loaded by a later run."""
+    from qtx_ms.obc_beyn import BeynLead
+    d, _, _ = env
+    calls, where = collections.Counter(), collections.defaultdict(set)
+    sig = BeynLead.sigma
+
+    def counted(self, z, side, *x):
+        calls[complex(z), side] += 1
+        return sig(self, z, side, *x)
+    monkeypatch.setattr(BeynLead, "sigma", counted)
+    m = lambda s: ["--obc", "beyn", "--sigma-cache", str(tmp_path / s), "--cache", str(tmp_path / "b")]
+    ref = go(d, None, False, "--obc", "beyn")                          # one rank, no cache
+    calls.clear()
+    rs = dist.ThreadComm.run(3, lambda c: go(d, c, True, *m("s")))
+    assert len(calls) == 20 and set(calls.values()) == {1}            # 8 contour + 2 real points, two sides, each on one rank
+    for q, r in enumerate(rs):
+        where[q] = set(r["h"].obc._leads)
+        assert r["N"] == ref["N"] and all(abs(v["T"] - ref["E"][k]["T"]) < 1e-9 for k, v in r["E"].items())
+    assert where[0] == where[2] == {"L"} and where[1] == {"R"}
+    assert len(list((tmp_path / "b").glob("beyn_basis_L_*.npz"))) == 1 == len(list((tmp_path / "b").glob("beyn_basis_R_*.npz")))
+    calls.clear()
+    r = go(d, None, False, *m("s2"))                                   # bases cached: only the real points, coupling bases loaded
+    assert len(calls) == 4 and all(abs(v["T"] - ref["E"][k]["T"]) < 1e-9 for k, v in r["E"].items())
+    assert all(r["h"].obc._leads[sd][0]._bases[sd].get("loaded") for sd in "LR")
+
+
+@pytest.mark.parametrize("kmax", [1, 3, 5])
+def test_lead_blocks(kmax):
+    """Periodic lead of 5 primitive cells: only the nonzero blocks L_k are stored (real); g of the subdivided lead = decimation of the lead
+    cell at complex z and next to the real axis (the Beyn rank exceeds the cell here: higher moments), incoming modes B B^H = Gamma."""
+    import scipy.sparse as sp
+    from qtx_ms.obc_beyn import BeynLead
+    m, s = 12, 5
+    n, r = s * m, np.random.default_rng(3)
+
+    def lead(scale):
+        L = {k: scale * 0.3 ** k * r.standard_normal((m, m)) for k in range(kmax + 1)}
+        L[0] = L[0] + L[0].T
+        for k in range(1, kmax + 1):
+            L[-k] = L[k].T
+        return [sp.csr_matrix(np.block([[L.get(j - i + o, np.zeros((m, m))) for j in range(s)] for i in range(s)])) for o in (0, s)]
+    (H0, H1), (S0, S1) = lead(1.0), lead(0.02)
+    S0 = S0 + sp.identity(n)
+    fl = mb.FoldedLead(H0, H1, S0.tocsr(), S1)
+    I = sp.identity(n, format="csr")
+    for side, (dev_c, gi) in dict(L=(H1, 0), R=(H1.T.tocsr(), 1)).items():
+        for z in (0.3 + 0.1j, 0.3 + 1e-6j):
+            for sec in (s, 1):
+                bl = BeynLead(H0, H1, S0, S1, sec, np.arange(n) if sec > 1 else None, sides=side, m0=n // sec)
+                assert sorted(bl.layer[side, "H"]) == (list(range(-kmax, kmax + 1)) if sec > 1 else [-1, 0, 1])
+                assert all(v.dtype == float for q in "HS" for v in bl.layer[side, q].values())
+                g = bl.sigma(z if z.imag > 1e-3 else z.real, side, I, I)[0]
+                ref = fl.surface_gfs(z)[gi]
+                assert np.abs(g[np.ix_(fl.F, fl.F)] - ref).max() < (1e-9 if z.imag > 1e-3 else 1e-3) * np.abs(ref).max()
+                if sec > 1:
+                    d, u = bl.sigma(z.real, side, I, I)
+                    G = 1j * (d - d.conj().T)
+                    assert np.abs(u @ u.conj().T - G).max() < 1e-5 * max(np.abs(G).max(), 1)
+
+
+def test_closed(env, tmp_path):
+    """No lead: columns of G_c = (E S - H)^-1 on the contact faces against the dense inverse, all and some columns, ranks; no Sigma is
+    computed; the bases of the closed device are not those of the open one."""
+    d, _, ref = env
+    more = ["--obc", "closed", "--maxit", "200", "--cache", str(tmp_path / "b"), "--chunk", "7", "--out"]
+    r = go(d, None, False, *more, str(tmp_path / "r.json"))
+    few = go(d, None, False, *more, str(tmp_path / "f.json"), "--rhs-cols", "5")
+    go(d, None, False, "--cache", str(tmp_path / "b"))
+    assert len(list((tmp_path / "b").glob("hier_*"))) == 2 and not r["h"].obc.mem
+    rs = dist.ThreadComm.run(2, lambda c: go(d, c, False, *more, str(tmp_path / "t.json")))
+    dev = r["h"].dev
+    for k, v in r["E"].items():
+        G = np.linalg.inv((v["E"] * dev.S - dev.H).toarray())
+        for f, n in (("r", len(dev.bL)), ("f", 5), ("t", len(dev.bL))):
+            z = np.load(tmp_path / f"{f}.json.G_{float(k):+.4f}.npz")
+            assert len(z["J"]) == n
+            for X, Y in ((z["G_LL"], G[np.ix_(dev.bL[z["J"]], dev.bL[z["J"]])]), (z["G_RL"], G[np.ix_(dev.bR, dev.bL[z["J"]])])):
+                assert np.abs(X - Y).max() < 1e-6 * np.abs(G).max()
+        for q in [v, few["E"][k]] + [x["E"][k] for x in rs]:
+            assert q["converged"] and q["T"] is None and q["closed"]["asym"] < 1e-6
+
+
 def test_gpu(env):
     try:
         gpu.enable()
@@ -201,3 +338,4 @@ def test_gpu(env):
         same(go(env[0]), env[2])
     finally:
         gpu.enable(False)
+

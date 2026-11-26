@@ -1,5 +1,6 @@
 """Fine level: the rows of S, H of the own cores and of the own windows (one CSR pattern, two real value arrays) on the device;
 dense blocks of them, the fine operator and the CAP-Schwarz smoother S_0."""
+import time
 import numpy as np
 import scipy.sparse as sp
 
@@ -112,7 +113,7 @@ class Fine:
 
     # ---- fine operator at one energy
     def set_energy(self, E, Sig):
-        """E S - H - Sigma of the own rows; Sig = (Sigma_L, Sigma_R) numpy."""
+        """E S - H - Sigma of the own rows; Sig = (Sigma_L, Sigma_R) numpy (None: no lead)."""
         xp = _xp()
         a, nl = E * self.s[:self.nnz_own] - self.h[:self.nnz_own], self.part.nloc
         ip, ix = self.ip[:nl + 1], self.ix[:self.nnz_own]
@@ -121,7 +122,7 @@ class Fine:
             self.A = csp.csr_matrix((a, ix, ip.astype(np.int32)), shape=(nl, self.n), copy=False)
         else:
             self.A = sp.csr_matrix((a, ix, ip), shape=(nl, self.n))
-        self.sig = [(r, b, xp.asarray(S[ii], complex)) for S, (ii, r, b) in zip(Sig, self.lead) if len(ii)]
+        self.sig = [(r, b, xp.asarray(S[ii], complex)) for S, (ii, r, b) in zip(Sig, self.lead) if len(ii) and S is not None]
 
     def __matmul__(self, x):
         xp = _xp()
@@ -155,17 +156,30 @@ class Fine:
             S, H, C, lead = self.window(k)
             A = xp.asfortranarray((E * S - H).astype(dt) + 1j * C.astype(dt))
             del S, H, C
-            for side, w, j in lead:
+            for side, w, j in lead if Sig[0] is not None else []:
                 A[w[:, None], w] -= xp.asarray(Sig[side][np.ix_(j, j)], dt)
             R = inverse_rows(A, xp.asarray(np.where(self.sw.core[k])[0]))
             del A
             ops.append((xp.asarray(self.exw.pos[self.sw.idx[k]]), xp.asarray(self.part.gloc[self.cores[k]]), R))
 
         def S0(r):
+            prof = getattr(self, "prof", None)                         # dict: halo and window products timed (GPU synchronised)
+            if prof is not None:
+                gpu.sync()
+                t = time.time()
             x = self.exw(r).astype(dt)
+            if prof is not None:
+                gpu.sync()
+                t1 = time.time()
+                a, n = prof.get("  S0 halo exchange", (0.0, 0))
+                prof["  S0 halo exchange"] = (a + t1 - t, n + 1)
             z = xp.zeros(r.shape, r.dtype)
             for rw, out, R in ops:
                 z[out] = R @ x[rw]
+            if prof is not None:
+                gpu.sync()
+                a, n = prof.get("  S0 window products", (0.0, 0))
+                prof["  S0 window products"] = (a + time.time() - t1, n + 1)
             return z
         S0.gb = sum(R.nbytes for _, _, R in ops) / 2 ** 30
         return S0

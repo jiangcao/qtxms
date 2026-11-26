@@ -80,10 +80,11 @@ class Hier:
         self.dir = None
         if cache:
             tag = json.dumps([name, dev.n, sw.s, sw.d, [len(i) for i in sw.idx], ups, cut1]
-                             + ([list(sl[0][:2]), sl[0][2]] if len(sl) == 1 and sl[0][3] == 1 else [[list(c) for c in sl]]) + ["hier1"])
+                             + ([list(sl[0][:2]), sl[0][2]] if len(sl) == 1 and sl[0][3] == 1 else [[list(c) for c in sl]]) + ["hier1"] + ([obc.model] if obc.model in ("beyn", "closed") else []))
             self.dir = os.path.join(cache, "hier_" + hashlib.sha1(tag.encode()).hexdigest()[:12])
             os.makedirs(self.dir, exist_ok=True)
         self.cached = True
+        self.prof = None                                               # dict: timers of the preconditioner parts (run.py --profile)
         self.U, self.r, self.off, self.N = {}, {}, {}, {}
         self.SH, self.Y, self.part, self.order, self.capw, self.trans, self.halo = {}, {}, {}, {}, {}, {}, {}
 
@@ -110,16 +111,31 @@ class Hier:
                 self._windows(k)
             gpu.free()
         self.sigc = {}
+        g = lambda xs: sum(v.nbytes for v in xs) / 2 ** 30
+        m = dict(pairs=[g(self.SH[k].values()) for k in self.SH], bases=[g(self.U[k].values()) for k in self.U],
+                 lead=g(Y for v in self.Y.values() for Y, _, _ in v), fine=self.fine.gb,
+                 cap_host=g(C for v in self.capw.values() for _, _, C in v))
+        self.log("memory of rank 0 [GiB]: " + ", ".join(f"{k} {[round(x, 1) for x in v] if isinstance(v, list) else round(v, 1)}" for k, v in m.items())
+                 + " (cap: host)")
+
+    def _file(self, k, b):
+        return os.path.join(self.dir, f"U{k}_{b}.npy")
+
+    def have_bases(self):
+        """The bases of every level are on disk: no density matrix is built, the contour Sigma are not needed. Collective."""
+        own = [(k, b) for k in range(1, self.K + 1) for b in range(self.lv[k].n) if self.lv[k].owner[b] == self.comm.rank]
+        return all(self.comm.allgather(bool(self.dir) and all(os.path.exists(self._file(k, b)) for k, b in own)))
 
     def sigma_c(self, q, side):
         if (q, side) not in self.sigc:
-            self.sigc[q, side] = np.array(self.obc.sigma(self.zs[q], side))
+            S = self.obc.sigma(self.zs[q], side)
+            self.sigc[q, side] = S if S is None else np.array(S)
         return self.sigc[q, side]
 
     def _bases(self, k):
         L, me, xp, U = self.lv[k], self.comm.rank, _xp(), {}
         own = [b for b in range(L.n) if L.owner[b] == me]
-        f = lambda b: os.path.join(self.dir, f"U{k}_{b}.npy")
+        f = lambda b: self._file(k, b)
         have = bool(self.dir) and self.cached and all(os.path.exists(f(b)) for b in own)
         self.cached = all(self.comm.allgather(have))                   # a new level: the files above it belong to other bases
         if self.cached:
@@ -149,7 +165,7 @@ class Hier:
             S, H, C, lead = self.fine.window(k, np.concatenate([np.where(~core)[0], np.where(core)[0]]))
 
             def add(M, q):
-                for side, w, j in lead:
+                for side, w, j in lead if self.obc.model != "closed" else []:
                     M[w[:, None], w] -= xp.asarray(self.sigma_c(q, side)[np.ix_(j, j)])
             acc = fold(S, 1j * C - H, add, ne, self.zs, self.dzs, range(len(self.zs)))
             del S, H, C
@@ -171,7 +187,7 @@ class Hier:
                 S, Kw = D[0], (-D[1]).astype(complex)
                 del D
                 for a, b, C in self.capw[k, g]:
-                    Kw[a, b] += 1j * C.astype(float)
+                    Kw[a, b] += 1j * xp.asarray(C).astype(float)
             if shared:
                 S = self.comm.sum(S if w.owner == me else xp.zeros((n, n)))
                 Kw = self.comm.sum(Kw if w.owner == me else xp.zeros((n, n), complex))
@@ -179,7 +195,7 @@ class Hier:
             Yw = [(side, p, self.Y[k][side][0][:, c]) for side, p, c in lead]
 
             def add(M, q):
-                for side, p, Y in Yw:
+                for side, p, Y in Yw if self.obc.model != "closed" else []:
                     M[p[:, None], p] -= Y.T @ (xp.asarray(self.sigma_c(q, side)) @ Y)
             nz = len(self.zs)
             acc = fold(S, Kw, add, n - npr, self.zs, self.dzs, range(me, nz, size) if shared else range(nz))
@@ -312,8 +328,10 @@ class Hier:
                 X[ro[b]:ro[b + 1]] = Ys[b]
                 X = Wd @ X
                 for a, (q1, _) in enumerate(hit):
-                    C = Ys[a].T @ X[ro[a]:ro[a + 1]]
-                    self.capw[k, g].append((slice(o[q1], o[q1 + 1]), slice(o[q2], o[q2 + 1]), C.astype(F4)))
+                    if not L.G[order[q1], order[q2]]:
+                        continue
+                    C = gpu.pinned((Ys[a].T @ X[ro[a]:ro[a + 1]]).astype(F4))      # host: used once per energy
+                    self.capw[k, g].append((slice(o[q1], o[q1 + 1]), slice(o[q2], o[q2 + 1]), C))
 
     def _window_lead(self, k, order, o):
         """[(side, window positions, columns of Y_k)] of the lead blocks of a window."""
@@ -401,7 +419,7 @@ class Hier:
         self.A, self.S, self.gb, self.schwarz = {}, {}, {}, schwarz
         for k in range(1, 0 if schwarz else self.K + 1):
             t = time.time()
-            sg = [Y.T @ (xp.asarray(Sig[s]) @ Y) for s, (Y, _, _) in enumerate(self.Y[k])]
+            sg = [Y.T @ (xp.asarray(Sig[s]) @ Y) if Sig[s] is not None else xp.zeros((Y.shape[1],) * 2, complex) for s, (Y, _, _) in enumerate(self.Y[k])]
             if k == self.K:
                 (self._bottom_bt if self.bottom_kind == "bt" else self._bottom)(E, sg)
                 self.tick("bottom LU", t)
@@ -463,7 +481,7 @@ class Hier:
                 if i != j:
                     M[o[b]:o[b + 1], o[a]:o[a + 1]] = A[i, j].T
             for a, b, C in self.capw[k, g]:
-                M[a, b] += 1j * C
+                M[a, b] += 1j * xp.asarray(C)
             for side, p, c in self._window_lead(k, order, o):
                 M[p[:, None], p] -= sg[side][c[:, None], c]
             R = inverse_rows(M, xp.arange(n - npr, n))
@@ -571,21 +589,36 @@ class Hier:
         self.bottom = lambda r: solve(part.gather(r).astype(complex))[idx].astype(C8)
 
     # ------------------------------------------------------------------ preconditioner
+    def _t(self, key, f, *x):
+        """f(*x), timed into self.prof[key] (seconds, calls) with the GPU synchronised when profiling (self.prof a dict)."""
+        if self.prof is None:
+            return f(*x)
+        sync()
+        t = time.time()
+        y = f(*x)
+        sync()
+        s, n = self.prof.get(key, (0.0, 0))
+        self.prof[key] = (s + time.time() - t, n + 1)
+        return y
+
     def coarse(self, k, r):
         """V-cycle on A_k."""
         if k == self.K:
-            return self.bottom(r)
+            return self._t(f"bottom solve (level {k})", self.bottom, r)
         A, S, (P, PT) = self.A[k], self.S[k], self.trans[k + 1]
-        z = S(r)
-        z = z + P(self.coarse(k + 1, PT(r - A(z))))
-        return z + S(r - A(z))
+        t = self._t
+        z = t(f"smoother level {k}", S, r)
+        z = z + t(f"prolong {k + 1}->{k}", P, self.coarse(k + 1, t(f"restrict {k}->{k + 1}", PT, r - t(f"A_{k} product", A, z))))
+        return z + t(f"smoother level {k}", S, r - t(f"A_{k} product", A, z))
 
     def prec(self, r):
         if self.slow is not None:
             return self.slow.cycle(r)
-        z = self.S0(r)
+        t = self._t
+        z = t("S0 fine smoother", self.S0, r)
         if self.schwarz:
             return z
         P, PT = self.trans[1]
-        z = z + P(self.coarse(1, PT((r - self.fine @ z).astype(C8))))
-        return z + self.S0(r - self.fine @ z)
+        fm = lambda v: self.fine @ v
+        z = z + t("prolong 1->fine", P, self.coarse(1, t("restrict fine->1", PT, (r - t("fine product (in prec)", fm, z)).astype(C8))))
+        return z + t("S0 fine smoother", self.S0, r - t("fine product (in prec)", fm, z))
