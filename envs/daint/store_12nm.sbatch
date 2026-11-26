@@ -1,6 +1,6 @@
 #!/bin/bash
 # Device store (qtx_ms.devstore) of the 12 nm inputs (cache_daint/12nm/prep, 714 240 orbitals) for qtx_ms.hier --dev-store.
-#   sbatch envs/daint/store_12nm.sbatch       (repo root; code copy dist_dev13)
+#   sbatch envs/daint/store_12nm.sbatch       (repo root; code copy dist_dev13); DEV: folder in cache_daint (default 12nm; OFF state 12nm_off)
 #SBATCH --job-name=store-12nm
 #SBATCH --account=c33
 #SBATCH --partition=debug
@@ -13,7 +13,7 @@
 #SBATCH --output=.tools/%x-%j.out
 set -e
 cd "$SLURM_SUBMIT_DIR"
-R=$PWD; CODE=${CODE:-$R/dist_dev13}; C=$R/cache_daint/12nm
+R=$PWD; CODE=${CODE:-$R/dist_dev13}; C=$R/cache_daint/${DEV:-12nm}
 export OMP_NUM_THREADS=64 OPENBLAS_NUM_THREADS=64
 source envs/daint/activate.sh
 cd $CODE; test -f $C/store/store.json || time python -u -m qtx_ms.devstore --inputs $C/prep --out $C/store

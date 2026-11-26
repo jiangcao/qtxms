@@ -361,4 +361,54 @@
 # 2026-11-25 (user): slow modes of the fine smoother as coarse level, dense exact solve (hier.run --slow M,Q,ROUNDS, qtx_ms/hier/slow.py; dist_dev12, c33, debug)
 #   A=$(MODE=2808a sbatch --parsable envs/daint/hier_slow.sbatch); MODE=6nm sbatch --dependency=afterany:$A envs/daint/hier_slow.sbatch   # done (2:14 and 10:12, jobs 5456903, 5456904)
 # 2026-11-25 (user): 12 nm (714 240 orbitals), hierarchy with exact level 3 (--bottom bt, now the default; dist_dev13), 2 nodes, c33, debug: device store first
-#   A=$(sbatch --parsable envs/daint/store_12nm.sbatch); sbatch --dependency=afterok:$A envs/daint/hier_12nm.sbatch   # submitted 20:22 (jobs 5456968, 5456969)
+#   A=$(sbatch --parsable envs/daint/store_12nm.sbatch); sbatch --dependency=afterok:$A envs/daint/hier_12nm.sbatch   # store done (1:36, 5456968); run failed (13:18, 5456969): GPU out of memory in the level 3 LU, bases and Sigma cached
+#   CODE=$PWD/dist_dev14 sbatch envs/daint/hier_12nm.sbatch   # done (job 5457039): projected CAP blocks on the host, memory logged; +0.50 not converged in 100 its
+#   OBC=beyn-real MAXIT=200 CODE=$PWD/dist_dev15 sbatch envs/daint/hier_12nm.sbatch   # done (job 5457068, 15:03): Beyn Sigma at the real energies, cached bases; all 3 energies converge (maxit 200)
+# closed device (--obc closed: no Sigma, RHS = 80 of the 4128 / 8256 unit vectors of the left contact face), submitted 21:04:
+#   OBC=closed CODE=$PWD/dist_dev16 sbatch envs/daint/hier_l3.sbatch     # 6 nm, done (job 5457149, 8:19, debug)
+#   OBC=closed MAXIT=200 CODE=$PWD/dist_dev16 sbatch -A lp82 envs/daint/hier_12nm.sbatch   # 12 nm, done (job 5457150, 13:52; +0.50 not converged in 200 its: max residual 1.1e-9) (submitted normal / c33, moved pending to debug / lp82, 30 min, by the user at 21:10)
+# Beyn incoming modes as injection (no Gamma_L eigenproblem), timings of the Beyn steps:
+#   OBC=beyn-real MAXIT=200 CODE=$PWD/dist_dev17 sbatch envs/daint/hier_12nm.sbatch   # done (job 5457257, 14:58): T = reference to 1e-10
+# profile of the Beyn lead setup (leads 131 s, coupling bases 153 + 149 s of 464 s):
+#   CODE=$PWD/dist_dev17 sbatch envs/daint/prof_beyn.sbatch   # done (job 5457498, 6:12) (5457489 failed at import: wrong code path)
+#   CODE=$PWD/dist_dev17 sbatch envs/daint/prof_beyn_cpl.sbatch   # done (job 5457524): 'leads 131 s' = page-wise mmap reads of the 8 dense coupling files (~40 MB/s)
+# coupling-basis products on the GPU (qtx_ms/obc_beyn.py), time and Sigma / B against the cached files of 5457257:
+#   CODE=$PWD/dist_dev18 sbatch envs/daint/prof_beyn_new.sbatch   # done (job 5457529, 5:02): basis 153 + 149 s -> 22.8 + 18.5 s
+# sparse lead-device couplings (both stores converted in place, dense files kept) and nonzero lead blocks, checked on the 12 nm lead:
+#   CODE=$PWD/dist_dev19 sbatch envs/daint/prof_beyn_new.sbatch   # done (job 5457611, 2:46)
+#   CODE=$PWD/dist_dev19 sbatch envs/daint/prof_folded_cpl.sbatch   # done (job 5457623): folded Sigma, sparse against dense couplings: 1e-15
+# 12 nm T with the sparse couplings and nonzero lead blocks (fresh Sigma folder: links to the folded contour files only):
+#   SIG=$PWD/cache_daint/12nm/hier_sigma_new OBC=beyn-real MAXIT=200 CODE=$PWD/dist_dev19 sbatch envs/daint/hier_12nm.sbatch   # done (job 5457667, 8:22): T = reference to 1e-10
+# phases of the Beyn Sigma (12 nm, left) and Sigma error after 1, 2, ... fixed-point steps:
+#   CODE=$PWD/dist_dev20 sbatch envs/daint/prof_fp.sbatch   # done (job 5457714, 12:36): stalls after 4-6 steps, 8-16 used; chunks = fixed point in time
+# 12 nm T with the earlier stop of the fixed point (dist_dev21, fresh Sigma folder):
+#   SIG=$PWD/cache_daint/12nm/hier_sigma_stop OBC=beyn-real MAXIT=200 CODE=$PWD/dist_dev21 sbatch envs/daint/hier_12nm.sbatch   # done (job 5457786, 8:03): T moved 5e-10 vs old stop, Sigma 53.6 s (55.2)
+# 12 nm with Beyn on the contour too (bases rebuilt; dist_dev22: contour Sigma only when a density matrix is built):
+#   SIG=$PWD/cache_daint/12nm/hier_sigma_stop OBC=beyn MAXIT=200 CODE=$PWD/dist_dev22 sbatch envs/daint/hier_12nm.sbatch   # done (job 5457798, 16:05): T = 5457786 to 6e-13, its -1..-3, contour 99 s
+# 12 nm full sweep Ec+0.00..0.50 step 0.01 (51 energies), Beyn everywhere, per-side Beyn tasks, cached bases (dist_dev23); table: envs/daint/sweep_table.py:
+#   SIG=$PWD/cache_daint/12nm/hier_sigma_stop OBC=beyn MAXIT=300 DE=0.00,0.01,...,0.50 CODE=$PWD/dist_dev23 sbatch --partition=normal --time=02:00:00 --job-name=hier-12nm-sweep envs/daint/hier_12nm.sbatch   # job 5457909, cancelled before it started (user, 2026-11-26)
+# 12 nm on 4 nodes (16 GPUs), debug, same 3 energies, fresh Sigma folder (per-side Beyn tasks on 16 ranks), cached bases:
+#   SIG=$PWD/cache_daint/12nm/hier_sigma_4n OBC=beyn MAXIT=200 CODE=$PWD/dist_dev23 sbatch --nodes=4 --job-name=hier-12nm-4n envs/daint/hier_12nm.sbatch   # done (job 5457910, 5:41): solve 1.5x faster at +0.50, bottom LU slower
+# 12 nm on 6 nodes (24 GPUs), debug, same 3 energies, fresh Sigma folder (coupling bases loaded):
+#   SIG=$PWD/cache_daint/12nm/hier_sigma_6n OBC=beyn MAXIT=200 CODE=$PWD/dist_dev23 sbatch --nodes=6 --job-name=hier-12nm-6n envs/daint/hier_12nm.sbatch   # done (job 5457977, 4:34): +0.50 105.7 s (4 nodes 131.1, 2 nodes 195.8)
+# 12 nm 6 nodes, timing breakdown of the solve (--profile, GPU synchronised at every timer; dist_dev24):
+#   SIG=$PWD/cache_daint/12nm/hier_sigma_6n OBC=beyn MAXIT=200 EXTRA=--profile CODE=$PWD/dist_dev24 sbatch --nodes=6 --job-name=hier-12nm-prof envs/daint/hier_12nm.sbatch   # done (job 5458061, 5:08): least squares 23 s, bottom solve 21 s, fine products 23 s of 111 s at +0.50
+# 12 nm 6 nodes, lower cuts of levels 2 and 3 (user: fewer its at +0.50); bases of all levels rebuilt (new cache folder):
+#   CUT2=1e-6 CUT3=1e-6 SIG=$PWD/cache_daint/12nm/hier_sigma_stop OBC=beyn MAXIT=200 CODE=$PWD/dist_dev24 sbatch --nodes=6 --job-name=hier-12nm-c1e-6 envs/daint/hier_12nm.sbatch   # done (job 5458088, 8:17): +0.50 its 100..103, 71.0 s
+#   CUT2=1e-7 CUT3=1e-7 (same)   # done (job 5458089, 7:46): +0.50 its 49..51, 43.3 s
+# 12 nm full sweep Ec+0.00..0.50 step 0.01 (51 energies), cuts 1e-7 at levels 2 / 3, 2 nodes, normal 2 h (cancelled pending, user: debug, fewer points), cached bases of 5458089 (user, 2026-11-26):
+#   CUT2=1e-7 CUT3=1e-7 SIG=$PWD/cache_daint/12nm/hier_sigma_stop OBC=beyn MAXIT=300 DE=0.00,0.01,...,0.50 CODE=$PWD/dist_dev24 sbatch --partition=normal --time=02:00:00 --job-name=hier-12nm-sweep-c1e-7 envs/daint/hier_12nm.sbatch   # job 5461019, cancelled
+#   same on debug (30 min), 11 energies Ec+0.00..0.50 step 0.05 (user):
+#   CUT2=1e-7 CUT3=1e-7 SIG=$PWD/cache_daint/12nm/hier_sigma_stop OBC=beyn MAXIT=300 DE=0.00,0.05,...,0.50 CODE=$PWD/dist_dev24 sbatch --job-name=hier-12nm-sweep-c1e-7 envs/daint/hier_12nm.sbatch   # failed (job 5461022, 3:27): GPU out of memory in the bottom block-tridiagonal LU at Ec+0.05 (2 nodes too small for cuts 1e-7)
+# distributed bottom LU (hier --bottom bt now = domains of slabs + separator system on one rank; old replicated LU: --bottom btrep), dist_dev25:
+#   CUT2=1e-7 CUT3=1e-7 SIG=$PWD/cache_daint/12nm/hier_sigma_stop OBC=beyn MAXIT=300 DE=0.00,0.05,...,0.50 CODE=$PWD/dist_dev25 sbatch --job-name=hier-12nm-sweep-c1e-7 envs/daint/hier_12nm.sbatch   # done (job 5461473, 14:18, 2 nodes): all 11 converge, T = 6-node runs to 1e-10, +0.50 its 49..52, 84.6 s; factors 11.5 GB on the largest rank (8 domains, 7 separators), node peak 77 GB
+# OFF state 12 nm (user, 2026-11-26): barrier 0.2 eV above the source on the middle third, drain -0.4 eV (qtx_ms.prep.offstate, dist_dev26):
+#   A=$(sbatch --parsable envs/daint/prep_off_12nm.sbatch); A=$(DEV=12nm_off CODE=$PWD/dist_dev26 sbatch --parsable --dependency=afterok:$A envs/daint/store_12nm.sbatch)   # prep done (job 5461633, 11:32; right_lead_shift -0.4, V [-0.4, 0.2]), store 5461634
+#   DEV=12nm_off CUT2=1e-7 CUT3=1e-7 OBC=beyn MAXIT=300 DE=0.00,0.05,...,0.50 CODE=$PWD/dist_dev26 sbatch --nodes=6 --dependency=afterok:<store> --job-name=hier-12nm-off envs/daint/hier_12nm.sbatch   # done (job 5461684, 11 min: setup 383 s (bases 273 s), its 28..43, T(+0.25) 0.844, T(+0.50) 8.263)
+# Gate sweep on the Vb 0.2 bases (user, 2026-11-26: reusability of the bases for varying gate voltages): dV = V(VB) - V(0.2) as
+# (dV S + S dV) / 2 on the fine H (hier --dV), Sigma and bases of 12nm_off reused; reference with new bases of H + dV (MODE=build)
+#   VBS="0.1 0.3 0.0" CODE=$PWD/dist_dev27 sbatch envs/daint/hier_gate_12nm.sbatch              # done (job 5462593, 13:54: Vb 0.1 / 0.3 / 0.0 in 291 / 230 / 243 s, setup 10-61 s, its 25..53)
+#   MODE=build VBS="0.1 0.3" CODE=$PWD/dist_dev27 sbatch envs/daint/hier_gate_12nm.sbatch       # done (job 5462594, 18:31: 555 / 494 s, bases 264 / 250 s; T = reuse to 1e-10)
+# Source-drain bias on the same bases (user, 2026-11-26): dV = V(0.2, VDS) - V(0.2, 0.4) = -(VDS - 0.4) on the drain and the right lead face
+# -> Sigma_R of the 0.4 lead at E + VDS - 0.4 (OBC shift_R, Beyn), Sigma_L / injection / bases reused
+#   VBS=0.2 VDSS="0.1 0.2 0.3 0.5" CODE=$PWD/dist_dev28 sbatch --job-name=hier-bias envs/daint/hier_gate_12nm.sbatch   # submitted (job 5463970, 6 nodes, debug)
