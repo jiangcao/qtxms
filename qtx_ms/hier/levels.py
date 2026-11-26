@@ -75,9 +75,12 @@ def tri_solve(f, ys):
 
 
 class Hier:
-    def __init__(self, dev, inp, sw, comm, obc, ups, cut1, sl, cache=None, name="dev", log=mb.log):
+    def __init__(self, dev, inp, sw, comm, obc, ups, cut1, sl, cache=None, name="dev", log=mb.log, dV=None):
         """sw: CapSchwarz (geometry of the fine windows, x windows x y strips); ups [(axis, cut, halo)] merges; cut1: cut of level 1;
-        sl: contours [(mu1, mu2, npts, weight)] in absolute energies; cache: folder of the bases."""
+        sl: contours [(mu1, mu2, npts, weight)] in absolute energies; cache: folder of the bases. dV: potential change per orbital of inp [eV]
+        on top of the inputs, H += (dV S + S dV) / 2 on the fine level; the Galerkin blocks project it into the bases, which are
+        those of the inputs (cached: run.py --dV refuses to build new ones). It must vanish on the left lead face and be constant on the
+        right one (another drain bias: Sigma_R at a shifted energy, OBC shift_R = -dV there)."""
         self.dev, self.sw, self.comm, self.obc, self.log = dev, sw, comm, obc, log
         self.slow, self.slow_par = None, None                          # slow-mode coarse level: (m, q, rounds), with schwarz
         self.bottom_kind, self.bottom_res = "bt", None              # deepest level: "bt" distributed / "btrep" replicated block-tridiagonal LU, "dense"
@@ -90,8 +93,13 @@ class Hier:
         ny = nw // nx
         cost = [float(sum(len(sw.idx[ix * ny + j]) ** 3 for j in range(ny))) for ix in range(nx)]
         owner = np.repeat(dist.chunks(cost, comm.size), ny)            # whole x positions: the strips of one window stay together
+        v = None
+        if dV is not None:
+            v = np.asarray(dV, float)[dev.dev]
+            assert not v[dev.bL].any() and np.ptp(v[dev.bR]) == 0, "dV: 0 on the left lead face, constant on the right one"
+            assert v[dev.bR][0] == -obc.shift[1], "dV on the right lead face = -OBC shift_R"
         t = time.time()
-        self.fine = f = Fine(dev, sw, owner, comm)
+        self.fine = f = Fine(dev, sw, owner, comm, v)
         self.tick("fine rows", t)
         lead = [np.unique(f.lab[b]) for b in (dev.bL, dev.bR)]
         self.plan = p = Plan(f.G, (np.arange(nw) // ny, np.arange(nw) % ny), owner, [(a, h) for a, _, h in ups], lead, comm.size)

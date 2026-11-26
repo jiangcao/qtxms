@@ -32,8 +32,9 @@ def inverse_rows(A, wr):
 
 
 class Fine:
-    def __init__(self, dev, sw, owner, comm):
-        """sw: CapSchwarz geometry (idx, core, ramp per window); owner of the windows = cores."""
+    def __init__(self, dev, sw, owner, comm, v=None):
+        """sw: CapSchwarz geometry (idx, core, ramp per window); owner of the windows = cores. v: potential change per device
+        orbital [eV] added to the rows read: H += (v S + S v) / 2 (another gate voltage on the same device, leads unchanged)."""
         xp = _xp()
         self.dev, self.sw, self.comm, self.n = dev, sw, comm, dev.n
         self.cores = [i[c] for i, c in zip(sw.idx, sw.core)]
@@ -50,6 +51,10 @@ class Fine:
         assert not np.iscomplexobj(S.data) and not np.iscomplexobj(H.data), "qtx_ms.hier: real H, S"
         M = (S + 1j * H).tocsr()                                       # one pattern for both
         del S, H
+        if v is not None:
+            ri = np.repeat(rows, np.diff(M.indptr))
+            M.data += 0.5j * (v[ri] + v[M.indices]) * M.data.real
+            del ri
         if hasattr(dev.S, "hold"):
             dev.drop()
         M.sort_indices()

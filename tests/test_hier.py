@@ -354,3 +354,96 @@ def test_gpu(env):
     finally:
         gpu.enable(False)
 
+
+def test_dV_reuses_bases(env, tmp_path):
+    """--dV: another gate voltage on the cached bases (and Sigma) of the inputs: H += (dV S + S dV) / 2 on the fine level, Galerkin
+    pairs = P^T H' P, T of the dense solve with H'; refused without the cached bases."""
+    d, inp, _ = env
+    x = inp["xyz"][:, 0]
+    dV = 0.08 * np.clip(1.0 - np.abs(x - x.mean()) / (0.3 * np.ptp(x)), 0.0, 1.0)  # gate bump in the middle, 0 near the leads (per atom)
+    np.save(tmp_path / "dV.npy", dV)
+    with pytest.raises(SystemExit):
+        go(d, None, False, "--cache", str(tmp_path / "c"), "--dV", str(tmp_path / "dV.npy"))
+    r0 = go(d, None, False, "--cache", str(tmp_path / "c"), "--sigma-cache", str(tmp_path / "s"))
+    files = {f: f.stat().st_mtime_ns for f in (tmp_path / "c").rglob("U*.npy")}
+    np.save(tmp_path / "zero.npy", np.zeros_like(dV))
+    r = go(d, None, True, "--cache", str(tmp_path / "c"), "--sigma-cache", str(tmp_path / "s"),
+           "--dV", f"{tmp_path / 'dV.npy'},{tmp_path / 'zero.npy'}")
+    assert {f: f.stat().st_mtime_ns for f in (tmp_path / "c").rglob("U*.npy")} == files and r["N"] == r0["N"]
+    h = r["h"]
+    dev = mb.Device(devstore.read_any(str(d / "dev")), obc="folded")
+    v = np.repeat(dV, inp["norb"])[dev.dev]
+    Hp = dev.H + 0.5 * (dev.S.multiply(v[:, None]) + dev.S.multiply(v[None, :]))
+    P = np.eye(dev.n)
+    for k in range(1, h.K + 1):
+        Uk = np.zeros((P.shape[1], h.N[k]))
+        for b in range(h.lv[k].n):
+            i = h.fine.cores[b] if k == 1 else h.entries(k - 1, h.lv[k].kids[b])
+            Uk[np.ix_(i, h.entries(k, [b]))] = h.U[k][b]
+        P = P @ Uk
+    D = P.T @ (Hp @ P)
+    for i in range(h.lv[h.K].n):
+        assert np.abs(h.dense(h.K, [i], h.lv[h.K].nbr[i])[1] - D[np.ix_(h.entries(h.K, [i]), h.entries(h.K, h.lv[h.K].nbr[i]))]).max() < 1e-10
+    for e, w in r["E"].items():
+        assert w["converged"]
+        z = w["E"] + 1e-6j
+        (SL, SR), B = dev._sigma(z)[0], h.obc.inject(z)
+        b = np.zeros((dev.n, B.shape[1]), complex)
+        b[dev.bL] = B
+        y = np.linalg.solve((dev.A(w["E"], SL, SR) - (Hp - dev.H)).toarray(), b)[dev.bR]
+        T = np.real(np.einsum("ic,ij,jc->", y.conj(), 1j * (SR - SR.conj().T), y))
+        assert abs(T - w["T"]) < 1e-9 and abs(T - r0["E"][e]["T"]) > 1e-4   # the barrier changes T
+    with pytest.raises(SystemExit):                                   # build: not into the folder of the inputs' bases
+        go(d, None, True, "--cache", str(tmp_path / "c"), "--dV", str(tmp_path / "dV.npy"), "--dV-bases", "build")
+    rb = go(d, None, True, "--cache", str(tmp_path / "b"), "--sigma-cache", str(tmp_path / "s"), "--dV", str(tmp_path / "dV.npy"),
+            "--dV-bases", "build")
+    for e, w in rb["E"].items():
+        assert w["converged"] and abs(w["T"] - r["E"][e]["T"]) < 1e-9
+
+
+
+def test_dV_source_order():
+    """run.to_orbitals: a per-atom / per-orbital potential of the source atom order -> prepared orbitals (atoms reordered)."""
+    norb_src = np.array([2, 1, 3, 2])
+    order = np.array([2, 0, 3, 1])                                    # prep atom i = source atom order[i]
+    off = np.concatenate([[0], np.cumsum(norb_src)])
+    perm = np.concatenate([np.arange(off[i], off[i + 1]) for i in order])
+    Va = np.array([1.0, 2.0, 3.0, 4.0])
+    want = np.repeat(Va[order], norb_src[order])
+    assert np.array_equal(run.to_orbitals(Va, norb_src[order], perm), want)
+    assert np.array_equal(run.to_orbitals(np.repeat(Va, norb_src), norb_src[order], perm), want)
+    assert np.array_equal(run.to_orbitals(Va, norb_src), np.repeat(Va, norb_src))
+
+
+def test_dV_drain_bias(env, tmp_path):
+    """--dV with a drain step (another source-drain bias): dV = -delta on the right part, right lead face included -> Sigma_R(z + delta)
+    of the given lead (Beyn); T = the dense solve with H' and an unshifted OBC evaluated at z + delta; bases and left lead reused."""
+    d, inp, _ = env
+    x = inp["xyz"][:, 0]
+    t = np.clip((x - (x.min() + 0.45 * np.ptp(x))) / (0.2 * np.ptp(x)), 0.0, 1.0)
+    delta = 0.03
+    dV = 0.05 * np.clip(1.0 - np.abs(x - x.mean()) / (0.2 * np.ptp(x)), 0.0, 1.0) - delta * t * t * (3 - 2 * t)
+    np.save(tmp_path / "dV.npy", dV)
+    c, s = ("--cache", str(tmp_path / "c")), ("--sigma-cache", str(tmp_path / "s"))
+    r0 = go(d, None, False, "--obc", "beyn", *c, *s)
+    with pytest.raises(AssertionError):                               # the shift needs Beyn
+        go(d, None, False, *c, *s, "--dV", str(tmp_path / "dV.npy"))
+    r = go(d, None, True, "--obc", "beyn", *c, *s, "--dV", str(tmp_path / "dV.npy"))
+    h = r["h"]
+    assert h.obc.shift == (0.0, delta) and r["N"] == r0["N"]
+    dev = mb.Device(devstore.read_any(str(d / "dev")), obc="folded")
+    v = np.repeat(dV, inp["norb"])[dev.dev]
+    assert not v[dev.bL].any() and np.all(v[dev.bR] == -delta)
+    dH = 0.5 * (dev.S.multiply(v[:, None]) + dev.S.multiply(v[None, :]))
+    o = obc.OBC(dev, dist.Comm(), log=lambda *x: None, model="beyn")
+    for e, w in r["E"].items():
+        z = w["E"] + 1e-6j
+        o.prepare([], [z, z + delta])
+        SL, SR = o.sigma(z, 0), o.sigma(z + delta, 1)
+        assert np.abs(SR - dev._sigma(z + delta)[0][1]).max() < 1e-2 * np.abs(SR).max()     # folded lead at the shifted energy
+        B = o.inject(z)
+        b = np.zeros((dev.n, B.shape[1]), complex)
+        b[dev.bL] = B
+        y = np.linalg.solve((dev.A(w["E"], SL, SR) - dH).toarray(), b)[dev.bR]
+        T = np.real(np.einsum("ic,ij,jc->", y.conj(), 1j * (SR - SR.conj().T), y))
+        assert w["converged"] and abs(T - w["T"]) < 1e-9 and abs(T - r0["E"][e]["T"]) > 1e-4

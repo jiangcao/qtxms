@@ -66,11 +66,14 @@ class OBC:
     incoming modes, B B^H = Gamma_L)."""
     real_eta = 1e-5                                                    # |Im z| of a real-axis point
 
-    def __init__(self, dev, comm, cache=None, tol=1e-4, log=print, model="folded", basis_dir=None):
-        """basis_dir: folder of the coupling bases of the Beyn leads (they do not depend on z; None: not stored)."""
+    def __init__(self, dev, comm, cache=None, tol=1e-4, log=print, model="folded", basis_dir=None, shift_R=0.0):
+        """basis_dir: folder of the coupling bases of the Beyn leads (they do not depend on z; None: not stored).
+        shift_R: the right lead and the device next to it shifted rigidly by -shift_R S (another drain bias): z S - H' = (z + shift_R) S - H,
+        so Sigma_R'(z) = Sigma_R(z + shift_R) of the given lead (Beyn only; the left lead and the injection are unchanged)."""
         assert model in ("folded", "beyn", "beyn-real", "closed"), model
+        assert not shift_R or model == "beyn", "shift_R: --obc beyn"
         self.dev, self.comm, self.cache, self.tol, self.log, self.model, self._leads = dev, comm, cache, tol, log, model, {}
-        self.basis_dir = basis_dir
+        self.basis_dir, self.shift = basis_dir, (0.0, float(shift_R))
         self.mem = {}                                                  # without a cache: {(z, side): Sigma}, {("inj", z): B}
 
     def is_beyn(self, z):
@@ -108,7 +111,9 @@ class OBC:
         tasks = []                                                     # (z, real, side): side 0 / 1 (Beyn) or None (folded, both)
         for z, real in pts:
             for side in ((0, 1) if self.is_beyn(z) else (None,)):
-                tasks.append((z, real, side))
+                tasks.append((z + self.shift[side or 0], real, side))
+        if self.shift[1]:
+            self.log(f"obc: right lead shifted by {-self.shift[1]:+.4f} S: Sigma_R(z) of the lead at z {self.shift[1]:+.4f}")
         if self.cache:
             os.makedirs(self.cache, exist_ok=True)
 
@@ -228,7 +233,7 @@ class OBC:
         """Sigma of side 0 (left) / 1 (right): numpy (closed: None)."""
         if self.model == "closed":
             return None
-        z = complex(z)
+        z = complex(z) + self.shift[side]
         if not self.cache:
             return self.mem[z, side]
         f, key = self._sigfile(z, side)

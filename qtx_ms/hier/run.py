@@ -40,6 +40,12 @@ def parse(argv=None):
     p.add_argument("--npts", type=int, default=24)
     p.add_argument("--sigma-cache", default="")
     p.add_argument("--cache", default="", help="folder of the bases")
+    p.add_argument("--dV", default="", help="NEW.npy[,REF.npy]: potential change per atom [eV] (NEW - REF) added to H as (dV S + S dV) / 2; the bases "
+                   "of the inputs are reused (they must be in --cache) and the Galerkin blocks project the change into them. Zero on the left lead "
+                   "face (Sigma_L, injection reused); constant c on the right face: another drain bias, Sigma_R(z) = Sigma_R of the inputs at z - c "
+                   "(--obc beyn; c = 0: the right Sigma reused too)")
+    p.add_argument("--dV-bases", default="reuse", choices=["reuse", "build"], help="with --dV: reuse the bases of the inputs (must be in "
+                   "--cache), or build new ones of H + dV (reference; --cache must not hold bases yet: its files carry the tag of the inputs)")
     p.add_argument("--tol", type=float, default=1e-10)
     p.add_argument("--maxit", type=int, default=100)
     p.add_argument("--chunk", type=int, default=0)
@@ -59,6 +65,33 @@ def parse(argv=None):
     return a
 
 
+def perm_of(folder):
+    """Source orbital of every orbital of a prepared folder (release prep: arrays.npz, qtx_ms inputs: perm.npy), or None."""
+    for f, k in (("arrays.npz", "perm"), ("perm.npy", None)):
+        p = os.path.join(folder, f)
+        if os.path.exists(p):
+            z = np.load(p)
+            if k is None or k in z:
+                return np.asarray(z if k is None else z[k])
+    return None
+
+
+def to_orbitals(V, norb, perm=None):
+    """A potential per atom or per orbital in the source order (QuaTrEx inputs/potential.npy) -> per orbital of the prepared
+    inputs, whose atoms are reordered: perm maps orbital -> source orbital, whole atoms move together."""
+    V, norb = np.asarray(V, float), np.asarray(norb)
+    if perm is None:
+        perm = np.arange(int(norb.sum()))
+    if len(V) == len(norb):                                            # per atom: source atom order from the first orbitals
+        first = perm[np.concatenate([[0], np.cumsum(norb)[:-1]])]
+        order = np.argsort(np.argsort(first))                          # prep atom i = source atom order[i]
+        nq = np.empty_like(norb)
+        nq[order] = norb
+        V = np.repeat(V, nq)
+    assert len(V) == len(perm), f"potential: {len(V)} entries for {len(norb)} atoms / {len(perm)} orbitals (trimmed inputs: give it per orbital)"
+    return V[perm]
+
+
 def run(a, comm):
     from ..schwarz import CapSchwarz, fgmres_block
     log, t00, xp = mb.log, time.time(), _xp()
@@ -75,12 +108,22 @@ def run(a, comm):
     log(f"{name}: {dev.n} orbitals, Ec {Ec:.4f} eV, {comm.size} ranks, {gpu.describe()}")
     sw = CapSchwarz(dev, inp, *(float(v) for v in a.cap.split(",")), spacing=a.cap_spacing, tov=a.cap_tov,
                     split=[int(v) for v in a.cap_split.split(",")] if a.cap_split else None)
-    obc = OBC(dev, comm, a.sigma_cache or None, log=log, model=a.obc, basis_dir=a.cache or None)
+    dV, shift = None, 0.0
+    if a.dV:
+        fs = a.dV.split(",")
+        dV = to_orbitals(np.load(fs[0]) - (np.load(fs[1]) if len(fs) > 1 else 0.0), inp["norb"], perm_of(a.inputs))
+        shift = -float(dV[dev.dev[dev.bR[0]]])                         # drain: the right lead shifted with it
+        log(f"dV {a.dV}: {dV.min():+.3f}..{dV.max():+.3f} eV, right lead {-shift:+.3f} eV, "
+            + ("bases of the inputs reused" if a.dV_bases == "reuse" else "new bases of H + dV"))
+    obc = OBC(dev, comm, a.sigma_cache or None, log=log, model=a.obc, basis_dir=a.cache or None, shift_R=shift)
     reals = [Ec + e + 1j * a.eta for e in dEs]
     ups = [(v.split(":")[0], float(v.split(":")[1])) for v in a.up.split(",") if v and not a.schwarz]
     hs = [None if v == "all" else int(v) for v in a.halo.split(",") if v]
     hs += [None] * (len(ups) - len(hs))
-    h = Hier(dev, inp, sw, comm, obc, [(ax, c, hl) for (ax, c), hl in zip(ups, hs)], a.cut, sl, a.cache or None, name, log)
+    h = Hier(dev, inp, sw, comm, obc, [(ax, c, hl) for (ax, c), hl in zip(ups, hs)], a.cut, sl, a.cache or None, name, log, dV=dV)
+    if dV is not None and not a.schwarz and h.have_bases() != (a.dV_bases == "reuse"):
+        raise SystemExit("--dV: the bases of the inputs are not in --cache (run without --dV first)" if a.dV_bases == "reuse" else
+                         "--dV-bases build: --cache already holds bases (of the inputs?): give an empty folder")
     h.bottom_kind = a.bottom
     h.slow_par = tuple(int(v) for v in a.slow.split(",")) if a.slow else None
     rho = not (a.schwarz or h.have_bases())                            # density matrices to build: only then the contour Sigma
