@@ -50,6 +50,26 @@ def test_store_equals_device(tmp_path, cg):
     assert abs(dev.A(0.35, *S) - d2.A(0.35, *S)).max() == 0 and isinstance(d2.H, devstore.SlabRows)
 
 
+def test_sparse_couplings(tmp_path):
+    """The lead-device couplings are CSR files; a format 1 store (dense files) loads, and --sparse-couplings adds the CSR files to it."""
+    inp, dev = make(tmp_path / "st")
+    st = str(tmp_path / "st")
+    assert not os.path.exists(st + "/cL0.npy") and os.path.exists(st + "/cL0_data.npy")
+    same = lambda d2: all(a.shape == b.shape and abs(a - b).max() == 0 for c, d in ((dev.cL, d2.cL), (dev.cR, d2.cR)) for a, b in zip(c, d))
+    assert same(devstore.load(st)[1])
+    for s, c in (("L", dev.cL), ("R", dev.cR)):                       # format 1
+        for q, M in enumerate(c):
+            for k in devstore.CSR:
+                os.remove(f"{st}/c{s}{q}_{k}.npy")
+            np.save(f"{st}/c{s}{q}.npy", M.toarray())
+    info = json.load(open(st + "/store.json"))
+    json.dump(dict(info, format=1), open(st + "/store.json", "w"))
+    assert same(devstore.load(st)[1])
+    devstore.main(["--sparse-couplings", st])
+    assert os.path.exists(st + "/cR3_indptr.npy") and same(devstore.load(st)[1])
+    assert devstore.coupling(st, "L", 0, len(dev.bL)).nnz < dev.cL[0].shape[0] * dev.cL[0].shape[1]
+
+
 def test_stale_store_refused(tmp_path):
     src = tmp_path / "inputs"
     from qtx_ms.prep.inputs import write_inputs

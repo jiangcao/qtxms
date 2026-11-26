@@ -493,19 +493,116 @@ class FineA:
     def window(self, idx):
         return self.rows(idx)[:, idx]
 
+    def segment(self, a, b):
+        """Rows a .. b - 1 (those held) of S, H on the device, for fill(): [(CSR arrays, row of every nonzero)], row numbers."""
+        xp = gpu.cp if gpu.on else np
+        out = []
+        for M in (self.S, self.H):
+            if hasattr(M, "hold"):                               # device store: the held rows, ascending and contiguous
+                assert M.M is not None, "the rows of H, S are not held"
+                p = M.pos[a:b]
+                g = np.where(p >= 0)[0]
+                q0, q1, C = int(p[g[0]]), int(p[g[-1]]) + 1, M.M
+                assert q1 - q0 == len(g)
+            else:
+                C, g, q0, q1 = M.tocsr(), np.arange(b - a), a, b
+            s0, s1 = int(C.indptr[q0]), int(C.indptr[q1])
+            ip = xp.asarray(C.indptr[q0:q1 + 1] - s0)
+            row = xp.searchsorted(ip, xp.arange(s1 - s0), side="right") - 1
+            out.append((xp.asarray(C.data[s0:s1]), xp.asarray(C.indices[s0:s1]), row.astype(np.int32), xp.asarray(a + g)))
+        return out
+
+    def fill(self, seg, idx, dt, dS=0.0, s=0.0, ramp=None):
+        """Dense window A[idx, idx] + dS S + i s P S P, P = diag(sqrt(ramp)), of the rows of segment(): F-ordered, dtype dt."""
+        xp = gpu.cp if gpu.on else np
+        n = len(idx)
+        pos = xp.full(self.S.shape[1], -1, np.int32)
+        pos[xp.asarray(idx)] = xp.arange(n, dtype=np.int32)
+        pr = None if ramp is None else xp.asarray(np.sqrt(ramp))
+        d = xp.zeros(n * n, dt)
+        for nm, (v, c, r, g) in zip("SH", seg):
+            rw = pos[g][r]                                       # window row of every nonzero
+            q = xp.where(rw >= 0)[0]
+            cw = pos[c[q]]
+            k = cw >= 0
+            q, rw, cw = q[k], rw[q][k], cw[k]
+            v, f = v[q], rw.astype(np.int64) + cw.astype(np.int64) * n
+            if nm == "S":
+                v = v * (self.E + dS) if pr is None else v * ((self.E + dS) + 1j * s * pr[rw] * pr[cw])
+                d[f] = v.astype(dt)
+            else:
+                d[f] -= v.astype(dt)
+        for Sg, b in self.sg:
+            i = np.where(np.isin(idx, b))[0]
+            if len(i):
+                j = np.searchsorted(b, idx[i])
+                i = xp.asarray(i)
+                d[(i[:, None] + i[None, :] * n).ravel()] -= xp.asarray(Sg[np.ix_(j, j)]).ravel().astype(dt)
+        return d.reshape((n, n), order="F")
+
 
 class FineOp:
-    """A @ x on the owned rows: halo exchange + the local rows (columns renumbered to owned + ghost)."""
+    """A @ x on the owned rows: halo exchange + the local rows (columns renumbered to owned + ghost).
+    keep: a dict of the caller kept over the energies (real S, H): the halo, the pattern of S, H and their values on it
+    (pinned host memory, 20 bytes per nonzero) are formed at the first energy; A = E S - H is then a real CSR filled on the
+    device, and the dense lead Sigma is applied as such."""
 
-    def __init__(self, fa, part, stream_gb=None, threads=1):
+    def __init__(self, fa, part, stream_gb=None, threads=1, keep=None):
         from .schwarz import operator
+        self.shape, self.sig = (part.nloc, part.nloc), None
+        if keep is not None and stream_gb is None and (keep or self._keep(fa, part, keep)):
+            xp = gpu.cp if gpu.on else np
+            self.ex, d, sh = keep["ex"], xp.asarray(keep["data"]), keep["shape"]
+            v = (xp.asarray(keep["indices"]), xp.asarray(keep["indptr"]))
+            a = fa.E * d.real - d.imag
+            del d
+            if gpu.on:
+                import cupyx.scipy.sparse as csp
+                self.op = csp.csr_matrix((a, *v), shape=sh, copy=False)
+            else:
+                self.op = sp.csr_matrix((a, *v), shape=sh)
+            self.sig = []
+            for Sg, b in fa.sg:                                  # the owned rows of the lead blocks, dense
+                ii = np.where(part.gown[b] == part.comm.rank)[0]
+                if len(ii):
+                    self.sig.append((xp.asarray(part.gloc[b[ii]]), xp.asarray(self.ex.pos[b]), xp.asarray(Sg[ii], complex)))
+            return
         M = fa.rows(part.idx)
         M.sum_duplicates()
         self.ex = Exch(part, np.unique(M.indices))
         M = sp.csr_matrix((M.data, self.ex.pos[M.indices], M.indptr), shape=(part.nloc, part.nloc + self.ex.ng))
         M.sort_indices()
         self.op = operator(M, threads, stream_gb)
-        self.shape = (part.nloc, part.nloc)
+
+    @staticmethod
+    def _keep(fa, part, keep):
+        """Fill keep (collective); False: complex S or H."""
+        S, H = fa.S[part.idx], fa.H[part.idx]
+        if part.comm.sum(np.array(int(np.iscomplexobj(S.data) or np.iscomplexobj(H.data)))) > 0:
+            return False
+        M = (S + 1j * H).tocsr()                                 # one pattern, S and H as real and imaginary part
+        del S, H
+        M.sum_duplicates()
+        need = np.zeros(part.n, bool)
+        need[M.indices] = True
+        for _, b in fa.sg:
+            if (part.gown[b] == part.comm.rank).any():
+                need[b] = True
+        ex = Exch(part, np.where(need)[0])
+        M = sp.csr_matrix((M.data, ex.pos[M.indices], M.indptr), shape=(part.nloc, part.nloc + ex.ng))
+        M.sort_indices()
+        keep.update(ex=ex, shape=M.shape, data=gpu.pinned(M.data.astype(complex)), indices=gpu.pinned(M.indices.astype(np.int32)),
+                    indptr=gpu.pinned(M.indptr.astype(np.int32)))
+        return True
 
     def __matmul__(self, x):
-        return self.op @ self.ex(x)
+        x = self.ex(x)
+        if self.sig is None:
+            return self.op @ x
+        from .mlevel import real_mul
+        one = x.ndim == 1
+        x = x.reshape(x.shape[0], -1).astype(complex, copy=False)
+        y = real_mul(self.op, x)
+        for r, c, Sd in self.sig:
+            y[r] -= Sd @ x[c]
+        return y[:, 0] if one else y

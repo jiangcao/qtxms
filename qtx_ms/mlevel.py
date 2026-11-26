@@ -481,6 +481,17 @@ class FineMat:
         self.name = name
 
 
+def real_mul(R, X):
+    """R @ X, real CSR R, complex X: [Re X, Im X] (cusparse: one data type for both operands)."""
+    if not gpu.on:
+        return R @ X
+    r = X.shape[1]
+    W = gpu.cp.empty((X.shape[0], 2 * r), np.float64, order="F")
+    W[:, :r], W[:, r:] = X.real, X.imag
+    Y = R @ W
+    return Y[:, :r] + 1j * Y[:, r:]
+
+
 class FineBlocks:
     """The fine S, H of the rows of the level-1 cores as sparse core-pair blocks M_ij = M[core_i, core_j] (i, j in the core
     graph), CSR on the device (user, 2026-11-25). The level S_k, H_k of --fine-blocks levels are formed from them, dense,
@@ -495,7 +506,7 @@ class FineBlocks:
         self.h, self.own, self.B, self.gb = h, set(h.part0.own), {}, 0.0
         self.real = {nm: not np.iscomplexobj(np.zeros(0, self.mat(nm).dtype)) for nm in "SH"}
         self.real["A"] = self.real["S"] and self.real["H"]
-        self.E, self.level, self.pairs = None, None, {}
+        self.E, self.level, self.names, self.pairs = None, None, "", {}
         for nm in "SH":
             for i in h.part0.own:
                 self.row(nm, i)
@@ -555,23 +566,15 @@ class FineBlocks:
                 out.update((min(b, int(j)), max(b, int(j))) for j in L.nbr[b] if int(j) in s_)
         return out
 
-    def keep(self, L):
+    def keep(self, L, names="SH"):
         self.release()
-        self.level = L.k
+        self.level, self.names = L.k, names
 
     def release(self):
         self.level, self.pairs = None, {}
 
     def mul(self, nm, R, X):
-        """R @ X for complex X; a real R multiplies [Re X, Im X] (cusparse: one data type for both operands)."""
-        xp = self.h.xp
-        if not self.real[nm] or not gpu.on:
-            return R @ X
-        r = X.shape[1]
-        W = xp.empty((X.shape[0], 2 * r), np.float64, order="F")
-        W[:, :r], W[:, r:] = X.real, X.imag
-        Y = R @ W
-        return Y[:, :r] + 1j * Y[:, r:]
+        return real_mul(R, X) if self.real[nm] else R @ X
 
     def prol(self, L, b):
         """Prolongation of block b of level L to the fine orbitals: {core: n_core x r_b}."""
@@ -608,16 +611,16 @@ class FineBlocks:
         orow, ocol = offs(L.r[rows]), offs(L.r[cols])
         D = xp.zeros((orow[-1], ocol[-1]), complex)
         herm = rows == cols
-        if self.level == L.k and nm != "A":                          # from the kept pairs
+        if self.level == L.k and nm in self.names:                   # from the kept pairs
             lr, lc = {b: a_ for a_, b in enumerate(rows)}, {b: a_ for a_, b in enumerate(cols)}
             todo = sorted({(min(b, int(b2)), max(b, int(b2))) for b in rows for b2 in L.nbr[b] if int(b2) in lc}
                           - {k[1:] for k in self.pairs if k[0] == nm})
-            for b in sorted({b for b, _ in todo}):                 # pairs of one row at a time: P_b once
-                tb = [b2 for b_, b2 in todo if b_ == b]
-                Pb = {b: {c: V.conj().T for c, V in self.prol(L, b).items()}}
-                for b2 in tb:
-                    self.pairs[(nm, b, b2)] = self.pair(L, nm, Pb[b], self.prol(L, b2) if b2 != b else
-                                                      {c: V.conj().T for c, V in Pb[b].items()}, (b, b2))
+            Pr = {b: self.prol(L, b) for b in sorted({b for t in todo for b in t})}
+            for b in sorted({b for b, _ in todo}):
+                Pb = {c: V.conj().T for c, V in Pr[b].items()}
+                for b2 in [b2 for b_, b2 in todo if b_ == b]:
+                    self.pairs[(nm, b, b2)] = self.pair(L, nm, Pb, Pr[b2], (b, b2))
+            del Pr
             for a_, b in enumerate(rows):
                 for b2 in L.nbr[b]:
                     b2 = int(b2)
@@ -956,7 +959,8 @@ class Hierarchy:
     def __init__(self, dev, inp, sw, l1_cap=None, l1_ramp="dist", l1_lu="c64", l1_solver="rows", batch_gb=24.0,
                  mem_frac=0.5, halo_smooth="same", host_blocks=False, stream_gb=None, l1_free=False, merge_eig="full",
                  sketch_prec="c128", core=None, rho_eig="full", log=log, comm=None, keep_max=np.inf,
-                 bottom="dist", share_points=True, fine_blocks=0, stream_smoother_gb=None, smoothers=True, keep_levels=()):
+                 bottom="dist", share_points=True, fine_blocks=0, stream_smoother_gb=None, smoothers=True, keep_levels=(),
+                 coupling_norms=True, keep_sh=()):
         assert l1_ramp in ("dist", "plane") and l1_lu in ("c64", "c128") and l1_solver in ("rows", "lu")
         assert halo_smooth in ("same", "full") and merge_eig in ("full", "rand", "sketch")
         self.dev, self.inp, self.sw, self.log = dev, inp, sw, log
@@ -969,6 +973,9 @@ class Hierarchy:
         # smoothers False: no smoothers of the levels (mode space only: qtx_ms.mlmode); S, H of a level then stay only for the
         # levels in keep_levels (and the deepest one)
         self.smoothers, self.keep_levels = bool(smoothers), set(keep_levels)
+        # keep_sh: levels whose (energy independent) S_k, H_k blocks are kept over the energies, in host memory with host_blocks
+        self.keep_sh, self.shbank = set(keep_sh), {}
+        self.coupling_norms = bool(coupling_norms)          # merge() logs the 2-norms of the coupling blocks (diagnostic: couplings())
         # bottom "dist": the deepest level solved by DistSlabLU (domains of slabs over the ranks), "repl": the same LU on
         # every rank (GatherSolve). share_points: contour points of the merge windows balanced over the ranks
         assert bottom in ("dist", "repl"), bottom
@@ -1047,6 +1054,7 @@ class Hierarchy:
         cx = np.array([self.x[c].mean() for c in self.cores]).reshape(-1, self.ny)
         assert np.ptp(cx, axis=1).max() < 3.0 and (np.diff(cx.mean(1)) > 0).all(), "window order is not (x, strip)"
         self.LV = {}
+        self._cap = {}                                              # cap_data
         self.ubank, self.basis_dir = {}, None                       # level bases by key: host copies / disk cache
         log(f"fine: n {n}, {nw} window cores, {min(len(c) for c in self.cores)}..{max(len(c) for c in self.cores)} "
             f"orbitals, core graph {int(G.sum())} coupled pairs ({G.sum(1).min()}..{G.sum(1).max()} per core); level "
@@ -1310,26 +1318,35 @@ class Hierarchy:
     def sub(M, idx):
         return M.sub(idx) if hasattr(M, "sub") else M[idx][:, idx]     # device store: rows of other ranks from the files
 
-    def cap_of(self, L, w):
-        """Projected CAP i s1 U^H (P S P) U of the window w (block list of level L) in level-L coordinates (None: the
-        window has no artificial cut)."""
+    def cap_data(self, L, w):
+        """(ramp orbitals, s1 P S P on them) of the CAP of the window w, or None (no artificial cut). Energy independent: kept
+        on the host per set of cores (the ramp: a tree query; S between the ramp orbitals: for the rows of other ranks from
+        the files)."""
+        cw = tuple(int(k) for k in self.cores_of(L, w))
+        if cw not in self._cap:
+            F = np.concatenate([self.cores[k] for k in cw])
+            rp = self.ramp(F)
+            on_ = np.where(rp > 0)[0]
+            if not len(on_):
+                self._cap[cw] = None
+            else:
+                Fo, p = F[on_], sp.diags(np.sqrt(rp[on_]))
+                self._cap[cw] = (Fo, (self.s1 * (p @ self.sub(self.S, Fo) @ p)).tocsr())
+        return self._cap[cw]
+
+    def add_cap(self, L, w, K):
+        """K += the projected CAP i s1 U^H (P S P) U of the window w (block list of level L) in level-L coordinates, in place.
+        Every ramp orbital belongs to one block of w, so only the blocks with ramp orbitals (the cuts) are touched and
+        every product is block wise."""
+        d = self.cap_data(L, w)
+        if d is None:
+            return
         xp, lab, posin = self.xp, self.lab, self.posin
         U1 = self.LV[1].U
-        F = np.concatenate([self.cores[k] for k in self.cores_of(L, w)])
-        rp = self.ramp(F)
-        on_ = np.where(rp > 0)[0]
-        if not len(on_):
-            return None
-        Fo = F[on_]
-        Pr = sp.diags(np.sqrt(rp[on_]))
-        Wf = (1j * self.s1 * (Pr @ self.sub(self.S, Fo) @ Pr)).tocsr()
+        Fo, W = d
         lf = lab[Fo]
-        Wd = gpu.csr(Wf, np.complex128) if gpu.on else Wf
-        # factored form: the CAP lives on the len(on_) ramp orbitals only: Y = their rows of the prolongation of the
-        # window, one block of w at a time (block diagonal: a block reaches only the ramp orbitals of its own cores),
-        # so no (ramp orbitals x all level-1 columns of the window) matrix is formed (12 nm, level 8: 5 GB and more)
         o2 = offs(L.r[[int(b) for b in w]])
-        Y = xp.zeros((len(on_), o2[-1]), complex)
+        qs, perm, Ys = [], [], []                                # touched blocks, their ramp orbitals (positions in Fo), rows of U
         for q, b in enumerate(w):
             cb = self.cores_of(L, [b])
             sel = {k: np.where(lf == k)[0] for k in cb}
@@ -1341,9 +1358,19 @@ class Hierarchy:
             for a_, k in enumerate(cb):
                 if len(sel[k]):
                     Uo[ro[a_]:ro[a_ + 1], o[a_]:o[a_ + 1]] = xp.asarray(U1[k])[xp.asarray(posin[Fo[sel[k]]])]
-            Y[xp.asarray(rows), o2[q]:o2[q + 1]] = self.projright(L, [b], Uo)
+            qs.append(q), perm.append(rows), Ys.append(self.projright(L, [b], Uo))
             del Uo
-        return Y.conj().T @ (Wd @ Y)
+        ro = offs([len(v) for v in perm])
+        perm = np.concatenate(perm)
+        Wp = W[perm][:, perm]
+        cplx = np.iscomplexobj(Wp.data)
+        Wd = gpu.csr(Wp, None if cplx else np.float64) if gpu.on else Wp
+        for b, (q2, Y2) in enumerate(zip(qs, Ys)):
+            X = xp.zeros((len(perm), Y2.shape[1]), complex)
+            X[ro[b]:ro[b + 1]] = Y2
+            X = real_mul(Wd, X) if not cplx else Wd @ X
+            for a, (q1, Y1) in enumerate(zip(qs, Ys)):
+                K[o2[q1]:o2[q1 + 1], o2[q2]:o2[q2 + 1]] += 1j * (Y1.conj().T @ X[ro[a]:ro[a + 1]])
 
     def sig_factor(self, L, w):
         """Factor of the lead Sigma of the window w (with a lead core): (lead-face cores of w, offsets of their level-1
@@ -1663,24 +1690,35 @@ class Hierarchy:
         """RAS on L.A: window wins[c] (sorted blocks of L), local operator A[w, w] + projected CAP, the solution is
         kept on the blocks writes[c] (a subset of the window). Returns the smoother (level-L vectors) with .sizes, .gb.
         l1_solver rows: only the rows of the window inverse on writes[c] are kept (n_write x n_window instead of
-        n_window^2 for the LU; the same correction, since RAS discards the other rows)."""
+        n_window^2 for the LU; the same correction, since RAS discards the other rows).
+        Windows of the same blocks (y pairs whose window covers the full width) are one window that writes the blocks
+        of all of them (user, 2026-11-25): one assembly, CAP and LU, the same correction."""
         xp, cdt = self.xp, self.cdt
         ops, sizes, gb = [], [], 0.0
         mine = [c for c in range(len(wins)) if wins[c] is not None]   # windows of other ranks: None
         ex = dist.Exch(L.part, self.entries(L, {int(b) for c in mine for b in wins[c]}))
         ez = dist.Exch(L.part, self.entries(L, {int(b) for c in mine for b in writes[c]}))   # blocks written
-        wins, writes = [wins[c] for c in mine], [writes[c] for c in mine]
+        grp = {}                                                     # window -> blocks written
+        for c in mine:
+            grp.setdefault(tuple(int(b) for b in wins[c]), []).extend(int(b) for b in writes[c])
+        wins, writes = [list(w) for w in grp], [sorted(v) for v in grp.values()]
         nb_ = lambda ks: int(sum(L.off[k + 1] - L.off[k] for k in ks))
         est = sum((nb_(wr) if self.l1_solver == "rows" else nb_(w)) * nb_(w) for w, wr in zip(wins, writes)) \
             * np.dtype(cdt).itemsize / 2 ** 30
         # rows of the inverse or the whole LU to pinned host memory window by window
         stream = self.stream_sm is not None and est > self.stream_sm
+        last = {}                                                    # block pair -> last window with it (kept pairs of A)
+        if isinstance(L.Sb, FineMat) and self.fb is not None and wins:   # windows of neighbours share most block pairs
+            if 0.5 * self.fb.need_gb(L, wins) < 0.4 * self.gpu_free_gb():
+                self.fb.keep(L, "A")
+                for c, w in enumerate(wins):
+                    for pr in self.fb.pair_set(L, [w]):
+                        last[pr] = c
         for c, w in enumerate(wins):
             Aw, o = L.A.sub(np.asarray(w))
-            Cw = self.cap_of(L, w)
-            if Cw is not None:
-                Aw += Cw
-                del Cw
+            for pr in [pr for pr, c_ in last.items() if c_ == c]:
+                self.fb.pairs.pop(("A",) + pr, None)
+            self.add_cap(L, w, Aw)
             loc = {int(k): q for q, k in enumerate(w)}
             pos_ = xp.asarray(np.concatenate([np.arange(o[loc[int(k)]], o[loc[int(k)] + 1]) for k in writes[c]]))
             rw = xp.asarray(np.concatenate([ex.pos[L.off[k]:L.off[k + 1]] for k in w]))
@@ -1705,6 +1743,8 @@ class Hierarchy:
             sizes.append(int(o[-1]))
             gpu.free()
 
+        if last:
+            self.fb.release()
         st = gpu.Streamer([op if isinstance(op, tuple) else (op,) for _, _, _, op in ops]) if stream else None
 
         def Sm(r):
@@ -1866,7 +1906,7 @@ class Hierarchy:
         full = [np.unique(np.concatenate([L.nbr[kb] for kb in ks])) for ks in Nn.kids]    # C + coupled blocks of L
         xd = [np.abs(ix[w][:, None] - ix[list(ks)][None, :]).min(1) for w, ks in zip(full, Nn.kids)]   # x distance to C
         hmax = int(max(d.max() for d in xd))
-        cpl = {} if isinstance(L.Sb, FineMat) else self.couplings(L)
+        cpl = {} if isinstance(L.Sb, FineMat) or not self.coupling_norms else self.couplings(L)
         sizes = {h: np.array([int(L.r[w[d <= h]].sum()) for w, d in zip(full, xd)]) for h in range(hmax + 1)}
         cost = {h: float((v.astype(float) ** 3).sum()) for h, v in sizes.items()}
         hu = hmax if halo is None else min(int(halo), hmax)
@@ -1961,10 +2001,7 @@ class Hierarchy:
                 for c in ks:
                     w = win[c]
                     Kw = -self.dense(L, L.Hb, w, w)
-                    Cw = self.cap_of(L, w)                           # not kept: the smoother below rebuilds it (cheap)
-                    if Cw is not None:
-                        Kw += Cw
-                    del Cw
+                    self.add_cap(L, w, Kw)
                     dat[c] = [self.dense(L, L.Sb, w, w), Kw,
                               None if self.merge_eig == "sketch" or schur else xp.zeros((nwin[c],) * 2, complex)]
                 self.mem(f"{bt}: S, K, accumulator of {len(ks)} windows")
@@ -2071,7 +2108,17 @@ class Hierarchy:
         elif Nn.k <= self.fine_blocks:
             Nn.Sb, Nn.Hb = FineMat("S"), FineMat("H")
         else:
-            Nn.Sb, Nn.Hb = gal(L.Sb, self.keep), gal(L.Hb, self.keep)
+            if Nn.k not in self.shbank:
+                if isinstance(L.Sb, FineMat) and self.fb.level != L.k:      # Hermitian, and shared by neighbour blocks: every pair once
+                    wn = [np.unique(np.concatenate([Nn.kids[int(c2)] for c2 in Nn.nbr[c]])) for c in own]
+                    if self.fb.need_gb(L, wn) < 0.4 * self.gpu_free_gb():
+                        self.fb.keep(L)
+                SH = gal(L.Sb, self.keep), gal(L.Hb, self.keep)
+                if Nn.k in self.keep_sh:
+                    self.shbank[Nn.k] = SH
+            else:
+                SH = self.shbank[Nn.k]
+            Nn.Sb, Nn.Hb = (list(X) for X in SH)                     # ghost rows are added to / dropped from the copies
         Nn.E = L.E
         nfree = Nn.k <= self.free_levels and is_free(L.A)
         if nfree or dd:                                      # no A_k blocks (or built below): Sigma of the lead blocks

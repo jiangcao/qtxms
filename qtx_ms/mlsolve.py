@@ -38,6 +38,10 @@ def parse(argv=None):
     g.add_argument("--chunk", type=int, default=0, help="columns per FGMRES call (0: all)")
     g.add_argument("--fgmres-log", type=int, default=0, help="log the residual estimate every k iterations")
     g.add_argument("--free-levels", type=int, default=0, help="levels 1 .. K without stored A_k (implies --host-blocks)")
+    g.add_argument("--keep-sh", default="", help="levels (comma list) whose energy independent S_k, H_k blocks are kept over "
+                   "the energies (host memory with --host-blocks / --fine-blocks), e.g. the first level with stored blocks")
+    g.add_argument("--no-keep-fine", action="store_true", help="several ranks: do not keep the halo, pattern and values of the fine "
+                   "S, H over the energies (real S, H; pinned host memory, 20 bytes per nonzero of the own rows)")
     g.add_argument("--stream-gb", type=float, default=None, help="operators larger than this [GB] streamed from the host")
     g.add_argument("--stream-smoother-gb", type=float, default=None, help="the same for the smoothers alone (0: always)")
     a = md.check(p.parse_args(argv))
@@ -59,10 +63,12 @@ def solve(a, comm=None):
         a, comm, inp, dev, name, Ec, solver=a.cap_solver,
         sw_stream=a.stream_gb if a.stream_smoother_gb is None else a.stream_smoother_gb, l1_lu=a.l1_lu,
         l1_solver=a.l1_solver, halo_smooth=a.halo_smooth, host_blocks=a.host_blocks, stream_gb=a.stream_gb,
-        l1_free=a.free_levels, keep_max=0, stream_smoother_gb=a.stream_smoother_gb)
+        l1_free=a.free_levels, keep_max=0, stream_smoother_gb=a.stream_smoother_gb, coupling_norms=False,
+        keep_sh=[int(v) for v in a.keep_sh.split(",")] if a.keep_sh else ())
     part, K = h.part0, a.fine_blocks
     Tof = md.Trans(dev, part, comm)
     dEs, U1, res = md.energies(a), None, dict(Ec=Ec, E={})
+    fine = None if a.no_keep_fine or len(dEs) == 1 else {}       # fine S, H data of dist.FineOp over the energies
     t_setup = time.time() - t00
     log(f"  setup {t_setup:.0f} s")
     for ie, dE in enumerate(dEs):
@@ -80,7 +86,9 @@ def solve(a, comm=None):
         sg = None if a.free_levels else a.stream_gb              # the fine A carries every free-level product: resident
         if dd:
             A = dist.FineA(dev, E, SL, SR)
-            Aop = dist.FineOp(A, part, sg, a.threads)
+            Aop = dist.FineOp(A, part, sg, a.threads, fine)
+            if last and fine:
+                fine.clear()
         else:
             A = dev.A(E, SL, SR).tocsr()
             Aop = operator(A, stream_gb=sg) if gpu.on else operator(A, a.threads)

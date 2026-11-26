@@ -334,9 +334,10 @@ class Device:
             rows = O[tr[blk]][np.unique(np.concatenate([r for r, _ in nz[blk]]))]
             assert np.isin(rows, o).all(), f"{blk}: device couples to lead orbitals off its face"
         cut = lambda M, r, c: M[r][:, c].toarray()
-        # A = z S - H blocks between device boundary and lead face: (lead, dev) and (dev, lead)
-        self.cL = [cut(M, oL, dev[self.bL]) for M in (H, S)] + [cut(M, dev[self.bL], oL) for M in (H, S)]
-        self.cR = [cut(M, oR, dev[self.bR]) for M in (H, S)] + [cut(M, dev[self.bR], oR) for M in (H, S)]
+        # A = z S - H blocks between device boundary and lead face: (lead, dev) and (dev, lead), CSR
+        scut = lambda M, r, c: M[r][:, c].tocsr()
+        self.cL = [scut(M, oL, dev[self.bL]) for M in (H, S)] + [scut(M, dev[self.bL], oL) for M in (H, S)]
+        self.cR = [scut(M, oR, dev[self.bR]) for M in (H, S)] + [scut(M, dev[self.bR], oR) for M in (H, S)]
         # qttools path: whole lead cell (not only its faces) against the device boundary orbitals
         obc = {"mgms": "folded"}.get(obc, obc)                 # old name of the folded-lead OBC
         assert obc in ("auto", "qttools", "folded"), obc
@@ -411,17 +412,32 @@ class Device:
         """Injection columns for the self-energy Sg returned by the last sigma(): the qttools incoming modes when
         they came with it, else the Gamma eigenchannels above tol (injection())."""
         B = self._inj.get(id(Sg))
+        if B is None and gpu.on:                                 # dense eigh of Gamma on the device
+            G = gpu.asarray(Sg)
+            G = 1j * (G - G.conj().T)
+            lam, X = gpu.cp.linalg.eigh(0.5 * (G + G.conj().T))
+            k = lam > tol
+            B = gpu.asnumpy(X[:, k] * gpu.cp.sqrt(lam[k]))
+            del G, lam, X
+            gpu.free()
+            return B
         return injection(Sg, tol)[0] if B is None else B
 
     def _sigma(self, z):
         gL, gR = self.lead.surface_gfs(z)
         if self.leadR is not self.lead:
             gR = self.leadR.surface_gfs(z)[1]
-        out = []
-        a = gpu.asarray                                       # GPU mode: the dense products on the device too
-        for g, (Hld, Sld, Hdl, Sdl) in ((gL, self.cL), (gR, self.cR)):
-            out.append(gpu.asnumpy((z * a(Sdl) - a(Hdl)) @ a(g) @ (z * a(Sld) - a(Hld))))
-        return tuple(out), None
+        return (self._coupled(z, gL, self.cL), self._coupled(z, gR, self.cR)), None
+
+    @staticmethod
+    def _coupled(z, g, c):
+        """A_dl g A_ld (numpy) of the sparse couplings c = (H_ld, S_ld, H_dl, S_dl), A = z S - H; GPU mode: on the device."""
+        Hld, Sld, Hdl, Sdl = (sp.csr_matrix(M) for M in c)
+        Adl, AldT = (z * Sdl - Hdl).tocsr(), (z * Sld - Hld).T.tocsr()
+        if gpu.on:
+            import cupyx.scipy.sparse as csp
+            Adl, AldT, g = csp.csr_matrix(Adl), csp.csr_matrix(AldT), gpu.asarray(g)
+        return gpu.asnumpy((AldT @ (Adl @ g).T).T)
 
     def A(self, E, SL, SR):
         """Sparse fine operator E S - H - Sigma_L - Sigma_R."""

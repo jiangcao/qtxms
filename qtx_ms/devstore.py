@@ -6,7 +6,8 @@ rows it needs (its own windows) instead of two copies of the whole matrices (inp
 
 <store>/store.json                     format, meta, sizes, size and mtime of the input files (stale store: refused)
 <store>/small.npz                      geometry (labels, xyz, norb, blocks), dev, ns, bL, bR, lead matrices (csr parts)
-<store>/c{L,R}{0..3}.npy               couplings device boundary - lead face of Device.cL, cR (dense, memory mapped)
+<store>/c{L,R}{0..3}_{data,indices,indptr}.npy   couplings device boundary - lead face of Device.cL, cR (CSR, read at the first
+                                       use). Format 1 stores: dense c{L,R}{0..3}.npy; `--sparse-couplings STORE` adds the CSR files
 <store>/s<k>_{H,S}_{data,indices,indptr}.npy   rows of device slab k, columns in device order, sorted (memory mapped)
 
 The slabs are those of the block-tridiagonal partition: the store does not depend on the window settings. Folded-lead
@@ -24,7 +25,7 @@ import scipy.sparse as sp
 from . import msbasis as mb
 from .msbasis import log
 
-FORMAT = 1
+FORMAT = 2
 CSR = ("data", "indices", "indptr")
 LEAD = ("H00", "H01", "S00", "S01")
 SRC = ("H.npz", "S.npz", "lead.npz", "arrays.npz", "prep.json", "meta.json", "blocks.txt", "norb.txt", "device.xyz",
@@ -49,6 +50,37 @@ def mapped(folder, pre, shape):
     M.has_sorted_indices = True
     M.has_canonical_format = True
     return M
+
+
+def write_coupling(folder, s, q, M):
+    M = sp.csr_matrix(M)
+    M.sum_duplicates()
+    for p in CSR:
+        np.save(os.path.join(folder, f"c{s}{q}_{p}.npy"), M.data if p == "data" else getattr(M, p).astype(np.int32))
+
+
+def coupling(folder, s, q, nb):
+    """Coupling q (H_ld, S_ld, H_dl, S_dl) of side s (CSR; nb: device boundary orbitals): its CSR files, read whole (no mapping), or the
+    dense file of a format 1 store."""
+    f = lambda p: os.path.join(folder, f"c{s}{q}_{p}.npy")
+    if not os.path.exists(f("data")):
+        return sp.csr_matrix(np.load(os.path.join(folder, f"c{s}{q}.npy")))
+    d, i, p = (np.load(f(k)) for k in CSR)
+    nr = len(p) - 1
+    # lead x device (q < 2): the columns are the boundary; device x lead: the columns are the lead face, as many as rows of c{s}0
+    nc = nb if q < 2 else len(np.load(os.path.join(folder, f"c{s}0_indptr.npy"))) - 1
+    return sp.csr_matrix((d, i, p), shape=(nr, nc))
+
+
+def sparse_couplings(folder):
+    """Adds the CSR files of the couplings to a format 1 store (the dense files stay, for older code)."""
+    for s in "LR":
+        for q in range(4):
+            if not os.path.exists(os.path.join(folder, f"c{s}{q}_data.npy")):
+                t = time.time()
+                M = sp.csr_matrix(np.load(os.path.join(folder, f"c{s}{q}.npy")))
+                write_coupling(folder, s, q, M)
+                log(f"c{s}{q}: {M.shape}, {M.nnz} nonzeros ({100 * M.nnz / np.prod(M.shape):.1f} %), {time.time() - t:.1f} s")
 
 
 class SlabRows:
@@ -141,7 +173,7 @@ class StoreDevice(mb.Device):
         for o in self.slab_orbs:
             self.loc[o] = np.arange(len(o))
         self.bL, self.bR = z["bL"], z["bR"]
-        self.cL, self.cR = ([np.load(os.path.join(folder, f"c{s}{q}.npy"), mmap_mode="r") for q in range(4)] for s in "LR")
+        self._cpl = {}
         self.qtt, self._inj, self._leads = None, {}, None
         self.H, self.S = (SlabRows(folder, nm, self.sb) for nm in "HS")
 
@@ -153,6 +185,13 @@ class StoreDevice(mb.Device):
             self._leads = l_, (l_ if inp.get("lead_right") is None else f(inp["lead_right"]))
         return self._leads[side]
 
+    def _couplings(self, s):
+        if s not in self._cpl:
+            self._cpl[s] = [coupling(self.folder, s, q, len(self.bL if s == "L" else self.bR)) for q in range(4)]
+        return self._cpl[s]
+
+    cL = property(lambda self: self._couplings("L"))
+    cR = property(lambda self: self._couplings("R"))
     lead = property(lambda self: self._lead(0))
     leadR = property(lambda self: self._lead(1))
 
@@ -201,7 +240,7 @@ def save(dev, inp, out, source=None):
                 nnz[nm] += int(R.nnz)
         for s, c in (("L", dev.cL), ("R", dev.cR)):
             for q, M in enumerate(c):
-                np.save(os.path.join(tmp, f"c{s}{q}.npy"), M)
+                write_coupling(tmp, s, q, M)
         z = dict(dev=dev.dev, ns=np.asarray(dev.ns), bL=dev.bL, bR=dev.bR,
                  **{k: np.asarray(inp[k]) for k in ("labels", "xyz", "norb", "blocks")})
         for pre in ("lead", "lead_right"):
@@ -224,8 +263,8 @@ def load(folder, source=None):
     """(inp, dev) of a store; inp has no H, S. source: the --inputs folder of the run, refused when its files are not
     the ones the store was built from."""
     info = json.load(open(os.path.join(folder, "store.json")))
-    if info.get("format") != FORMAT:
-        raise ValueError(f"{folder}: store format {info.get('format')}, this version reads {FORMAT}; build it again")
+    if info.get("format") not in (1, FORMAT):
+        raise ValueError(f"{folder}: store format {info.get('format')}, this version reads 1, {FORMAT}; build it again")
     if source is not None and source_files(source) != info["source_files"]:
         raise ValueError(f"{folder} was not built from the present files of {source} (built from {info['source']}); "
                          f"build it again: python -m qtx_ms.devstore")
@@ -264,9 +303,14 @@ def hostmem():
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--inputs", required=True)
-    p.add_argument("--out", required=True)
+    p.add_argument("--inputs")
+    p.add_argument("--out")
+    p.add_argument("--sparse-couplings", default="", metavar="STORE", help="only: add the CSR coupling files to a format 1 store")
     a = p.parse_args(argv)
+    if a.sparse_couplings:
+        return sparse_couplings(a.sparse_couplings)
+    if not (a.inputs and a.out):
+        p.error("--inputs and --out, or --sparse-couplings")
     t = time.time()
     src = source_files(a.inputs)                                   # before reading: a change during the build is refused
     inp = read_any(a.inputs)

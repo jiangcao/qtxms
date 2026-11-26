@@ -133,16 +133,13 @@ def build(a, comm, inp, dev, name, Ec, solver="rows64", sw_stream=None, **kw):
 
 
 def lead(dev, E, eta, comm, ncol=0):
-    """Lead Sigma and injection of the energy E (rank 0 fills the cache, its values on every rank): SL, SR, b (n x ncol,
-    the strongest columns), number of channels. The columns ascend in the Gamma eigenvalue."""
-    dd = comm.size > 1
-    if dd and dev.sigma_cache:
-        if comm.rank == 0:
-            dev.sigma(E + 1j * eta)
-        comm.barrier()
-    SL, SR = dev.sigma(E + 1j * eta)
-    B = dev.inject(SL)
-    if dd:
+    """Lead Sigma and injection of the energy E (computed on rank 0 only): SL, SR, b (n x ncol, the strongest columns),
+    number of channels. The columns ascend in the Gamma eigenvalue."""
+    SL = SR = B = None
+    if comm.rank == 0:
+        SL, SR = dev.sigma(E + 1j * eta)
+        B = dev.inject(SL)
+    if comm.size > 1:
         SL, SR, B = comm.bcast(SL), comm.bcast(SR), comm.bcast(B)
     nch = B.shape[1]
     nsel = min(ncol, nch) if ncol else nch

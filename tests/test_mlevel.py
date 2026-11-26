@@ -160,3 +160,23 @@ def test_slab_lu_equals_dense_solve_and_block_list_is_not_a_copy():
         assert np.allclose(ex(r), np.linalg.solve(L.A.dense(), r), atol=1e-9)
     L = h.LV[3]
     assert all(np.shares_memory(L.Ab[i][q], L.A.R[i]) for i in range(len(L.r)) for q in range(len(L.Ab[i])))
+
+
+@pytest.mark.parametrize("solver", ["rows", "lu"])
+def test_identical_windows_are_one(solver):
+    """Windows of the same blocks that write different blocks (y pairs whose windows cover the full width): one window
+    (one LU) and the same correction as with the windows apart."""
+    dev, sw, h, A, b, SL, SR = setup(l1_solver=solver)
+    build(h, SL, SR, halos=())
+    L = h.LV[1]
+    nb = len(L.r)
+    assert nb >= 6
+    wins = [np.arange(0, 4), np.arange(0, 4), np.arange(2, nb), np.arange(2, nb)]
+    writes = [(0, 2), (1,), tuple(range(4, nb)), (3,)]               # every block once, in no particular order
+    Sm = h.ras(L, wins, writes)
+    one = [h.ras(L, [w if c == q else None for c, w in enumerate(wins)], writes) for q in range(len(wins))]
+    assert len(Sm.sizes) == 2 and all(len(s.sizes) == 1 for s in one)
+    rng = np.random.default_rng(1)
+    r = rng.standard_normal((L.N, 3)) + 1j * rng.standard_normal((L.N, 3))
+    y = Sm(r)
+    assert np.allclose(y, sum(s(r) for s in one), atol=1e-10 * np.abs(y).max()) and np.abs(y).min() > 0

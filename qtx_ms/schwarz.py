@@ -126,7 +126,7 @@ class CapSchwarz:
         self.s, self.d, self.solver, self.dE0, self.dev = s, d, solver, dE0, dev
         self.rows = solver.startswith("rows")
         self.gpu = gpu.on and solver != "pardiso"          # GPU: window LUs / rows and solves on the device, serially
-        self.ops, self.twall, self.rows_gb = None, 0.0, 0.0
+        self.ops, self.twall, self.rows_gb, self._ramps = None, 0.0, 0.0, {}
         self.own = list(range(len(self.idx)))                  # windows of this rank (all; distribute() changes it)
         self.comm = self.part = self.ex = None
         if self.gpu:
@@ -234,24 +234,41 @@ class CapSchwarz:
     def set_energy(self, E, A, delta=None, log=log):
         S = self.dev.S.tocsr()
         window = A.window if hasattr(A, "window") else (lambda A: lambda idx: A[idx][:, idx])(A.tocsr())   # dist.FineA
+        # distributed, GPU: the dense windows are filled on the device from the rows of the windows at one x position
+        asm = self.gpu and hasattr(A, "segment")
+        seg = [None, None]
+
+        def group(k):
+            return k // max(1, len(self.idx) // len(self.centres))
+
+        def dense_window(k, dt):
+            if seg[0] != group(k):
+                seg[1] = None
+                ks_ = [q for q in self.own if group(q) == group(k)]
+                seg[:] = group(k), A.segment(int(min(self.idx[q].min() for q in ks_)), int(max(self.idx[q].max() for q in ks_)) + 1)
+            if k not in self._ramps:
+                self._ramps[k] = self.ramp(k)
+            return A.fill(seg[1], self.idx[k], dt, self.dE0, self.s, self._ramps[k])
+
         def factor(k):
             idx = self.idx[k]
             t = time.time()
-            P = sp.diags(np.sqrt(self.ramp(k)))
-            Sjj = S[idx][:, idx]
-            Ajj = window(idx) + self.dE0 * Sjj + 1j * self.s * (P @ Sjj @ P)
+            if not asm:
+                P = sp.diags(np.sqrt(self.ramp(k)))
+                Sjj = S[idx][:, idx]
+                Ajj = window(idx) + self.dE0 * Sjj + 1j * self.s * (P @ Sjj @ P)
             if self.solver == "pardiso":
                 cs = mb.CSolver(Ajj, n_ref=0)
                 op = cs.factor_solve
             else:
                 dt = np.complex64 if self.solver in ("dense64", "rows64") else complex
-                D = gpu.csr_dense(Ajj, dt) if self.gpu else Ajj.toarray().astype(dt)
+                D = dense_window(k, dt) if asm else gpu.csr_dense(Ajj, dt) if self.gpu else Ajj.toarray().astype(dt)
                 lu = gpu.lu_factor(D) if self.gpu else sla.lu_factor(D, check_finite=False, overwrite_a=True)
                 del D
                 if self.rows:                                      # (A_jj^-1)[core, :] = (A_jj^-H e_core)^H, LU dropped
                     xq = gpu.cp if self.gpu else np
                     c = np.where(self.core[k])[0]
-                    Ek = xq.zeros((Ajj.shape[0], len(c)), dt)
+                    Ek = xq.zeros((len(idx), len(c)), dt)
                     Ek[xq.asarray(c), xq.arange(len(c))] = 1
                     Ri = xq.ascontiguousarray((gpu.lu_solve(lu, Ek, trans=2) if self.gpu else
                                                sla.lu_solve(lu, Ek, trans=2, check_finite=False)).conj().T)
@@ -278,6 +295,7 @@ class CapSchwarz:
         if self.gpu:
             gpu.free()
         out = list(self.pool.map(factor, ks) if self.pool else map(factor, ks))
+        seg[:] = None, None
         self.ops, self.tfac = {k: o for k, (o, _) in zip(ks, out)}, [t for _, t in out]
         if stream:
             self.st, self.ops = gpu.Streamer([self.ops[k] if isinstance(self.ops[k], tuple) else (self.ops[k],)
