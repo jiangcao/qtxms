@@ -47,13 +47,41 @@ def fold(S, K, add, ne, zs, dzs, qs):
     return acc
 
 
+def tri_factor(D, U, Lw):
+    """Block LU from the left of the block-tridiagonal matrix with diagonal D, upper U, lower Lw (lists): (inverses of the Schur
+    complements D_a - Lw_a-1 X_a-1, X_a = inv_a U_a, Lw). D and U are consumed (entries set to None)."""
+    xp, inv, X = _xp(), [], []
+    for a in range(len(D)):
+        S = D[a] if not a else D[a] - Lw[a - 1] @ X[-1]
+        D[a] = None
+        inv.append(xp.linalg.inv(S))
+        del S
+        if a + 1 < len(D):
+            X.append(inv[a] @ U[a])
+            U[a] = None
+    return inv, X, Lw
+
+
+def tri_solve(f, ys):
+    """Solve with tri_factor's f; ys: right-hand side per slab, None = zero (leading zeros are skipped). List per slab."""
+    inv, X, Lw = f
+    t = []
+    for a, y in enumerate(ys):
+        v = y if not a or t[-1] is None else (-(Lw[a - 1] @ t[-1]) if y is None else y - Lw[a - 1] @ t[-1])
+        t.append(None if v is None else inv[a] @ v)
+    for a in range(len(ys) - 2, -1, -1):
+        t[a] = -(X[a] @ t[a + 1]) if t[a] is None else t[a] - X[a] @ t[a + 1]
+    return t
+
+
 class Hier:
     def __init__(self, dev, inp, sw, comm, obc, ups, cut1, sl, cache=None, name="dev", log=mb.log):
         """sw: CapSchwarz (geometry of the fine windows, x windows x y strips); ups [(axis, cut, halo)] merges; cut1: cut of level 1;
         sl: contours [(mu1, mu2, npts, weight)] in absolute energies; cache: folder of the bases."""
         self.dev, self.sw, self.comm, self.obc, self.log = dev, sw, comm, obc, log
         self.slow, self.slow_par = None, None                          # slow-mode coarse level: (m, q, rounds), with schwarz
-        self.bottom_kind, self.bottom_res = "bt", None              # solver of the deepest level: dense LU or block-tridiagonal LU
+        self.bottom_kind, self.bottom_res = "bt", None              # deepest level: "bt" distributed / "btrep" replicated block-tridiagonal LU, "dense"
+        self.bplan, self.bottom_gb, self.bottom_dom = None, None, None
         self.geo = mb.Geometry(inp["xyz"], inp["meta"].get("periodic"))
         self.atom = np.repeat(np.arange(len(inp["norb"])), inp["norb"])[dev.dev]
         self.cuts, self.t = [None, cut1] + [c for _, c, _ in ups], {}
@@ -421,7 +449,7 @@ class Hier:
             t = time.time()
             sg = [Y.T @ (xp.asarray(Sig[s]) @ Y) if Sig[s] is not None else xp.zeros((Y.shape[1],) * 2, complex) for s, (Y, _, _) in enumerate(self.Y[k])]
             if k == self.K:
-                (self._bottom_bt if self.bottom_kind == "bt" else self._bottom)(E, sg)
+                dict(bt=self._bottom_dist, btrep=self._bottom_bt, dense=self._bottom)[self.bottom_kind](E, sg)
                 self.tick("bottom LU", t)
                 break
             sg = [x.astype(C8) for x in sg]
@@ -587,6 +615,196 @@ class Hier:
         self.bottom_n = n
         idx = xp.asarray(part.idx)
         self.bottom = lambda r: solve(part.gather(r).astype(complex))[idx].astype(C8)
+
+    def _slabs(self):
+        """Slabs of A_K: its x positions, neighbouring ones joined when blocks (or a lead face) couple farther. (slab of every block,
+        blocks per slab, block offsets per slab, slab sizes, block -> (slab, position))."""
+        k, L = self.K, self.lv[self.K]
+        ix = np.unique(L.grid[0], return_inverse=True)[1]
+        far = max([abs(int(ix[i]) - int(ix[j])) for i, j in L.pairs] + [int(np.ptp(ix[l])) for _, l, _ in self.Y[k]])
+        ix = ix // max(far, 1)
+        sl = [np.where(ix == a)[0] for a in range(int(ix.max()) + 1)]
+        o = [offs(self.r[k][b]) for b in sl]
+        return ix, sl, o, [int(v[-1]) for v in o], {int(b): (a, q) for a, bs in enumerate(sl) for q, b in enumerate(bs)}
+
+    def _bottom_plan(self):
+        """Once: domains of contiguous slabs separated by single slabs (dist.domains, one domain per rank), the holder of the
+        separator system (a rank without a domain, else the one with the cheapest domain), the block pairs every rank needs,
+        the halo of the residual and the layout of the solution."""
+        if self.bplan is not None:
+            return self.bplan
+        k, L, comm, me = self.K, self.lv[self.K], self.comm, self.comm.rank
+        ix, sl, o, n, at = self._slabs()
+        dom, sep, ranks = dist.domains(np.asarray(n, float) ** 3, comm.size)
+        p = len(dom)
+        free = [r for r in range(comm.size) if r not in ranks]
+        hold = free[0] if free else ranks[int(np.argmin([sum(n[a] ** 3 for a in range(*d)) for d in dom]))]
+        own = np.zeros(len(sl), int)
+        for d, (a, b) in enumerate(dom):
+            own[a:b] = ranks[d]
+        own[sep] = hold
+        issep = np.isin(np.arange(len(sl)), sep)
+        needs = [set() for _ in range(comm.size)]
+        for i, j in L.pairs:                                           # slab block (a, b): diagonal -> its owner, else the domain's rank
+            a, b = int(ix[i]), int(ix[j])
+            r = int(own[b] if issep[a] else own[a])
+            if r != L.owner[i]:
+                needs[r].add((i, j))
+        ent = [self.entries(k, b) for b in sl]
+        mine = [a for a in range(len(sl)) if own[a] == me]
+        rows = np.concatenate([ent[a] for a in mine] or [np.zeros(0, int)])
+        part = self.part[k]
+        exin = dist.Exch(part, rows)
+        dpart = dist.Part(comm, ent, own, self.N[k])
+        exout = dist.Exch(dpart, part.idx)
+        d = ranks.index(me) if me in ranks else None
+        sid = lambda d: (sep[d - 1] if d > 0 else None, sep[d] if d < p - 1 else None)
+        ck = [("C", e, t) for e in range(p) for t, ok in (("LL", e > 0), ("RL", 0 < e < p - 1), ("RR", e < p - 1), ("LR", 0 < e < p - 1)) if ok]
+        gk = [("g", e, t) for e in range(p) for t, ok in (("L", e > 0), ("R", e < p - 1)) if ok]
+        xneed = [[] for _ in range(comm.size)]
+        for e in range(p):
+            xneed[ranks[e]] += [("x", j) for j in (e - 1, e) if 0 <= j < p - 1]
+        self.bplan = bp = dict(ix=ix, sl=sl, o=o, n=n, at=at, dom=dom, sep=sep, ranks=ranks, hold=hold, own=own, d=d, sid=sid,
+                               needs=[sorted(s) for s in needs], ck=ck, gk=gk, xneed=xneed, mine=mine, exin=exin, exout=exout, dpart=dpart,
+                               pos={a: gpu.asarray(exin.pos[ent[a]]) for a in mine}, dpos={a: gpu.asarray(dpart.gloc[ent[a]]) for a in mine},
+                               ro=gpu.asarray(exout.pos[part.idx]))
+        self.bottom_dom = f"{p} domains, separators {sep} on rank {hold}"
+        return bp
+
+    def _bottom_dist(self, E, sg):
+        """Block-tridiagonal LU of A_K distributed over domains of slabs (double precision). Every domain rank factors its
+        interior (closed: no lead unless it has one) and forms its Schur contributions on its one or two separators; they go
+        to the holder, which factors the separator system (block tridiagonal). Apply: interior solves, separator right-hand
+        sides to the holder, separator solve, separator values back, interior solves again (no coupling columns stored).
+        Point to point only; the memory of the replicated LU (three blocks per slab on every rank) becomes the own domain
+        (+ the separator system on the holder). self.bottom_res: relative residual of a random solve; self.bottom_gb: largest rank."""
+        xp, k, L, comm, me = _xp(), self.K, self.lv[self.K], self.comm, self.comm.rank
+        bp = self._bottom_plan()
+        sl, o, n, at, sep, ranks, hold, d = (bp[q] for q in ("sl", "o", "n", "at", "sep", "ranks", "hold", "d"))
+        p, r = len(bp["dom"]), self.r[k]
+        pairs = {**self.SH[k], **swap(comm, self.SH[k], bp["needs"], lambda q: L.owner[q[0]], lambda q: (2, int(r[q[0]]), int(r[q[1]])), float, xp)}
+
+        def block(a, b):
+            M = xp.zeros((n[a], n[b]), complex)
+            for p_, i in enumerate(sl[a]):
+                i = int(i)
+                for j in L.nbr[i]:
+                    sb, q = at[int(j)]
+                    if sb == b:
+                        X = pairs[i, int(j)] if i <= j else pairs[int(j), i]
+                        B = E * X[0] - X[1]
+                        M[o[a][p_]:o[a][p_ + 1], o[b][q]:o[b][q + 1]] = B if i <= j else B.T
+            for side, (_, l, ol) in enumerate(self.Y[k]):
+                for p_, i in enumerate(l):
+                    for q_, j in enumerate(l):
+                        (si, pi), (sj, pj) = at[int(i)], at[int(j)]
+                        if si == a and sj == b:
+                            M[o[a][pi]:o[a][pi + 1], o[b][pj]:o[b][pj + 1]] -= sg[side][ol[p_]:ol[p_ + 1], ol[q_]:ol[q_ + 1]]
+            return M
+        fac, cpl, cont, gb = None, {}, {}, 0.0
+        if d is not None:
+            a0, a1 = bp["dom"][d]
+            I = list(range(a0, a1))
+            fac = tri_factor([block(a, a) for a in I], [block(a, a + 1) for a in I[:-1]], [block(a + 1, a) for a in I[:-1]])
+            sL, sR = bp["sid"](d)
+            if sL is not None:
+                cpl["AL"], cpl["LA"] = block(a0, sL), block(sL, a0)
+            if sR is not None:
+                cpl["AR"], cpl["RA"] = block(a1 - 1, sR), block(sR, a1 - 1)
+            m = len(I)
+            if sL is not None:                                         # Z = A_II^-1 (coupling columns), first / last slab rows
+                Z = tri_solve(fac, [cpl["AL"]] + [None] * (m - 1))
+                cont["C", d, "LL"] = -(cpl["LA"] @ Z[0])
+                if sR is not None:
+                    cont["C", d, "RL"] = -(cpl["RA"] @ Z[-1])
+                del Z
+            if sR is not None:
+                Z = tri_solve(fac, [None] * (m - 1) + [cpl["AR"]])
+                cont["C", d, "RR"] = -(cpl["RA"] @ Z[-1])
+                if sL is not None:
+                    cont["C", d, "LR"] = -(cpl["LA"] @ Z[0])
+                del Z
+            gb += sum(x.nbytes for f in fac for x in f) + sum(x.nbytes for x in cpl.values())
+        sfac = None
+        if p > 1:
+            def shape(q):
+                sL, sR = bp["sid"](q[1])
+                return {"LL": (n[sL], n[sL]) if sL is not None else None, "RR": (n[sR], n[sR]) if sR is not None else None,
+                        "LR": (n[sL], n[sR]) if sL is not None and sR is not None else None,
+                        "RL": (n[sR], n[sL]) if sL is not None and sR is not None else None}[q[2]]
+            need = [bp["ck"] if q == hold else [] for q in range(comm.size)]
+            got = swap(comm, cont, need, lambda q: ranks[q[1]], shape, complex, xp)
+            if me == hold:
+                C = {**cont, **got}
+                sfac = tri_factor([block(s, s) + C["C", j, "RR"] + C["C", j + 1, "LL"] for j, s in enumerate(sep)],
+                                  [C["C", j + 1, "LR"] for j in range(p - 2)], [C["C", j + 1, "RL"] for j in range(p - 2)])
+                gb += sum(x.nbytes for f in sfac for x in f)
+            del got
+        del cont, pairs
+        gpu.free()
+        self.bottom_gb = max(comm.allgather(gb / 2 ** 30))
+        exin, exout, dpart, pos, dpos = bp["exin"], bp["exout"], bp["dpart"], bp["pos"], bp["dpos"]
+
+        def solve(rl):
+            """Local rows of r (part of level K) -> local rows of x, complex."""
+            nc = rl.shape[1]
+            xr = exin(rl)
+            ys = {a: xr[pos[a]].astype(complex) for a in bp["mine"]}
+            g, y = {}, None
+            if d is not None:
+                a0, a1 = bp["dom"][d]
+                y = tri_solve(fac, [ys[a] for a in range(a0, a1)])
+                if "LA" in cpl:
+                    g["g", d, "L"] = -(cpl["LA"] @ y[0])
+                if "RA" in cpl:
+                    g["g", d, "R"] = -(cpl["RA"] @ y[-1])
+            xd = xp.zeros((dpart.nloc, nc), complex)
+            xs = {}
+            if p > 1:
+                need = [bp["gk"] if q == hold else [] for q in range(comm.size)]
+                gs = lambda q: (n[bp["sid"](q[1])[0 if q[2] == "L" else 1]], nc)
+                G = {**g, **swap(comm, g, need, lambda q: ranks[q[1]], gs, complex, xp)}
+                if me == hold:
+                    z = tri_solve(sfac, [ys[s] + G["g", j, "R"] + G["g", j + 1, "L"] for j, s in enumerate(sep)])
+                    for j, s in enumerate(sep):
+                        xs["x", j] = z[j]
+                        xd[dpos[s]] = z[j]
+                xs.update(swap(comm, xs, bp["xneed"], lambda q: hold, lambda q: (n[sep[q[1]]], nc), complex, xp))
+            if d is not None:
+                a0, a1 = bp["dom"][d]
+                rhs = [ys[a] for a in range(a0, a1)]
+                if "AL" in cpl:
+                    rhs[0] = rhs[0] - cpl["AL"] @ xs["x", d - 1]
+                if "AR" in cpl:
+                    rhs[-1] = rhs[-1] - cpl["AR"] @ xs["x", d]
+                if p > 1:
+                    y = tri_solve(fac, rhs)
+                for q, a in enumerate(range(a0, a1)):
+                    xd[dpos[a]] = y[q]
+            return exout(xd)[bp["ro"]]
+        part = self.part[k]
+        rng = np.random.default_rng(0)
+        b = xp.asarray(rng.standard_normal((self.N[k], 2)) + 1j * rng.standard_normal((self.N[k], 2)))
+        x = part.gather(solve(b[xp.asarray(part.idx)]))
+        self.bottom_res = self._bottom_residual(E, sg, b, x)
+        self.bottom_n = n
+        self.bottom = lambda rl: solve(rl).astype(C8)
+
+    def _bottom_residual(self, E, sg, b, x):
+        """|b - A_K x| / |b| from the block pairs of the owners; b, x global, on every rank."""
+        xp, k, L, me = _xp(), self.K, self.lv[self.K], self.comm.rank
+        y, e = xp.zeros_like(b), lambda i: slice(int(self.off[k][i]), int(self.off[k][i + 1]))
+        for (i, j), P in self.SH[k].items():
+            if L.owner[i] == me:
+                B = E * P[0] - P[1]
+                y[e(i)] += B @ x[e(j)]
+                if i != j:
+                    y[e(j)] += B.T @ x[e(i)]
+        y = self.comm.sum(y)
+        for side, (_, l, _) in enumerate(self.Y[k]):
+            q = xp.asarray(self.entries(k, l))
+            y[q] -= sg[side] @ x[q]
+        return float(xp.linalg.norm(b - y) / xp.linalg.norm(b))
 
     # ------------------------------------------------------------------ preconditioner
     def _t(self, key, f, *x):

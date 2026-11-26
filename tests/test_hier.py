@@ -155,6 +155,21 @@ def test_bottom_bt(env):
                 assert r["E"][k]["converged"] and abs(r["E"][k]["T"] - v["T"]) < 1e-9 and r["E"][k]["its"] == v["its"]
 
 
+def test_bottom_domains(env):
+    """Distributed block-tridiagonal LU (domains + separator system on one rank) = the replicated one: 8 slabs on 3 / 4 ranks
+    (2 / 3 separators, holder with and without a domain of its own); smaller factors on the largest rank."""
+    d, up = env[0], "y:1e-3,x:1e-3"
+    r0 = dist.ThreadComm.run(2, lambda c: go(d, c, True, "--up", up, "--bottom", "btrep"))[0]
+    for size, ns in ((3, 2), (4, 3)):
+        rs = dist.ThreadComm.run(size, lambda c: go(d, c, True, "--up", up))
+        for r in rs:
+            h = r["h"]
+            assert len(h.bplan["sep"]) == ns and h.bottom_res < 1e-10 and r["N"] == r0["N"]
+            assert h.bottom_gb < 0.7 * 3 * sum(n * n for n in h.bottom_n) * 16 / 2 ** 30
+            for k, v in r0["E"].items():
+                assert r["E"][k]["converged"] and abs(r["E"][k]["T"] - v["T"]) < 1e-9 and r["E"][k]["its"] == v["its"]
+
+
 def test_schwarz_only(env):
     """One-level: the same T, more iterations than with the levels; ranks: the same counts."""
     d, _, ref = env

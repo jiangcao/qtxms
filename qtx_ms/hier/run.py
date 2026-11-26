@@ -28,8 +28,9 @@ def parse(argv=None):
                    "periodized lead at every z, Beyn at the real energies only (contour folded: the same bases), or closed: no Sigma at "
                    "any z, right-hand sides = identity on the left contact face (columns of G_c = (E S - H)^-1; no T)")
     p.add_argument("--rhs-cols", type=int, default=0, help="closed: only this many, evenly spaced columns of the identity (0: all)")
-    p.add_argument("--bottom", default="bt", choices=["bt", "dense"], help="exact solve of the deepest level: block-tridiagonal LU over the x "
-                   "positions (default), or dense LU")
+    p.add_argument("--bottom", default="bt", choices=["bt", "btrep", "dense"], help="exact solve of the deepest level: "
+                   "block-tridiagonal LU over the x positions, distributed over domains of slabs with a separator system on one rank (bt, "
+                   "default), the same LU replicated on every rank (btrep), or dense LU")
     p.add_argument("--schwarz", action="store_true", help="no coarse level: the preconditioner is one application of S_0")
     p.add_argument("--slow", default="", help="M,Q,ROUNDS: two-level, no bases: the coarse level = slow modes of the fine smoother S_0 (M vectors, "
                    "Q subspace steps; more rounds: slow modes of the cycle), dense exact solve, built at every energy (hier.slow)")
@@ -154,6 +155,7 @@ def run(a, comm):
         log(f"Ec {e:+.3f}: {what}, {nb} columns, its {its.min()}..{its.max()}, res {rs.max():.0e}" + ("" if ok else " ** NOT CONVERGED **")
             + f"; energy {time.time() - t0:.1f} s: " + ", ".join(f"{k} {v:.1f}" for k, v in h.t.items())
             + (f"; bottom {len(h.bottom_n)} slabs of {max(h.bottom_n)} at most, residual {h.bottom_res:.0e}" if h.bottom_res is not None else "")
+            + (f" ({h.bottom_dom}, factors {h.bottom_gb:.1f} GB on the largest rank)" if h.bottom_gb is not None else "")
             + f"; smoothers {h.S0.gb:.1f} + {sum(h.gb.values()):.1f} GB, GPU held per rank {peak()} GB")
         res["E"][f"{e:.4f}"] = dict(E=z.real, T=T, closed=info, its=its.tolist(), slow=h.slow.info if h.slow is not None else None, res=rs.tolist(), converged=ok, hist=hist, t=dict(h.t), t_energy=time.time() - t0, profile=pf)
         if a.out and comm.rank == 0:
